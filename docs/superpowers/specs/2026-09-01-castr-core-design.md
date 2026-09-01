@@ -313,7 +313,9 @@ remote input, multiple receivers, HEVC, zero-copy GPU encode, internet
 `quinn`, `rustls`, `rcgen`, `mdns-sd`, `spake2`, `postcard`, `serde`,
 `openh264` (bundles Cisco's library, built with cmake), `audiopus` with
 bundled libopus, `sdl2` with the `bundled` feature, `windows` (Desktop
-Duplication, WASAPI, Media Foundation, D3D11), `tokio`, `tracing`, `clap`.
+Duplication, WASAPI, Media Foundation, D3D11), `tokio`, `tracing`, `clap`,
+`eframe` for the sender's pairing/cast window (pure Rust, statically
+linked, keeps the single-exe requirement).
 
 Build prerequisites: a C compiler and cmake on every platform for the
 bundled `openh264`, `opus`, and SDL2 builds. No system media libraries
