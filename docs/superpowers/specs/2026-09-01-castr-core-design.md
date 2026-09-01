@@ -46,13 +46,20 @@ Cargo workspace `castr` (name is a placeholder).
 |---|---|---|
 | `castr-proto` | Wire format, packet types, packetize/reassemble, session state machine. No I/O. | No |
 | `castr-net` | QUIC transport (`quinn`), mDNS discovery, UDP broadcast fallback, pairing. | No |
-| `castr-media` | FFmpeg encode/decode wrappers, jitter buffer, A/V clock, bitrate controller. | No |
+| `castr-media` | `VideoEncoder`/`VideoDecoder` traits, software H.264 backend (`openh264`), Opus wrappers, jitter buffer, A/V clock, bitrate controller. | No |
+| `castr-codec-win` | Media Foundation H.264 encoder and decoder implementing the `castr-media` traits. Hardware MFTs preferred, Microsoft software MFT as fallback. | Windows only |
 | `castr-capture-win` | Desktop Duplication video capture, WASAPI loopback audio capture. | Windows only |
-| `castr-sender` | CLI binary wiring capture, media, and net. | Yes |
-| `castr-receiver` | CLI binary wiring net, media, and SDL2 rendering. Runs on Windows and Linux. | Yes |
+| `castr-sender` | CLI binary wiring capture, codecs, media, and net. | Yes |
+| `castr-receiver` | CLI binary wiring net, codecs, media, and SDL2 rendering. Runs on Windows and Linux. | Yes |
 
 Rule: `castr-proto`, `castr-net`, and `castr-media` must compile on any
 target without platform-specific code, so Android can wrap them later.
+Codec backends are selected at build time by target: `castr-codec-win` on
+Windows, the `openh264` software backend elsewhere. A V4L2 M2M backend for
+the Pi's hardware decoder is sub-project 2.
+
+No FFmpeg anywhere. The software backend exists for tests, CI, and as a
+last-resort fallback; it is not expected to reach 1080p on the Pi 3.
 
 ## 5. Discovery and pairing
 
@@ -147,10 +154,18 @@ encryption, MTU discovery, and connection migration intact.
    only if 500 ms have passed since the last sent frame, so the receiver
    never sees a stall.
 2. The acquired texture is copied to a staging texture and mapped to CPU
-   memory as BGRA. (Zero-copy GPU encode is an optimization for later.)
-3. FFmpeg encoder selection in order: `h264_nvenc`, `h264_amf`,
-   `h264_qsv`, `h264_mf`, then `libx264` with `ultrafast` and `zerolatency`.
-   The first that opens successfully is used and logged.
+   memory as BGRA, then converted to NV12. (Passing the D3D11 texture
+   straight to the encoder MFT for zero-copy encode is an optimization for
+   later; the trait accepts either.)
+3. Encoder selection via `MFTEnumEx` for `MFVideoFormat_H264` output with
+   `MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER`. The first
+   hardware MFT that activates and accepts the negotiated type is used and
+   logged. If none, fall back to the Microsoft software H.264 encoder MFT,
+   then to `openh264`. The MFT is run in asynchronous mode with
+   `CODECAPI_AVLowLatencyMode`, `CODECAPI_AVEncCommonRateControlMode` CBR
+   for game mode and VBR for quality mode, and `CODECAPI_AVEncMPVGOPSize`
+   per section 8.2. Bitrate changes apply live via
+   `CODECAPI_AVEncCommonMeanBitRate` without reopening the encoder.
 4. Encoder output is packetized per section 6.2 and sent as datagrams.
 5. Audio runs on its own thread from WASAPI loopback through Opus and is
    sent as it is produced.
@@ -162,8 +177,10 @@ encryption, MTU discovery, and connection migration intact.
    frames older than 500 ms are discarded and a NACK is sent for anything
    younger that is a keyframe.
 2. Complete frames enter the jitter buffer (see section 8 for depth).
-3. FFmpeg decoder selection: `h264_v4l2m2m` on Linux ARM, `h264` with
-   `d3d11va` hwaccel on Windows, then software `h264`.
+3. Decoder selection: on Windows, the Microsoft H.264 decoder MFT with
+   `MF_SA_D3D11_AWARE` and a D3D11 device manager so decode happens on the
+   GPU and output is an NV12 texture; on other targets, `openh264`
+   software decode. (V4L2 M2M for the Pi is sub-project 2.)
 4. Decoded frames are uploaded to an SDL2 texture and presented according
    to the A/V clock in section 9.
 5. Drop rule: if a newer complete frame exists and the current one has not
@@ -246,7 +263,8 @@ resizes the audio buffer.
 
 `castr-receiver`:
 - `--name <display name>`, `--fullscreen`, `--max-bitrate N`
-  (default 10 Mbps on ARM Linux, 40 Mbps elsewhere), `--decoder auto|v4l2|d3d11|sw`.
+  (default 10 Mbps on ARM Linux, 40 Mbps elsewhere), `--decoder auto|mf|sw`
+  (`v4l2` is added in sub-project 2).
 - Displays PIN when an unpaired sender connects.
 
 Config and pairing files live in the platform config directory under
@@ -257,17 +275,24 @@ Config and pairing files live in the platform config directory under
 | Layer | Tests |
 |---|---|
 | `castr-proto` | Packetize/reassemble round trip. Out-of-order fragments. Lost fragments produce correct NACK lists. Frame number wraparound. Session state machine transitions including resume with valid, expired, and wrong tokens. |
-| `castr-media` | Jitter buffer ordering and drop rules per mode. A/V clock: video scheduled against audio timestamps, drift correction bounds. Bitrate controller responds to synthetic stats as specified in 8.1. Encode/decode round trip with `libx264` and software `h264` so CI needs no GPU. |
+| `castr-media` | Jitter buffer ordering and drop rules per mode. A/V clock: video scheduled against audio timestamps, drift correction bounds. Bitrate controller responds to synthetic stats as specified in 8.1. Encode/decode round trip through the `openh264` backend so CI needs no GPU. |
+| `castr-codec-win` | Encode a synthetic frame sequence with the MF encoder and decode it with the MF decoder; assert frame count, dimensions, and that a keyframe is produced on request. Cross-check by decoding MF output with `openh264`. Runs only on Windows. |
 | `castr-net` | Two endpoints in one process over loopback. A lossy shim drops a configurable fraction of datagrams. Verifies pairing success and failure, session resume, and NACK retransmit of keyframes only. |
 | End to end | Sender and receiver on one Windows machine. Then Windows sender to Pi 3 over Ethernet. Measure glass-to-glass latency with a timer on screen and a phone camera. |
 
 ## 13. Out of scope for this sub-project
 
-Android, DRM/KMS direct output on the Pi, remote input, multiple
-receivers, HEVC, zero-copy GPU encode, internet (non-LAN) use.
+Android, DRM/KMS direct output on the Pi, V4L2 hardware decode on the Pi,
+remote input, multiple receivers, HEVC, zero-copy GPU encode, internet
+(non-LAN) use.
 
 ## 14. Key dependencies
 
 `quinn`, `rustls`, `rcgen`, `mdns-sd`, `spake2`, `postcard`, `serde`,
-`ffmpeg-next` (or `ffmpeg-sys-next`), `audiopus`, `sdl2`, `windows`
-(Desktop Duplication and WASAPI), `tokio`, `tracing`, `clap`.
+`openh264` (bundles Cisco's library, built with cmake), `audiopus` with
+bundled libopus, `sdl2` with the `bundled` feature, `windows` (Desktop
+Duplication, WASAPI, Media Foundation, D3D11), `tokio`, `tracing`, `clap`.
+
+Build prerequisites: a C compiler and cmake on every platform for the
+bundled `openh264`, `opus`, and SDL2 builds. No system media libraries
+are required on Windows. No FFmpeg on any platform.
