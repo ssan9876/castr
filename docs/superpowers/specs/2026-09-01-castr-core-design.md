@@ -14,11 +14,31 @@ Sub-project 1 delivers the core protocol, a Windows sender, and a desktop
 receiver binary that runs on Windows for development and cross-compiles to
 Linux (Raspberry Pi 3 Model B is the first hardware target).
 
+Product positioning: any Windows or Android device can cast to the
+receiver out of the box using standard Miracast (zero install), and the
+free `castr` sender gives a much better experience. The receiver therefore
+speaks two protocols; this sub-project builds the first one.
+
 Later sub-projects (each with its own spec):
 
-2. Pi receiver hardening: hardware decode, DRM/KMS output, boot autostart.
-3. Android receiver.
-4. Android sender.
+2. Pi receiver hardening: V4L2 hardware decode, DRM/KMS output, boot
+   autostart. Shared by both protocols.
+3. Miracast sink mode: Wi-Fi Direct group owner with persistent group,
+   RTSP with the MS-WFDPE extensions (`microsoft_max_bitrate`,
+   `microsoft_latency_management_capability`, dynamic resolution),
+   `wfd_idr_request` on loss, MPEG-TS over RTP demuxed into the same
+   decode and present pipeline as sub-project 2. Miracast over
+   Infrastructure (MS-MICE) is an add-on once Wi-Fi Direct works.
+4. Android receiver.
+5. Android sender.
+
+### 1.1 Zero-install sender requirement
+
+`castr-sender` on Windows ships as a single portable executable: no
+installer, no admin rights, no external DLLs, no runtime download. It uses
+only APIs built into Windows 10 and later (Desktop Duplication, WASAPI,
+Media Foundation, D3D11). First-run pairing is done from a small window,
+not only the CLI, so a non-technical user can download one file and cast.
 
 ## 2. Miracast failures and the corresponding design decisions
 
@@ -257,6 +277,8 @@ resizes the audio buffer.
 ## 11. Configuration and CLI
 
 `castr-sender`:
+- No arguments: opens a small window listing discovered receivers with
+  Pair and Cast buttons and a mode toggle (see section 1.1).
 - `list` prints discovered receivers.
 - `pair <name|fp>` runs the PIN flow.
 - `cast <name|fp> [--mode game|quality] [--fps 30|60] [--max-bitrate N]`.
