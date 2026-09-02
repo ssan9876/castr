@@ -1,6 +1,6 @@
 use crate::identity::{fingerprint_of, Identity};
 use crate::tls::{client_config, server_config, TrustCheck};
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use bytes::Bytes;
 use castr_proto::{decode_len_prefixed, encode_len_prefixed, ControlMessage, Nack};
 use rustls::pki_types::CertificateDer;
@@ -38,6 +38,13 @@ impl Endpoint {
     /// consumes it before handing the Link out.
     const CONTROL_PREAMBLE: &'static [u8; 4] = b"CTRL";
 
+    /// Sent by the receiver after it has read the control preamble. The receiver only
+    /// reaches that point once the QUIC handshake has fully completed with the client
+    /// certificate verified, so waiting for this ack on the sender side is a deterministic
+    /// proof of acceptance -- unlike the raw QUIC handshake future, which (per TLS 1.3) can
+    /// resolve on the client side before the server has verified the client's certificate.
+    const CONTROL_ACK: &'static [u8; 2] = b"OK";
+
     pub async fn accept(&self) -> anyhow::Result<Link> {
         loop {
             let incoming = self
@@ -47,11 +54,14 @@ impl Endpoint {
                 .ok_or_else(|| anyhow!("endpoint closed"))?;
             match incoming.await {
                 Ok(conn) => match conn.accept_bi().await {
-                    Ok((tx, mut rx)) => {
+                    Ok((mut tx, mut rx)) => {
                         let mut preamble = [0u8; 4];
                         match rx.read_exact(&mut preamble).await {
                             Ok(()) if &preamble == Self::CONTROL_PREAMBLE => {
-                                return Link::new(conn, tx, rx)
+                                match tx.write_all(Self::CONTROL_ACK).await {
+                                    Ok(()) => return Link::new(conn, tx, rx),
+                                    Err(e) => tracing::warn!("control ack write failed: {e}"),
+                                }
                             }
                             Ok(()) => tracing::warn!("bad control preamble {preamble:?}"),
                             Err(e) => tracing::warn!("control preamble read failed: {e}"),
@@ -73,24 +83,21 @@ impl Endpoint {
         // A quinn/rustls client-side handshake future resolves once the client has
         // processed the server's flight and generated its own Finished message; it does
         // NOT wait for the server to validate the client's certificate. That check (and
-        // any resulting CONNECTION_CLOSE) happens on the server asynchronously afterward,
-        // and quinn's background endpoint driver only gets a chance to notice and process
-        // it once our task actually yields to the executor. So a bare `connect().await`
-        // succeeding is not proof the server accepted the client's identity: open the
-        // control stream, then give a rejection a brief window to arrive before handing
-        // out a Link that may already be dead.
-        let (mut tx, rx) = conn.open_bi().await.context("open control stream")?;
+        // any resulting CONNECTION_CLOSE) happens on the server asynchronously afterward.
+        // So a bare `connect().await` succeeding is not proof the server accepted the
+        // client's identity: wait for the receiver's explicit ack, which it can only send
+        // after the QUIC handshake completed with the client certificate verified. If the
+        // server rejected the certificate, this read fails with a connection error instead.
+        let (mut tx, mut rx) = conn.open_bi().await.context("open control stream")?;
         tx.write_all(Self::CONTROL_PREAMBLE)
             .await
             .context("control preamble")?;
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
-            _ = conn.closed() => {
-                return Err(anyhow!(
-                    "connection closed during handshake: {:?}",
-                    conn.close_reason()
-                ));
-            }
+        let mut ack = [0u8; 2];
+        rx.read_exact(&mut ack)
+            .await
+            .context("server did not acknowledge control stream")?;
+        if &ack != Self::CONTROL_ACK {
+            bail!("unexpected control ack {ack:?}");
         }
         Link::new(conn, tx, rx)
     }
