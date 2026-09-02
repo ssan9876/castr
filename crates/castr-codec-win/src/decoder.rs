@@ -1,6 +1,7 @@
 use crate::mf::*;
-use anyhow::{anyhow, Context};
+use anyhow::{anyhow, bail, Context};
 use castr_media::*;
+use std::collections::VecDeque;
 use windows::core::Interface;
 use windows::Win32::Media::MediaFoundation::*;
 
@@ -15,6 +16,11 @@ pub struct MfDecoder {
     height: u32,
     output_size: u32,
     provides_samples: bool,
+    /// Decoded frames drained from the transform but not yet returned to the caller,
+    /// in FIFO order. A single `ProcessInput`/drain pass can surface more than one
+    /// output (or none), so `decode` queues everything it finds here and returns the
+    /// oldest.
+    pending: VecDeque<RawFrame>,
 }
 
 // SAFETY: see the identical justification on `MfEncoder`: COM is initialized in the
@@ -53,6 +59,7 @@ impl MfDecoder {
             height: 0,
             output_size: 0,
             provides_samples: false,
+            pending: VecDeque::new(),
         };
         dec.negotiate_output()?;
         // SAFETY: `dec.mft` is valid; these messages carry no pointer payload (param is 0).
@@ -132,10 +139,18 @@ impl MfDecoder {
         if let Ok(b2d) = buffer.cast::<IMF2DBuffer>() {
             let mut scanline0 = std::ptr::null_mut();
             let mut pitch = 0i32;
-            // SAFETY: `b2d` is a valid 2D buffer; `Lock2D` hands back a pointer to
-            // the top scanline and the row pitch, valid until `Unlock2D`.
+            // SAFETY: `b2d` is a valid 2D buffer; `Lock2D` hands back a pointer to the
+            // top scanline and the row pitch, valid until `Unlock2D`. The row-walking
+            // code below only holds for a non-negative (top-down) pitch, since it
+            // advances forward from `scanline0`; a negative (bottom-up) pitch is
+            // rejected below, after unlocking.
             unsafe { b2d.Lock2D(&mut scanline0, &mut pitch) }.context("Lock2D")?;
-            let pitch = pitch.unsigned_abs() as usize;
+            if pitch < 0 {
+                // SAFETY: matches the `Lock2D` call above; must run before returning.
+                unsafe { b2d.Unlock2D() }?;
+                bail!("bottom-up NV12 surface not supported (pitch {pitch})");
+            }
+            let pitch = pitch as usize;
             // Luma: `h` rows of `w` visible columns, addressed within the coded
             // (padded) surface using its pitch.
             for row in 0..h {
@@ -179,12 +194,12 @@ impl MfDecoder {
     }
 }
 
-impl VideoDecoder for MfDecoder {
-    fn decode(&mut self, data: &[u8], timestamp_us: u64) -> anyhow::Result<Option<RawFrame>> {
-        let sample = make_sample(data, timestamp_us, 33_333)?;
-        // SAFETY: `self.mft` is a valid, configured transform; `sample` is a valid
-        // input sample carrying an Annex B access unit for stream 0.
-        unsafe { self.mft.ProcessInput(0, &sample, 0) }.context("ProcessInput")?;
+impl MfDecoder {
+    /// Repeatedly calls `ProcessOutput` and queues every decoded frame onto `pending`
+    /// (FIFO), stopping once the transform reports `MF_E_TRANSFORM_NEED_MORE_INPUT`.
+    /// A single input can unblock more than one queued output, and failing to drain
+    /// them all before the next `ProcessInput` is what causes `MF_E_NOTACCEPTING`.
+    fn drain_outputs(&mut self, fallback_timestamp_us: u64) -> anyhow::Result<()> {
         loop {
             let mut out = MFT_OUTPUT_DATA_BUFFER {
                 dwStreamID: 0,
@@ -217,25 +232,48 @@ impl VideoDecoder for MfDecoder {
                     // SAFETY: `sample` is a valid output sample.
                     let ts = unsafe { sample.GetSampleTime() }
                         .map(|t| t.max(0) as u64 / 10)
-                        .unwrap_or(timestamp_us);
+                        .unwrap_or(fallback_timestamp_us);
                     let data = self.read_nv12(&sample)?;
-                    return Ok(Some(RawFrame {
+                    self.pending.push_back(RawFrame {
                         format: PixelFormat::Nv12,
                         width: self.width,
                         height: self.height,
                         stride: self.width,
                         data,
                         timestamp_us: ts,
-                    }));
+                    });
+                    // Keep going: there may be more queued output.
                 }
-                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(None),
+                Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
                     self.negotiate_output()?;
-                    continue;
                 }
                 Err(e) => return Err(e).context("ProcessOutput"),
             }
         }
+    }
+}
+
+impl VideoDecoder for MfDecoder {
+    fn decode(&mut self, data: &[u8], timestamp_us: u64) -> anyhow::Result<Option<RawFrame>> {
+        let sample = make_sample(data, timestamp_us, 33_333)?;
+        // SAFETY: `self.mft` is a valid, configured transform; `sample` is a valid
+        // input sample carrying an Annex B access unit for stream 0.
+        let hr = unsafe { self.mft.ProcessInput(0, &sample, 0) };
+        if let Err(e) = hr {
+            if e.code() == MF_E_NOTACCEPTING {
+                // The transform has queued output(s) it needs drained before it will
+                // accept more input; drain them, then retry once.
+                self.drain_outputs(timestamp_us)?;
+                // SAFETY: same as above.
+                unsafe { self.mft.ProcessInput(0, &sample, 0) }
+                    .context("ProcessInput (retry after MF_E_NOTACCEPTING)")?;
+            } else {
+                return Err(e).context("ProcessInput");
+            }
+        }
+        self.drain_outputs(timestamp_us)?;
+        Ok(self.pending.pop_front())
     }
 
     fn name(&self) -> &'static str {

@@ -1,6 +1,7 @@
 use crate::mf::*;
 use anyhow::{anyhow, bail, Context};
 use castr_media::*;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use windows::core::{Interface, VARIANT};
 use windows::Win32::Media::MediaFoundation::*;
@@ -15,6 +16,11 @@ pub struct MfEncoder {
     need_input_credits: u32,
     frame_index: u64,
     name: &'static str,
+    /// Outputs obtained anywhere other than the end of `encode` (e.g. while waiting
+    /// for a NeedInput credit, or extras drained after the first `take_output` in a
+    /// single `encode` call). Held in FIFO order and drained before any freshly
+    /// produced output, so no access unit is ever dropped.
+    pending: VecDeque<EncodedFrame>,
 }
 
 // SAFETY: `mf_startup` initializes COM with `COINIT_MULTITHREADED`, so the process is
@@ -149,6 +155,7 @@ impl MfEncoder {
             need_input_credits: 0,
             frame_index: 0,
             name,
+            pending: VecDeque::new(),
         })
     }
 
@@ -200,8 +207,11 @@ impl MfEncoder {
         let deadline = Instant::now() + Duration::from_millis(200);
         while self.need_input_credits == 0 {
             if self.pump_events(Duration::from_millis(5))? {
-                // Output arrived before we could feed input; drain it so the MFT keeps going.
-                let _ = self.take_output()?;
+                // Output arrived before we could feed input; queue it (FIFO) rather than
+                // discard it, so this access unit is still returned to the caller.
+                if let Some(f) = self.take_output()? {
+                    self.pending.push_back(f);
+                }
             }
             if Instant::now() >= deadline {
                 bail!("encoder never requested input");
@@ -289,10 +299,37 @@ impl VideoEncoder for MfEncoder {
                 Duration::from_millis(100)
             };
             if !self.pump_events(wait)? {
-                return Ok(None);
+                // No output arrived from this input, but an earlier one may still be queued.
+                return Ok(self.pending.pop_front());
             }
         }
-        self.take_output()
+        // A single input can unblock more than one queued output (e.g. after
+        // MF_E_NOTACCEPTING would otherwise have hit us on the next ProcessInput).
+        // Drain everything the transform is willing to hand back right now; only the
+        // first (in FIFO order, oldest queued first) is returned from this call, the
+        // rest are queued for subsequent calls. For an async MFT, the event contract
+        // only permits one `ProcessOutput` per `METransformHaveOutput`, so only keep
+        // going while another such event is already queued (checked without waiting);
+        // a synchronous MFT has no event queue and `take_output` itself terminates the
+        // loop by returning `None` once it reports `MF_E_TRANSFORM_NEED_MORE_INPUT`.
+        let fresh = self.take_output()?;
+        loop {
+            if self.events.is_some() && !self.pump_events(Duration::ZERO)? {
+                break;
+            }
+            match self.take_output()? {
+                Some(extra) => self.pending.push_back(extra),
+                None => break,
+            }
+        }
+        if let Some(queued) = self.pending.pop_front() {
+            if let Some(f) = fresh {
+                self.pending.push_back(f);
+            }
+            Ok(Some(queued))
+        } else {
+            Ok(fresh)
+        }
     }
 
     fn request_keyframe(&mut self) {
