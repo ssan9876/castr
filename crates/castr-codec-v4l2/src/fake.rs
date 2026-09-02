@@ -194,7 +194,6 @@ impl Ops for FakeOps {
 mod tests {
     use super::*;
     use crate::ops::Ops;
-    use crate::sys::*;
 
     #[test]
     fn fake_records_calls_and_serves_scripted_capture_buffers() {

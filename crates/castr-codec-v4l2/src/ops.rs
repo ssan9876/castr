@@ -55,6 +55,7 @@ pub struct Mapping {
 unsafe impl Send for Mapping {}
 
 impl Mapping {
+    #[cfg(test)]
     pub(crate) fn owned(len: usize) -> Self {
         let mut v = vec![0u8; len];
         let ptr = v.as_mut_ptr();
@@ -198,7 +199,7 @@ impl Ops for RealOps {
     fn s_fmt(&mut self, buf_type: u32, want: &FormatInfo) -> io::Result<FormatInfo> {
         let mut f = v4l2_format::new(buf_type);
         {
-            let mut mp = f.pix_mp_mut();
+            let mp = f.pix_mp_mut();
             mp.width = want.width;
             mp.height = want.height;
             mp.pixelformat = want.pixelformat;
