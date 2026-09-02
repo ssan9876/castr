@@ -2,5 +2,6 @@
 pub mod audio;
 pub mod codec;
 pub mod convert;
+pub mod jitter;
 pub mod sw;
 pub use codec::*;
