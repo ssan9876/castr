@@ -34,16 +34,7 @@ pub struct V4l2Decoder<O: Ops = RealOps> {
     capture: Option<Capture>,
     unanswered: u32,
     finished: bool,
-    #[cfg(test)]
-    drop_sink: Option<std::rc::Rc<std::cell::RefCell<Vec<String>>>>,
 }
-
-// SAFETY: the `drop_sink` test hook holds an `Rc`, which otherwise blocks the
-// auto-derived `Send` impl needed by `VideoDecoder: Send`. As with `FakeOps`,
-// tests are single-threaded and never share a `V4l2Decoder<FakeOps>` across
-// threads.
-#[cfg(test)]
-unsafe impl<O: Ops + Send> Send for V4l2Decoder<O> {}
 
 impl V4l2Decoder<RealOps> {
     pub fn open() -> anyhow::Result<Self> {
@@ -98,6 +89,22 @@ impl<O: Ops> V4l2Decoder<O> {
         output
             .allocate(&mut ops, OUTPUT_BUFFERS, false)
             .context("allocate output buffers")?;
+        if output.buffers.len() < MAX_IN_FLIGHT {
+            bail!(
+                "driver granted only {} output buffer(s), need at least {MAX_IN_FLIGHT}",
+                output.buffers.len()
+            );
+        }
+        if let Some(b) = output
+            .buffers
+            .iter()
+            .find(|b| b.mapping.len() < OUTPUT_BUFFER_SIZE as usize)
+        {
+            bail!(
+                "driver granted an output buffer of {} bytes, need at least {OUTPUT_BUFFER_SIZE}",
+                b.mapping.len()
+            );
+        }
         output.stream_on(&mut ops).context("STREAMON output")?;
         Ok(Self {
             ops,
@@ -105,8 +112,6 @@ impl<O: Ops> V4l2Decoder<O> {
             capture: None,
             unanswered: 0,
             finished: false,
-            #[cfg(test)]
-            drop_sink: None,
         })
     }
 
@@ -238,36 +243,50 @@ impl<O: Ops> V4l2Decoder<O> {
         };
         let idx = d.index as usize;
         let frame = if d.bytesused == 0 {
-            None
+            Ok(None)
         } else {
             let (w, h) = (cap.visible.width as usize, cap.visible.height as usize);
             let stride = cap.coded.bytesperline as usize;
             let coded_h = cap.coded.height as usize;
-            let src = cap.queue.buffers[idx].mapping.as_slice();
-            let mut data = Vec::with_capacity(w * h * 3 / 2);
             let top = cap.visible.top.max(0) as usize;
             let left = cap.visible.left.max(0) as usize;
-            for row in 0..h {
-                let o = (top + row) * stride + left;
-                data.extend_from_slice(&src[o..o + w]);
+            let src = cap.queue.buffers[idx].mapping.as_slice();
+            // `sizeimage` (QUERYBUF, which sized this mapping) and
+            // `bytesperline`/`height` (S_FMT) come from separate driver
+            // reports; a bad compose rect or a driver that disagrees with
+            // itself must not be allowed to index past the mapping.
+            if stride * coded_h * 3 / 2 > src.len() || top + h > coded_h || left + w > stride {
+                Err(anyhow!(
+                    "capture geometry out of bounds: visible {w}x{h} at ({left},{top}) in {stride}x{coded_h} coded, mapping {} bytes",
+                    src.len()
+                ))
+            } else {
+                let mut data = Vec::with_capacity(w * h * 3 / 2);
+                for row in 0..h {
+                    let o = (top + row) * stride + left;
+                    data.extend_from_slice(&src[o..o + w]);
+                }
+                let uv_base = stride * coded_h;
+                for row in 0..h / 2 {
+                    let o = uv_base + (top / 2 + row) * stride + left;
+                    data.extend_from_slice(&src[o..o + w]);
+                }
+                Ok(Some(RawFrame {
+                    format: PixelFormat::Nv12,
+                    width: w as u32,
+                    height: h as u32,
+                    stride: w as u32,
+                    data,
+                    timestamp_us: d.timestamp_us,
+                }))
             }
-            let uv_base = stride * coded_h;
-            for row in 0..h / 2 {
-                let o = uv_base + (top / 2 + row) * stride + left;
-                data.extend_from_slice(&src[o..o + w]);
-            }
-            Some(RawFrame {
-                format: PixelFormat::Nv12,
-                width: w as u32,
-                height: h as u32,
-                stride: w as u32,
-                data,
-                timestamp_us: d.timestamp_us,
-            })
         };
+        // Requeue regardless of outcome so a geometry error doesn't leak the
+        // capture buffer out of the driver's rotation.
         cap.queue
             .queue(&mut self.ops, idx, 0, 0)
             .context("requeue capture buffer")?;
+        let frame = frame?;
         if frame.is_some() {
             self.unanswered = 0;
         }
@@ -311,13 +330,12 @@ impl<O: Ops> V4l2Decoder<O> {
     }
 
     #[cfg(test)]
-    pub(crate) fn take_calls_on_drop(&mut self) -> std::rc::Rc<std::cell::RefCell<Vec<String>>>
+    pub(crate) fn take_calls_on_drop(&mut self) -> std::sync::Arc<std::sync::Mutex<Vec<String>>>
     where
         O: crate::fake::HasSink,
     {
-        let sink = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         self.ops.set_sink(sink.clone());
-        self.drop_sink = Some(sink.clone());
         sink
     }
 }
@@ -341,6 +359,14 @@ impl<O: Ops + Send> VideoDecoder for V4l2Decoder<O> {
             .output
             .free_slot()
             .ok_or_else(|| anyhow!("no free output buffer"))?;
+        let mapping_len = self.output.buffers[slot].mapping.len();
+        if data.len() > mapping_len {
+            bail!(
+                "access unit of {} bytes exceeds the {} byte output buffer actually allocated",
+                data.len(),
+                mapping_len
+            );
+        }
         self.output.buffers[slot].mapping.as_mut_slice()[..data.len()].copy_from_slice(data);
         self.output
             .queue(&mut self.ops, slot, data.len() as u32, timestamp_us)
@@ -480,7 +506,15 @@ mod tests {
     fn capture_copy_crops_to_the_visible_rectangle() {
         let mut ops = FakeOps::new();
         ops.push_event(src_change());
-        ops.captures_filled = vec![0x80];
+        ops.captures_filled = vec![0x80]; // non-empty triggers FakeOps's positional fill
+                                          // A compose rect with non-zero left/top inside the 640x368 coded frame,
+                                          // so a wrong uv_base, top/2, or dropped left offset makes this fail.
+        ops.compose = v4l2_rect {
+            left: 8,
+            top: 4,
+            width: 624,
+            height: 352,
+        };
         let mut d = V4l2Decoder::with_ops(ops).unwrap();
         d.decode(&KEY, 0).unwrap();
         d.ops.push_dequeue(
@@ -493,9 +527,21 @@ mod tests {
             },
         );
         let f = d.decode(&DELTA, 33_000).unwrap().unwrap();
-        // Y plane is the first 640*360 bytes, UV plane follows immediately (stride == width).
-        assert!(f.data.iter().all(|&b| b == 0x80));
-        assert_eq!(f.data.len(), 640 * 360 + 640 * 180);
+        let (stride, coded_h) = (640usize, 368usize);
+        let (left, top, w, h) = (8usize, 4usize, 624usize, 352usize);
+        let byte_at = |o: usize| (o % 251) as u8;
+        let mut expected = Vec::with_capacity(w * h * 3 / 2);
+        for row in 0..h {
+            let o = (top + row) * stride + left;
+            expected.extend((0..w).map(|c| byte_at(o + c)));
+        }
+        let uv_base = stride * coded_h;
+        for row in 0..h / 2 {
+            let o = uv_base + (top / 2 + row) * stride + left;
+            expected.extend((0..w).map(|c| byte_at(o + c)));
+        }
+        assert_eq!(f.data, expected);
+        assert_eq!(f.data.len(), 624 * 352 + 624 * 176);
     }
 
     #[test]
@@ -648,8 +694,48 @@ mod tests {
         let log = d.take_calls_on_drop();
         d.decode(&KEY, 0).unwrap();
         drop(d);
-        let log = log.borrow();
+        let log = log.lock().unwrap();
         assert!(log.contains(&"streamoff(10)".to_string()));
         assert!(log.contains(&"streamoff(9)".to_string()));
+    }
+
+    #[test]
+    fn bad_capture_geometry_is_reported_and_the_buffer_is_still_requeued() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        // sizeimage smaller than bytesperline * height * 3 / 2: the mapping is
+        // too small for the coded geometry the driver itself reported.
+        ops.capture_format = FormatInfo {
+            width: 640,
+            height: 368,
+            pixelformat: V4L2_PIX_FMT_NV12,
+            bytesperline: 640,
+            sizeimage: 640 * 368, // should be 640*368*3/2
+        };
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 0,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 0,
+                flags: 0,
+            },
+        );
+        let e = d.decode(&DELTA, 33_000).unwrap_err();
+        assert!(e.to_string().contains("geometry"), "{e:#}");
+        assert!(
+            d.ops.calls.iter().any(|c| c.starts_with("qbuf(9,0,")),
+            "capture buffer still requeued despite the geometry error"
+        );
+    }
+
+    #[test]
+    fn startup_fails_if_the_driver_grants_too_few_output_buffers() {
+        let mut ops = FakeOps::new();
+        ops.granted = Some(1);
+        let e = V4l2Decoder::with_ops(ops).err().unwrap();
+        assert!(e.to_string().contains("buffer"), "{e:#}");
     }
 }

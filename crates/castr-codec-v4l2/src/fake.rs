@@ -4,11 +4,10 @@
 
 use crate::ops::*;
 use crate::sys::*;
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 pub(crate) struct FakeOps {
     pub calls: Vec<String>,
@@ -24,20 +23,15 @@ pub(crate) struct FakeOps {
     pub polls: VecDeque<PollResult>,
     pub fail_next: Option<&'static str>,
     pub captures_filled: Vec<u8>,
-    pub sink: Option<Rc<RefCell<Vec<String>>>>,
+    pub sink: Option<Arc<Mutex<Vec<String>>>>,
 }
 
-// SAFETY: `FakeOps` holds an `Rc` only to support the drop-sink hook used by
-// unit tests. Tests are single-threaded and never share a `FakeOps` (or a
-// `V4l2Decoder<FakeOps>`) across threads.
-unsafe impl Send for FakeOps {}
-
 pub(crate) trait HasSink {
-    fn set_sink(&mut self, sink: Rc<RefCell<Vec<String>>>);
+    fn set_sink(&mut self, sink: Arc<Mutex<Vec<String>>>);
 }
 
 impl HasSink for FakeOps {
-    fn set_sink(&mut self, sink: Rc<RefCell<Vec<String>>>) {
+    fn set_sink(&mut self, sink: Arc<Mutex<Vec<String>>>) {
         self.sink = Some(sink);
     }
 }
@@ -45,7 +39,7 @@ impl HasSink for FakeOps {
 impl Drop for FakeOps {
     fn drop(&mut self) {
         if let Some(s) = &self.sink {
-            *s.borrow_mut() = self.calls.clone();
+            *s.lock().unwrap() = self.calls.clone();
         }
     }
 }
@@ -165,8 +159,11 @@ impl Ops for FakeOps {
         self.record(format!("mmap({length},{offset})"))?;
         let mut m = Mapping::owned(length);
         if !self.captures_filled.is_empty() {
-            let fill = self.captures_filled[0];
-            m.as_mut_slice().fill(fill);
+            // Fill positionally (not a single repeated byte) so tests that
+            // read specific offsets can actually detect a wrong stride/base.
+            for (i, b) in m.as_mut_slice().iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
         }
         Ok(m)
     }
