@@ -1,0 +1,5 @@
+# Shell scripts and systemd units are consumed by Linux; a CRLF checkout on
+# Windows would make the Pi refuse to exec them (`#!/bin/sh`).
+scripts/pi/** text eol=lf
+*.sh text eol=lf
+*.service text eol=lf

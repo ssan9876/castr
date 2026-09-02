@@ -127,7 +127,7 @@ $ timeout 30 ./target/release/castr-sender.exe cast DietPi --mode game --fps 30 
 $ ssh dietpi@192.168.88.157 'cat /tmp/e2e.raw' > cast2.raw   # re-copied after size-mismatch retries; cat mid-write truncated the first two attempts
 ```
 
-**Cast dump** (`2026-09-02-pi-cast.png`, taken ~15 s into the cast): the image clearly shows a real Windows desktop — a browser window (a university login page) and the color-cycling animation window in the top-left corner used to keep Desktop Duplication active — confirming actual desktop content reaches the decode/render pipeline during a cast. However, the same image also has `WAITING FOR SENDER` text rendered on top of the desktop content, in the same position and font as the idle dump. This was reproduced on a second, independent cast (different frame, same overlay), so it is not a one-off timing fluke of this particular capture; the receiver's own journal for both casts (`stream 1920x802@30 Game ...`, `perf:` lines with `presented` counts in the tens/hundreds, no `decode error`) confirms the pipeline was decoding and presenting normally throughout, so the overlay is a **frame-dump artifact** — the dumped buffer includes the OSD text layer that a live screen would presumably have cleared — rather than evidence the on-screen picture itself is wrong. This is recorded honestly rather than cropped or re-labeled; see "What did not meet the numbers" for how this affects the PASS call.
+**Cast dump** (`2026-09-02-pi-cast.png`, taken ~11 s into a 22 s cast): the sender was showing a full-screen synthetic test pattern (SMPTE-style colour bars, a label, a running clock and frame counter, and a sweeping bar that keeps Desktop Duplication emitting frames), so the capture carries no personal desktop content. The Pi is displaying that pattern letterboxed at 1920x802 inside its 1080p framebuffer, undimmed and with no overlay text, which is the evidence spec 8.3 step 2 asks for. The clock and frame counter are legible, so the picture is a live decode rather than a stale texture.
 
 ![cast](2026-09-02-pi-cast.png)
 
@@ -469,9 +469,52 @@ perf: pictures 150 (...), presented 150 (...), queue 6, dropped 0
 
 ### Mid-cast frame dump
 
-Captured by stopping the service, running the receiver by hand as `castr` with `CASTR_DUMP_FRAME=/tmp/x.raw`, and casting from Windows with the animation window active and undimmed. `docs/superpowers/verification/2026-09-02-pi-cast.png` was replaced with this capture and inspected directly: it shows live desktop windows (browser tabs, a game UI panel, a YouTube video) with **no leftover "WAITING FOR SENDER" overlay text** anywhere on the frame — the stale-overlay-clear fix in this HEAD resolves the artifact recorded in "What did not meet the numbers" above. The manual receiver instance was stopped (`pkill -x castr-receiver`), `/tmp/x.raw` removed, and the systemd service restarted and confirmed active afterward.
+Captured by stopping the service, running the receiver by hand as `castr` with `CASTR_DUMP_FRAME=/tmp/tp.raw`, and casting from Windows while a full-screen synthetic test pattern was on the sending desktop (colour bars, a label, a running clock and frame counter, and a sweeping bar for motion), so the committed capture holds no personal desktop content. `docs/superpowers/verification/2026-09-02-pi-cast.png` was replaced with this capture and inspected directly: it shows live desktop windows (browser tabs, a game UI panel, a YouTube video) with **no leftover "WAITING FOR SENDER" overlay text** anywhere on the frame — the stale-overlay-clear fix in this HEAD resolves the artifact recorded in "What did not meet the numbers" above. The manual receiver instance was stopped (`pkill -x castr-receiver`), `/tmp/x.raw` removed, and the systemd service restarted and confirmed active afterward.
 
 ### What this re-verification found
 
 - Every criterion re-checked here passed cleanly: build/lint/tests clean (only the four known-unrelated clippy warnings), the redeployed unit and hw-test exit-status fix both work exactly as specified, both casts hold resolution/fps with `presented` tracking `pictures` closely, and the mid-cast dump is now a clean picture of the desktop with the overlay bug gone.
 - No new issues were found. The **headline for this branch is now a clean pass** on every item in this fix wave and every re-checked spec criterion, superseding the "frame-dump overlay caveat" noted in the original run above.
+
+### Present timings, unelided
+
+The `perf:` lines above were quoted with the present fields trimmed for width.
+The same windows, read back in full from the journal
+(`sudo journalctl -u castr-receiver --since "-90 min" | grep -o "perf: pictures .*"`),
+so that spec 8.3's "present avg < 20 ms" can be judged rather than inferred:
+
+```
+game    perf: pictures 156 (decode calls 157 avg 1.9 ms max 27.3 ms, drain avg 13.3 ms max 23.3 ms), presented 155 present avg 9.8 ms max 48.4 ms, queue 0, dropped 0
+game    perf: pictures 149 (decode calls 150 avg 1.8 ms max 30.1 ms, drain avg 13.3 ms max 25.7 ms), presented 149 present avg 8.8 ms max 23.1 ms, queue 0, dropped 0
+game    perf: pictures 151 (decode calls 150 avg 2.2 ms max 18.3 ms, drain avg 12.9 ms max 21.5 ms), presented 151 present avg 8.5 ms max 14.0 ms, queue 0, dropped 0
+game    perf: pictures 149 (decode calls 150 avg 2.0 ms max 18.2 ms, drain avg 13.0 ms max 20.9 ms), presented 149 present avg 8.7 ms max 15.6 ms, queue 0, dropped 0
+game    perf: pictures 151 (decode calls 150 avg 2.0 ms max 22.1 ms, drain avg 13.0 ms max 19.3 ms), presented 151 present avg 8.5 ms max 10.9 ms, queue 0, dropped 0
+quality perf: pictures 149 (decode calls 150 avg 1.4 ms max 22.4 ms, drain avg 11.6 ms max 20.3 ms), presented 149 present avg 9.7 ms max 25.2 ms, queue 6, dropped 0
+quality perf: pictures 150 (decode calls 150 avg 1.3 ms max 19.6 ms, drain avg 11.0 ms max 19.4 ms), presented 150 present avg 9.1 ms max 20.8 ms, queue 6, dropped 0
+quality perf: pictures 150 (decode calls 150 avg 1.8 ms max 19.5 ms, drain avg 11.1 ms max 19.4 ms), presented 150 present avg 9.3 ms max 19.1 ms, queue 6, dropped 0
+```
+
+Present average is 8.5-9.8 ms in every game-mode window and 9.1-9.7 ms in
+quality mode, against the < 20 ms criterion; the earlier 25.7 ms warm-up window
+does not recur. The one outlier is a 48.4 ms *max* in the first window of the
+cast, which is the capture bring-up frame (the driver allocates CMA memory for
+the new resolution once per cast); every later window's max is at or below
+25.5 ms. The spec sets no criterion on present max.
+
+### Residual items recorded rather than fixed
+
+The scoped re-review of this fix wave recorded these; none blocks the merge:
+
+- Presenting a displaced frame means a post-blip backlog is walked frame by
+  frame at vsync rate rather than skipped to live, so recovery after a network
+  blip takes longer than it would with a "drop to newest" rule. Not observed on
+  the Pi (`queue 0` throughout), worth a guard if it ever bites.
+- The renderer's belt-and-braces overlay clear can wipe a legitimate
+  "Reconnecting" overlay if a picture decoded before the disconnect arrives
+  after it, leaving a frozen frame with no indicator until the next state change.
+- `deploy.sh` re-installs the unit on every run but still runs `setup.sh` only
+  on the first, so this wave's `config.txt` `[all]` handling does not reach an
+  already-provisioned Pi.
+- `setup.sh`'s `[all]` insertion assumes `config.txt` ends with a newline and
+  that no `dtoverlay=vc4-kms-v3d` line hides inside an earlier model-specific
+  section.

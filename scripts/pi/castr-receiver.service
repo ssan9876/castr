@@ -12,7 +12,9 @@ Environment=XDG_CONFIG_HOME=/var/lib/castr/config
 # Wait (bounded) for the DRM device and the V4L2 codec device on early boot.
 # The loops live in a separate script because unit files must not contain a
 # literal `$` - systemd substitutes $WORD tokens before the shell sees them.
-ExecStartPre=/usr/local/lib/castr/wait-devices.sh
+# `-`: a missing or unexecutable wait script must not stop the receiver from
+# starting; the script itself exits 0 regardless of what it finds.
+ExecStartPre=-/usr/local/lib/castr/wait-devices.sh
 TimeoutStartSec=30
 ExecStart=/usr/local/bin/castr-receiver --fullscreen
 Restart=always
