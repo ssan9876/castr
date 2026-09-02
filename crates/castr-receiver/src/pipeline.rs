@@ -57,28 +57,44 @@ impl ErrorWindow {
 }
 
 /// Decode/present timing shared between the decode thread and the SDL loop,
-/// reported every few seconds (spec section 5).
+/// reported every few seconds (spec section 5). `calls` counts every
+/// `decode` invocation (the denominator for decode avg/max); `pictures`
+/// counts every decoded frame actually produced, whether returned directly
+/// by `decode` or fetched afterwards via `poll_frame` ("drained"). On the
+/// Pi most 1080p pictures arrive through `poll_frame`, and each drain can
+/// cost real time (a buffer copy), so it is timed separately from `decode`.
 #[derive(Default)]
 pub struct PerfStats {
-    decoded: u32,
+    calls: u32,
     decode_total: Duration,
     decode_max: Duration,
+    pictures: u32,
+    drains: u32,
+    drain_total: Duration,
+    drain_max: Duration,
     presented: u32,
     present_total: Duration,
     present_max: Duration,
 }
 
 impl PerfStats {
-    pub fn decode(&mut self, d: Duration) {
-        self.decoded += 1;
+    /// Records one `decode` call taking `d`. `picture` is true when it
+    /// returned a decoded frame directly (as opposed to it showing up later
+    /// via `poll_frame`).
+    pub fn decode(&mut self, d: Duration, picture: bool) {
+        self.calls += 1;
         self.decode_total += d;
         self.decode_max = self.decode_max.max(d);
+        if picture {
+            self.pictures += 1;
+        }
     }
-    /// Counts a picture drained via `poll_frame` as decoded, with zero decode
-    /// time attributed to it (the time was already spent in the `decode` call
-    /// that produced it internally).
-    pub fn decoded_extra(&mut self) {
-        self.decoded += 1;
+    /// Records one picture fetched via `poll_frame`, which took `d`.
+    pub fn drained(&mut self, d: Duration) {
+        self.pictures += 1;
+        self.drains += 1;
+        self.drain_total += d;
+        self.drain_max = self.drain_max.max(d);
     }
     pub fn present(&mut self, d: Duration) {
         self.presented += 1;
@@ -95,10 +111,13 @@ impl PerfStats {
     /// One log line, then reset.
     pub fn take_report(&mut self, queue_depth: u32, dropped: u32) -> String {
         let s = format!(
-            "perf: decoded {} decode avg {:.1} ms max {:.1} ms, presented {} present avg {:.1} ms max {:.1} ms, queue {}, dropped {}",
-            self.decoded,
-            Self::avg(self.decode_total, self.decoded),
+            "perf: pictures {} (decode calls {} avg {:.1} ms max {:.1} ms, drain avg {:.1} ms max {:.1} ms), presented {} present avg {:.1} ms max {:.1} ms, queue {}, dropped {}",
+            self.pictures,
+            self.calls,
+            Self::avg(self.decode_total, self.calls),
             self.decode_max.as_secs_f64() * 1000.0,
+            Self::avg(self.drain_total, self.drains),
+            self.drain_max.as_secs_f64() * 1000.0,
             self.presented,
             Self::avg(self.present_total, self.presented),
             self.present_max.as_secs_f64() * 1000.0,
@@ -230,9 +249,10 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                 loop {
                     let frame = jitter.lock().unwrap().pop(now_us(start));
                     let Some(f) = frame else {
+                        let t = Instant::now();
                         match decoder.poll_frame() {
                             Ok(Some(raw)) => {
-                                perf.lock().unwrap().decoded_extra();
+                                perf.lock().unwrap().drained(t.elapsed());
                                 if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
                                     return;
                                 }
@@ -248,7 +268,9 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                     tracing::debug!("decode frame {} key={}", f.frame_number, f.keyframe);
                     let t = Instant::now();
                     let result = decoder.decode(&f.data, f.timestamp_us);
-                    perf.lock().unwrap().decode(t.elapsed());
+                    perf.lock()
+                        .unwrap()
+                        .decode(t.elapsed(), matches!(result, Ok(Some(_))));
                     match result {
                         Ok(Some(raw)) => {
                             last_decoded = Some(f.frame_number);
@@ -271,6 +293,11 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                                 // Three failures in ten seconds: rebuild, then
                                 // fall back to software for the session (spec 3.1).
                                 tracing::warn!("rebuilding decoder after repeated errors");
+                                // Drop the failing decoder (e.g. its /dev/video10
+                                // fd and MMAP buffers on the Pi) before opening a
+                                // replacement, or the driver may refuse a second
+                                // concurrent open and the rebuild fails spuriously.
+                                drop(decoder);
                                 decoder = match open_decoder(choice) {
                                     Ok(d) => d,
                                     Err(e) => {
@@ -291,10 +318,20 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                             continue;
                         }
                     }
-                    while let Ok(Some(raw)) = decoder.poll_frame() {
-                        perf.lock().unwrap().decoded_extra();
-                        if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
-                            return;
+                    loop {
+                        let t = Instant::now();
+                        match decoder.poll_frame() {
+                            Ok(Some(raw)) => {
+                                perf.lock().unwrap().drained(t.elapsed());
+                                if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!("poll_frame error: {e:#}");
+                                break;
+                            }
                         }
                     }
                 }
@@ -331,6 +368,10 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     let mut latest_video_ts: Option<u64> = None;
     let mut warned_audio_lag = false;
     let mut last_perf = Instant::now();
+    // Time of the last actual `present`, separate from `last_video` (which the
+    // redraw branch below also touches every ~50 ms even while idle, so it
+    // can never be used to detect idleness).
+    let mut last_present = Instant::now();
     let mut streaming_seen = false;
     loop {
         if renderer.poll_quit() {
@@ -386,7 +427,14 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                 renderer.present(&f)?;
                 perf.lock().unwrap().present(t.elapsed());
                 last_video = Instant::now();
-                streaming_seen = true;
+                last_present = Instant::now();
+                if !streaming_seen {
+                    // Resuming after idle: start the report window fresh so
+                    // the first report doesn't fire immediately over a
+                    // mostly-idle partial window.
+                    streaming_seen = true;
+                    last_perf = Instant::now();
+                }
             } else {
                 pending = Some(f);
             }
@@ -396,7 +444,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
             let depth = jitter.lock().unwrap().depth() as u32;
             let dropped = dropped_since_report.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("{}", perf.lock().unwrap().take_report(depth, dropped));
-            if last_video.elapsed() > Duration::from_secs(5) {
+            if last_present.elapsed() > Duration::from_secs(5) {
                 streaming_seen = false; // idle: stop reporting until video flows again
             }
         }
@@ -805,16 +853,21 @@ mod tests {
     #[test]
     fn perf_stats_report_averages_and_maxima() {
         let mut p = PerfStats::default();
-        p.decode(Duration::from_millis(10));
-        p.decode(Duration::from_millis(30));
+        p.decode(Duration::from_millis(10), false);
+        p.decode(Duration::from_millis(30), true);
+        p.drained(Duration::from_millis(20));
         p.present(Duration::from_millis(5));
         let s = p.take_report(2, 1);
-        assert!(s.contains("decoded 2"), "{s}");
-        assert!(s.contains("decode avg 20.0 ms max 30.0 ms"), "{s}");
-        assert!(s.contains("present avg 5.0 ms max 5.0 ms"), "{s}");
+        assert!(s.contains("pictures 2"), "{s}");
+        assert!(s.contains("decode calls 2 avg 20.0 ms max 30.0 ms"), "{s}");
+        assert!(s.contains("drain avg 20.0 ms max 20.0 ms"), "{s}");
+        assert!(
+            s.contains("presented 1 present avg 5.0 ms max 5.0 ms"),
+            "{s}"
+        );
         assert!(s.contains("queue 2"), "{s}");
         assert!(s.contains("dropped 1"), "{s}");
         // Taking resets the counters.
-        assert!(p.take_report(0, 0).contains("decoded 0"));
+        assert!(p.take_report(0, 0).contains("pictures 0"));
     }
 }
