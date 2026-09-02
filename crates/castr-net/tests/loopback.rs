@@ -9,6 +9,8 @@ fn loopback() -> SocketAddr {
     "127.0.0.1:0".parse().unwrap()
 }
 
+static DISCOVERY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn pair() -> (Identity, Identity, Endpoint, Endpoint) {
     let recv_id = Identity::generate().unwrap();
     let send_id = Identity::generate().unwrap();
@@ -175,8 +177,10 @@ async fn accept_survives_peer_that_never_opens_control_stream() {
     stalling.close(0u32.into(), b"bye");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // current_thread runtime: no cross-thread contention while held
 async fn udp_probe_finds_advertiser_on_loopback() {
+    let _guard = DISCOVERY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let fp = [0x42u8; 32];
     let adv = Advertiser::start("Test Receiver", fp, 5555, 0)
         .await
@@ -193,8 +197,10 @@ async fn udp_probe_finds_advertiser_on_loopback() {
     assert_eq!(hit.version, PROTOCOL_VERSION);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
+#[allow(clippy::await_holding_lock)] // current_thread runtime: no cross-thread contention while held
 async fn browse_with_nothing_advertised_returns_empty() {
+    let _guard = DISCOVERY_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let found = browse(std::time::Duration::from_millis(300), 1)
         .await
         .unwrap();
