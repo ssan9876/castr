@@ -174,3 +174,29 @@ async fn accept_survives_peer_that_never_opens_control_stream() {
     stalling_conn.close(0u32.into(), b"bye");
     stalling.close(0u32.into(), b"bye");
 }
+
+#[tokio::test]
+async fn udp_probe_finds_advertiser_on_loopback() {
+    let fp = [0x42u8; 32];
+    let adv = Advertiser::start("Test Receiver", fp, 5555, 0)
+        .await
+        .unwrap();
+    let found = browse(std::time::Duration::from_millis(800), adv.probe_port())
+        .await
+        .unwrap();
+    let hit = found
+        .iter()
+        .find(|r| r.fingerprint == fp)
+        .expect("advertiser discovered");
+    assert_eq!(hit.name, "Test Receiver");
+    assert_eq!(hit.addr.port(), 5555);
+    assert_eq!(hit.version, PROTOCOL_VERSION);
+}
+
+#[tokio::test]
+async fn browse_with_nothing_advertised_returns_empty() {
+    let found = browse(std::time::Duration::from_millis(300), 1)
+        .await
+        .unwrap();
+    assert!(found.iter().all(|r| r.fingerprint != [0x42u8; 32]));
+}
