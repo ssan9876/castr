@@ -1,0 +1,22 @@
+[package]
+name = "castr-receiver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+hex.workspace = true
+rand.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+sdl2 = { workspace = true, features = ["unsafe_textures"] }
+castr-proto = { path = "../castr-proto" }
+castr-net = { path = "../castr-net" }
+castr-media = { path = "../castr-media" }
+
+[target.'cfg(windows)'.dependencies]
+castr-codec-win = { path = "../castr-codec-win" }
