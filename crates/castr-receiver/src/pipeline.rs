@@ -420,7 +420,12 @@ async fn handle_connection(
 }
 
 async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> anyhow::Result<()> {
-    let mut reasm = Reassembler::new(500_000);
+    // One reassembler per stream. A shared one lets an audio packet advance the
+    // `newest_completed` watermark past a video frame that is still missing
+    // fragments, after which the video frame's remaining fragments are dropped
+    // as "old" and the frame never completes.
+    let mut video_reasm = Reassembler::new(500_000);
+    let mut audio_reasm = Reassembler::new(500_000);
     let mut nack_tx = link.open_nack_stream().await?;
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut stats_tick = tokio::time::interval(Duration::from_millis(100));
@@ -438,6 +443,9 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
             d = link.recv_datagram() => {
                 let d = d?;
                 fragments_received += 1;
+                // Stream id is byte 0 of the datagram header (spec 6.2).
+                let is_video = d.first() == Some(&STREAM_VIDEO);
+                let reasm = if is_video { &mut video_reasm } else { &mut audio_reasm };
                 if let Some(f) = reasm.push(&d, now_us(cfg.start))? {
                     match f.stream {
                         STREAM_VIDEO => {
@@ -486,12 +494,15 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
                 if goodbye { return Ok(()); }
             }
             _ = tick.tick() => {
-                for n in reasm.tick(now_us(cfg.start)) { nack_tx.send(&n).await?; }
+                // Audio frames are never fragmented, so its reassembler is only
+                // ticked to expire partials; its NACKs are meaningless.
+                let _ = audio_reasm.tick(now_us(cfg.start));
+                for n in video_reasm.tick(now_us(cfg.start)) { nack_tx.send(&n).await?; }
             }
             _ = stats_tick.tick() => {
                 let dropped = cfg.jitter.lock().unwrap().dropped();
                 let depth = cfg.stats.lock().unwrap().decode_queue_depth;
-                let s = Stats { frames_received, frames_dropped: dropped, fragments_lost: reasm.fragments_lost() as u32, fragments_received, decode_queue_depth: depth, interval_ms: 100 };
+                let s = Stats { frames_received, frames_dropped: dropped, fragments_lost: (video_reasm.fragments_lost() + audio_reasm.fragments_lost()) as u32, fragments_received, decode_queue_depth: depth, interval_ms: 100 };
                 frames_received = 0; fragments_received = 0;
                 link.send_control(&ControlMessage::Stats(s)).await?;
             }
