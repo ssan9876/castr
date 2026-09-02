@@ -27,6 +27,8 @@ pub struct Beacon {
     pub version: u16,
 }
 
+/// Dropping this blocks for up to 2s while the mDNS daemon unregisters the
+/// service and shuts down, so the goodbye is sent before the drop returns.
 pub struct Advertiser {
     mdns: Option<ServiceDaemon>,
     fullname: String,
@@ -116,8 +118,12 @@ impl Drop for Advertiser {
     fn drop(&mut self) {
         self.responder.abort();
         if let Some(d) = self.mdns.take() {
-            let _ = d.unregister(&self.fullname);
-            let _ = d.shutdown();
+            if let Ok(rx) = d.unregister(&self.fullname) {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+            }
+            if let Ok(rx) = d.shutdown() {
+                let _ = rx.recv_timeout(std::time::Duration::from_secs(1));
+            }
         }
     }
 }
