@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", features = ["alloc"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+sha2 = "0.10"
+hmac = "0.12"
+spake2 = "0.4"
+rand = "0.8"
+hex = "0.4"
+toml = "0.8"
+dirs = "5"
+mdns-sd = "0.11"
+openh264 = { version = "0.6", features = ["source"] }
+audiopus = "0.2"
+sdl2 = { version = "0.36", features = ["bundled", "static-link"] }
+eframe = "0.28"
+windows = "0.58"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

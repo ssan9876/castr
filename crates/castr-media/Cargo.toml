@@ -1,0 +1,14 @@
+[package]
+name = "castr-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+openh264.workspace = true
+audiopus.workspace = true
+castr-proto = { path = "../castr-proto" }
