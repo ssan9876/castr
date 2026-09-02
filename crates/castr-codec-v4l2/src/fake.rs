@@ -4,9 +4,11 @@
 
 use crate::ops::*;
 use crate::sys::*;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io;
 use std::os::fd::OwnedFd;
+use std::rc::Rc;
 
 pub(crate) struct FakeOps {
     pub calls: Vec<String>,
@@ -22,6 +24,30 @@ pub(crate) struct FakeOps {
     pub polls: VecDeque<PollResult>,
     pub fail_next: Option<&'static str>,
     pub captures_filled: Vec<u8>,
+    pub sink: Option<Rc<RefCell<Vec<String>>>>,
+}
+
+// SAFETY: `FakeOps` holds an `Rc` only to support the drop-sink hook used by
+// unit tests. Tests are single-threaded and never share a `FakeOps` (or a
+// `V4l2Decoder<FakeOps>`) across threads.
+unsafe impl Send for FakeOps {}
+
+pub(crate) trait HasSink {
+    fn set_sink(&mut self, sink: Rc<RefCell<Vec<String>>>);
+}
+
+impl HasSink for FakeOps {
+    fn set_sink(&mut self, sink: Rc<RefCell<Vec<String>>>) {
+        self.sink = Some(sink);
+    }
+}
+
+impl Drop for FakeOps {
+    fn drop(&mut self) {
+        if let Some(s) = &self.sink {
+            *s.borrow_mut() = self.calls.clone();
+        }
+    }
 }
 
 impl FakeOps {
@@ -55,6 +81,7 @@ impl FakeOps {
             polls: VecDeque::new(),
             fail_next: None,
             captures_filled: Vec::new(),
+            sink: None,
         }
     }
     pub fn push_dequeue(&mut self, buf_type: u32, d: Dequeued) {
