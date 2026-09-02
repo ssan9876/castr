@@ -565,14 +565,27 @@ pub async fn cast(
             _ = link.closed() => {
                 set_state("reconnecting");
                 tracing::warn!("connection lost, reconnecting");
-                match reconnect_draining(&ep, target.addr, &opts.sender_name, &mut token, &mut video_rx, &mut audio_rx).await {
+                let mut video_alive = true;
+                let channels = ReconnectChannels {
+                    video_rx: &mut video_rx,
+                    audio_rx: &mut audio_rx,
+                    video_alive: &mut video_alive,
+                    audio_alive: &mut audio_alive,
+                };
+                match reconnect_draining(&ep, target.addr, &opts.sender_name, &mut token, channels).await {
                     Ok(l) => {
                         link = l;
+                        if !video_alive {
+                            set_state("failed");
+                            stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
+                            bail!("capture thread exited");
+                        }
                         match link.recv_control().await? {
                             ControlMessage::HelloAck { .. } => {}
                             other => bail!("resume failed: {other:?}"),
                         }
                         nack_rx = None;
+                        control_errors = 0;
                         link.send_control(&ControlMessage::StartStream(params.clone())).await?;
                         enc_tx.send(EncCmd::Keyframe).ok();
                         set_state("casting");
@@ -602,18 +615,42 @@ pub async fn cast(
     Ok(())
 }
 
+/// Bundles the capture/audio drain state `reconnect_draining` needs, so the
+/// function stays under clippy's argument-count lint instead of taking each
+/// receiver/flag as its own parameter.
+struct ReconnectChannels<'a> {
+    video_rx: &'a mut mpsc::Receiver<VideoOut>,
+    audio_rx: &'a mut mpsc::Receiver<AudioOut>,
+    video_alive: &'a mut bool,
+    audio_alive: &'a mut bool,
+}
+
 /// Reconnects like `connect_with_retry`, but keeps draining `video_rx` and
 /// `audio_rx` while doing so. Without this, the capture/audio threads block
 /// on `blocking_send` into full channels once reconnection takes longer than
 /// a few frames, stalling capture for the whole outage.
+///
+/// `video_alive`/`audio_alive` reflect the caller's current belief about
+/// whether the capture/audio threads are still running; once a channel
+/// reports closed, its drain arm is disabled (via the `if` guard) instead of
+/// busy-polling a `recv()` that now resolves to `None` immediately on every
+/// poll. The caller's flags are updated in place so its own state (e.g. the
+/// main loop's `audio_alive`) stays consistent with what happened during the
+/// outage; video is not optional, so the caller must check `*video_alive`
+/// after this returns `Ok` and bail out if it went false.
 async fn reconnect_draining(
     ep: &Endpoint,
     addr: std::net::SocketAddr,
     name: &str,
     token: &mut Option<[u8; 16]>,
-    video_rx: &mut mpsc::Receiver<VideoOut>,
-    audio_rx: &mut mpsc::Receiver<AudioOut>,
+    channels: ReconnectChannels<'_>,
 ) -> anyhow::Result<Link> {
+    let ReconnectChannels {
+        video_rx,
+        audio_rx,
+        video_alive,
+        audio_alive,
+    } = channels;
     let mut dropped = 0u64;
     let mut connect_fut = std::pin::pin!(connect_with_retry(
         ep,
@@ -631,8 +668,21 @@ async fn reconnect_draining(
                 }
                 return res;
             }
-            v = video_rx.recv() => { if v.is_some() { dropped += 1; } }
-            a = audio_rx.recv() => { if a.is_some() { dropped += 1; } }
+            v = video_rx.recv(), if *video_alive => {
+                match v {
+                    Some(_) => dropped += 1,
+                    None => {
+                        tracing::warn!("capture thread exited while reconnecting");
+                        *video_alive = false;
+                    }
+                }
+            }
+            a = audio_rx.recv(), if *audio_alive => {
+                match a {
+                    Some(_) => dropped += 1,
+                    None => *audio_alive = false,
+                }
+            }
         }
     }
 }
