@@ -305,14 +305,18 @@ impl VideoEncoder for MfEncoder {
         }
         // A single input can unblock more than one queued output (e.g. after
         // MF_E_NOTACCEPTING would otherwise have hit us on the next ProcessInput).
-        // Drain everything the transform is willing to hand back right now; only the
-        // first (in FIFO order, oldest queued first) is returned from this call, the
-        // rest are queued for subsequent calls. For an async MFT, the event contract
-        // only permits one `ProcessOutput` per `METransformHaveOutput`, so only keep
-        // going while another such event is already queued (checked without waiting);
-        // a synchronous MFT has no event queue and `take_output` itself terminates the
+        // Drain everything the transform is willing to hand back right now, pushing
+        // every one obtained in this call onto the back of `pending` in the order
+        // they were produced (oldest first) so delivery order is never rotated; the
+        // caller always gets the oldest queued output overall, not just the oldest
+        // from this call. For an async MFT, the event contract only permits one
+        // `ProcessOutput` per `METransformHaveOutput`, so only keep going while
+        // another such event is already queued (checked without waiting); a
+        // synchronous MFT has no event queue and `take_output` itself terminates the
         // loop by returning `None` once it reports `MF_E_TRANSFORM_NEED_MORE_INPUT`.
-        let fresh = self.take_output()?;
+        if let Some(fresh) = self.take_output()? {
+            self.pending.push_back(fresh);
+        }
         loop {
             if self.events.is_some() && !self.pump_events(Duration::ZERO)? {
                 break;
@@ -322,14 +326,7 @@ impl VideoEncoder for MfEncoder {
                 None => break,
             }
         }
-        if let Some(queued) = self.pending.pop_front() {
-            if let Some(f) = fresh {
-                self.pending.push_back(f);
-            }
-            Ok(Some(queued))
-        } else {
-            Ok(fresh)
-        }
+        Ok(self.pending.pop_front())
     }
 
     fn request_keyframe(&mut self) {

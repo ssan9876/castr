@@ -122,3 +122,21 @@ fn mf_decoder_decodes_openh264_output() {
     }
     assert!(decoded >= 20, "decoded {decoded}");
 }
+
+#[test]
+fn mf_encoder_timestamps_are_monotonic() {
+    let mut enc = MfEncoder::new(cfg()).unwrap();
+    let mut last: Option<u64> = None;
+    for i in 0..60 {
+        if let Some(e) = enc.encode(&frame(i)).unwrap() {
+            if let Some(prev) = last {
+                assert!(
+                    e.timestamp_us > prev,
+                    "timestamp did not increase: prev={prev} next={}",
+                    e.timestamp_us
+                );
+            }
+            last = Some(e.timestamp_us);
+        }
+    }
+}
