@@ -3,3 +3,5 @@ pub mod header;
 pub use header::*;
 pub mod packetize;
 pub use packetize::*;
+pub mod reassemble;
+pub use reassemble::*;
