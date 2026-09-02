@@ -3174,12 +3174,24 @@ impl Endpoint {
 
     pub fn local_addr(&self) -> anyhow::Result<SocketAddr> { Ok(self.inner.local_addr()?) }
 
+    /// QUIC does not announce a stream to the peer until bytes are written on it, so the
+    /// sender writes this preamble right after opening the control stream and the receiver
+    /// consumes it before handing the Link out.
+    const CONTROL_PREAMBLE: &'static [u8; 4] = b"CTRL";
+
     pub async fn accept(&self) -> anyhow::Result<Link> {
         loop {
             let incoming = self.inner.accept().await.ok_or_else(|| anyhow!("endpoint closed"))?;
             match incoming.await {
                 Ok(conn) => match conn.accept_bi().await {
-                    Ok((tx, rx)) => return Link::new(conn, tx, rx),
+                    Ok((tx, mut rx)) => {
+                        let mut preamble = [0u8; 4];
+                        match rx.read_exact(&mut preamble).await {
+                            Ok(()) if &preamble == Self::CONTROL_PREAMBLE => return Link::new(conn, tx, rx),
+                            Ok(()) => tracing::warn!("bad control preamble {preamble:?}"),
+                            Err(e) => tracing::warn!("control preamble read failed: {e}"),
+                        }
+                    }
                     Err(e) => tracing::warn!("control stream not opened: {e}"),
                 },
                 Err(e) => tracing::warn!("handshake failed: {e}"),
@@ -3189,7 +3201,8 @@ impl Endpoint {
 
     pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<Link> {
         let conn = self.inner.connect(addr, "castr.local")?.await.context("QUIC handshake")?;
-        let (tx, rx) = conn.open_bi().await.context("open control stream")?;
+        let (mut tx, rx) = conn.open_bi().await.context("open control stream")?;
+        tx.write_all(Self::CONTROL_PREAMBLE).await.context("control preamble")?;
         Link::new(conn, tx, rx)
     }
 
