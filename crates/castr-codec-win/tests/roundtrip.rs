@@ -89,3 +89,36 @@ fn mf_encoder_honors_keyframe_request_and_live_bitrate() {
         "expected initial keyframe plus a requested one, got {keys}"
     );
 }
+
+#[test]
+fn mf_decoder_decodes_mf_encoder_output() {
+    let mut enc = MfEncoder::new(cfg()).unwrap();
+    let mut dec = MfDecoder::new().unwrap();
+    let mut decoded = 0;
+    for i in 0..30 {
+        if let Some(e) = enc.encode(&frame(i)).unwrap() {
+            if let Some(d) = dec.decode(&e.data, e.timestamp_us).unwrap() {
+                assert_eq!((d.width, d.height, d.format), (640, 360, PixelFormat::Nv12));
+                assert_eq!(d.data.len(), 640 * 360 * 3 / 2);
+                decoded += 1;
+            }
+        }
+    }
+    assert!(decoded >= 20, "decoded {decoded}");
+}
+
+#[test]
+fn mf_decoder_decodes_openh264_output() {
+    let mut enc = castr_media::sw::SwEncoder::new(cfg()).unwrap();
+    let mut dec = MfDecoder::new().unwrap();
+    let mut decoded = 0;
+    for i in 0..30 {
+        let f = convert::convert(&frame(i), PixelFormat::I420);
+        if let Some(e) = enc.encode(&f).unwrap() {
+            if dec.decode(&e.data, e.timestamp_us).unwrap().is_some() {
+                decoded += 1;
+            }
+        }
+    }
+    assert!(decoded >= 20, "decoded {decoded}");
+}
