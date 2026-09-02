@@ -374,6 +374,12 @@ impl<O: Ops> V4l2Decoder<O> {
     /// the driver's own buffers, which is what back-pressures a decoder fed
     /// faster than it can decode. Returns whether anything was dequeued.
     fn collect_capture(&mut self, limit: usize) -> anyhow::Result<bool> {
+        // The sequence has ended (LAST buffer, EPIPE, or a refused requeue):
+        // the driver produces nothing more until the queue is restarted, so
+        // stop asking. `drain_to_last` and a reconfigure clear this.
+        if self.saw_last {
+            return Ok(false);
+        }
         let mut any = false;
         for _ in 0..limit {
             let Some(picture) = self.take_capture()? else {
@@ -409,7 +415,13 @@ impl<O: Ops> V4l2Decoder<O> {
         };
         let idx = d.index as usize;
         let last = d.flags & V4L2_BUF_FLAG_LAST != 0;
-        let frame = if d.bytesused == 0 {
+        // Anything decoded before the first SOURCE_CHANGE came out of the
+        // provisional queue, at the driver's default geometry rather than the
+        // stream's: recycle it, never hand it to the caller.
+        let frame = if cap.provisional {
+            tracing::debug!("v4l2 decoder: dropping a picture from the provisional capture queue");
+            Ok(None)
+        } else if d.bytesused == 0 {
             Ok(None)
         } else {
             let (w, h) = (cap.visible.width as usize, cap.visible.height as usize);
@@ -459,7 +471,16 @@ impl<O: Ops> V4l2Decoder<O> {
             // CAPTURE queue for a source change it has not yet told us about,
             // so our buffer is now the wrong size for it. That is the end of
             // the old sequence; the pending SOURCE_CHANGE rebuilds the queue.
+            //
+            // This is deliberately not restricted to a drain: on the hardware
+            // it fires *outside* one, while collecting normally, because the
+            // driver re-formats the queue before it reports the event. Nothing
+            // in the ioctl tells the two cases apart, and if no source change
+            // follows, the driver simply produces nothing more and the stall
+            // detector fires - so a genuinely malformed QBUF shows up as a
+            // stall rather than being silently swallowed.
             if e.raw_os_error() == Some(libc::EINVAL) {
+                tracing::warn!("v4l2 decoder: capture buffer {idx} refused with EINVAL; treating it as the end of the sequence");
                 self.saw_last = true;
             } else {
                 return Err(anyhow::Error::new(e).context("requeue capture buffer"));
@@ -480,6 +501,9 @@ impl<O: Ops> V4l2Decoder<O> {
     fn wait_for_slot(&mut self, budget: &mut usize) -> anyhow::Result<()> {
         let max_idle = STALL_POLL_MS / POLL_STEP_MS as u64;
         let mut idle = 0u64;
+        // The deadlock-breaking recycle below copies a picture, so like
+        // `budget` it is spent at most once per decode call.
+        let mut fallback = 1usize;
         while self.output.in_flight() >= MAX_IN_FLIGHT {
             let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
             if r.error {
@@ -500,7 +524,8 @@ impl<O: Ops> V4l2Decoder<O> {
             // Nothing moved. The driver may be waiting for a CAPTURE buffer we
             // are holding back to bound this call's latency, so recycle one
             // anyway rather than deadlocking against our own budget.
-            if self.collect_capture(1)? {
+            if fallback > 0 && self.collect_capture(1)? {
+                fallback -= 1;
                 idle = 0;
                 continue;
             }
@@ -510,27 +535,6 @@ impl<O: Ops> V4l2Decoder<O> {
             }
         }
         Ok(())
-    }
-
-    /// Collect a picture the decoder has already produced, without feeding it
-    /// anything. Waits up to one poll step for one to appear.
-    ///
-    /// The driver is pipelined - a picture comes out a few access units after
-    /// the one that produced it - and it batches heavily when it is fed faster
-    /// than real time, so a caller that has run out of input needs a way to
-    /// pull the tail out rather than growing its latency.
-    pub fn poll_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
-        if let Some(f) = self.ready.pop_front() {
-            return Ok(Some(f));
-        }
-        let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
-        if r.error {
-            return Err(poll_error());
-        }
-        self.drain_events()?;
-        self.drain_output()?;
-        self.collect_capture(1)?;
-        Ok(self.ready.pop_front())
     }
 
     #[cfg(test)]
@@ -599,6 +603,27 @@ impl<O: Ops + Send> VideoDecoder for V4l2Decoder<O> {
                 idle.as_millis()
             );
         }
+        Ok(self.ready.pop_front())
+    }
+
+    /// Collect a picture the decoder has already produced, without feeding it
+    /// anything. Waits up to one poll step for one to appear.
+    ///
+    /// The driver is pipelined - a picture comes out a few access units after
+    /// the one that produced it - and it batches heavily when it is fed faster
+    /// than real time, so a caller that has run out of input needs a way to
+    /// pull the tail out rather than growing its latency.
+    fn poll_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
+        if let Some(f) = self.ready.pop_front() {
+            return Ok(Some(f));
+        }
+        let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
+        if r.error {
+            return Err(poll_error());
+        }
+        self.drain_events()?;
+        self.drain_output()?;
+        self.collect_capture(1)?;
         Ok(self.ready.pop_front())
     }
 
@@ -927,6 +952,152 @@ mod tests {
             "every buffer is requeued when the queue restarts: {after:?}"
         );
         assert_eq!(d.frame_size(), Some((640, 360)));
+    }
+
+    #[test]
+    fn poll_frame_hands_back_the_backlog_a_drain_produced() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        // A source change drains the old sequence, so several pictures can
+        // arrive at once. `decode` returns one per call by contract; the rest
+        // must be reachable or they are permanent latency.
+        for i in 0..4u32 {
+            d.ops.push_dequeue(
+                CAP,
+                Dequeued {
+                    index: i,
+                    bytesused: 640 * 368 * 3 / 2,
+                    timestamp_us: i as u64 * 33_000,
+                    flags: 0,
+                },
+            );
+        }
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 4,
+                bytesused: 0,
+                timestamp_us: 0,
+                flags: V4L2_BUF_FLAG_LAST,
+            },
+        );
+        d.ops.capture_format = hd();
+        d.ops.compose = rect(1280, 720);
+        d.ops.push_event(src_change());
+        let first = d.decode(&KEY, 33_000).unwrap().expect("one picture");
+        assert_eq!(first.timestamp_us, 0);
+        let rest: Vec<u64> = std::iter::from_fn(|| d.poll_frame().unwrap())
+            .map(|f| f.timestamp_us)
+            .collect();
+        assert_eq!(rest, vec![33_000, 66_000, 99_000], "in order, then empty");
+        assert!(d.poll_frame().unwrap().is_none());
+    }
+
+    #[test]
+    fn pictures_from_the_provisional_queue_are_dropped_not_returned() {
+        let mut ops = FakeOps::new();
+        // No SOURCE_CHANGE yet: the capture queue is still at the driver's
+        // default geometry, so anything it produces is not this stream's.
+        ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 3,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 7,
+                flags: 0,
+            },
+        );
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        let before = d.ops.calls.len();
+        assert!(
+            d.decode(&KEY, 0).unwrap().is_none(),
+            "no picture is claimed"
+        );
+        assert!(d.frame_size().is_none());
+        assert!(
+            d.ops.calls[before..]
+                .iter()
+                .any(|c| c.starts_with("qbuf(9,3,")),
+            "the buffer is still recycled: {:?}",
+            &d.ops.calls[before..]
+        );
+    }
+
+    #[test]
+    fn a_capture_requeue_refused_with_einval_ends_the_sequence() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        // The driver hands back a picture but then refuses to take the buffer
+        // again: it has already re-formatted the queue for a source change it
+        // has not reported yet.
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 1,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 33_000,
+                flags: 0,
+            },
+        );
+        d.ops.fail_errno = Some(("qbuf(9,", libc::EINVAL));
+        d.ops.capture_format = hd();
+        d.ops.compose = rect(1280, 720);
+        d.ops.push_event(src_change());
+        // No error surfaces, the picture is kept, and the drain finishes at
+        // once instead of polling out its whole budget.
+        let before = d.ops.calls.len();
+        let f = d.decode(&KEY, 66_000).unwrap().expect("picture kept");
+        assert_eq!((f.width, f.height), (640, 360));
+        assert_eq!(d.frame_size(), Some((1280, 720)), "capture was rebuilt");
+        assert_eq!(
+            d.ops.calls[before..]
+                .iter()
+                .filter(|c| c.starts_with("poll("))
+                .count(),
+            0,
+            "EINVAL ends the drain immediately"
+        );
+    }
+
+    #[test]
+    fn an_einval_requeue_outside_a_drain_also_ends_the_sequence() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        // The same refusal with no source change pending. On the hardware this
+        // is where it actually happens (the driver re-formats before it
+        // reports the event), so it is end-of-sequence here too, not an error:
+        // with no event to follow, the driver goes quiet and the stall rule
+        // catches it.
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 1,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 33_000,
+                flags: 0,
+            },
+        );
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 2,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 66_000,
+                flags: 0,
+            },
+        );
+        d.ops.fail_errno = Some(("qbuf(9,", libc::EINVAL));
+        let f = d.decode(&DELTA, 66_000).unwrap().expect("picture kept");
+        assert_eq!(f.timestamp_us, 33_000);
+        // The second scripted buffer is not collected: the sequence is over
+        // until the queue is restarted.
+        assert!(d.poll_frame().unwrap().is_none());
     }
 
     #[test]

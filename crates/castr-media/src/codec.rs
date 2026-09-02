@@ -47,5 +47,11 @@ pub trait VideoEncoder: Send {
 pub trait VideoDecoder: Send {
     /// Feed one complete access unit (Annex B). May return zero or one frame.
     fn decode(&mut self, data: &[u8], timestamp_us: u64) -> anyhow::Result<Option<RawFrame>>;
+    /// A decoded picture the decoder is holding beyond the one returned by
+    /// `decode`, if any. Decoders that never hold extra pictures use the
+    /// default.
+    fn poll_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
+        Ok(None)
+    }
     fn name(&self) -> &'static str;
 }

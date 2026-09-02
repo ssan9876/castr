@@ -22,6 +22,9 @@ pub(crate) struct FakeOps {
     events: VecDeque<Event>,
     pub polls: VecDeque<PollResult>,
     pub fail_next: Option<&'static str>,
+    /// Fail the next call whose log line starts with this prefix, with this
+    /// errno - so tests can drive branches that inspect `raw_os_error`.
+    pub fail_errno: Option<(&'static str, i32)>,
     pub captures_filled: Vec<u8>,
     /// Value served for V4L2_CID_MIN_BUFFERS_FOR_CAPTURE.
     pub min_capture_buffers: i32,
@@ -78,6 +81,7 @@ impl FakeOps {
             events: VecDeque::new(),
             polls: VecDeque::new(),
             fail_next: None,
+            fail_errno: None,
             captures_filled: Vec::new(),
             min_capture_buffers: 1,
             clock: std::time::Instant::now(),
@@ -99,6 +103,13 @@ impl FakeOps {
         self.events.push_back(e);
     }
     fn record(&mut self, s: String) -> io::Result<()> {
+        if let Some((prefix, errno)) = self.fail_errno {
+            if s.starts_with(prefix) {
+                self.fail_errno = None;
+                self.calls.push(s);
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+        }
         self.calls.push(s);
         if let Some(name) = self.fail_next.take() {
             return Err(io::Error::other(name));
@@ -279,6 +290,22 @@ mod tests {
             f.dqbuf(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE).unwrap(),
             Dequeue::EndOfSequence
         );
+    }
+
+    #[test]
+    fn fake_fails_a_matching_call_with_a_real_errno() {
+        let mut f = FakeOps::new();
+        f.fail_errno = Some(("qbuf(9,", libc::EINVAL));
+        // A different call is unaffected.
+        f.qbuf(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE, 0, 1, 1, 0)
+            .unwrap();
+        let e = f
+            .qbuf(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1, 1, 0, 0)
+            .unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL));
+        // It fires once.
+        f.qbuf(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE, 1, 1, 0, 0)
+            .unwrap();
     }
 
     #[test]
