@@ -247,11 +247,13 @@ Group=castr
 SupplementaryGroups=video render input audio
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=XDG_CONFIG_HOME=/var/lib/castr/config
+# The receiver needs the DRM device; wait for udev to create it on early boot.
+# (No `$` in the line: systemd substitutes $WORD tokens before the shell runs.)
+ExecStartPre=/bin/sh -c 'until [ -e /dev/dri/card0 ]; do sleep 0.2; done'
+TimeoutStartSec=30
 ExecStart=/usr/local/bin/castr-receiver --fullscreen
 Restart=always
 RestartSec=2
-# The receiver needs the DRM device; wait for udev to create it on early boot.
-ExecStartPre=/bin/sh -c 'for i in $(seq 1 50); do [ -e /dev/dri/card0 ] && exit 0; sleep 0.2; done; exit 1'
 
 [Install]
 WantedBy=multi-user.target
