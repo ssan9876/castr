@@ -95,8 +95,8 @@ mod tests {
         let input: Vec<i16> = (0..2000).collect();
         let fast = resample_linear(&input, 1.005);
         let slow = resample_linear(&input, 0.995);
-        assert!(fast.len() < input.len() && fast.len() % 2 == 0);
-        assert!(slow.len() > input.len() && slow.len() % 2 == 0);
+        assert!(fast.len() < input.len() && fast.len().is_multiple_of(2));
+        assert!(slow.len() > input.len() && slow.len().is_multiple_of(2));
         assert!((fast.len() as f64 - 2000.0 / 1.005).abs() <= 2.0);
     }
 

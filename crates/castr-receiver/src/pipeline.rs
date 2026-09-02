@@ -239,7 +239,9 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
             Ok(()) => tracing::info!("session ended"),
             Err(e) => tracing::warn!("connection error: {e:#}"),
         }
-        session.on_disconnect(now_us(cfg.start));
+        if should_mark_disconnected(session.state()) {
+            session.on_disconnect(now_us(cfg.start));
+        }
         cfg.jitter.lock().unwrap().flush();
         let overlay = if matches!(session.state(), ReceiverState::Disconnected { .. }) {
             "Reconnecting"
@@ -255,6 +257,16 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
 
 fn hex_short(fp: &[u8; 32]) -> String {
     hex::encode(&fp[..6])
+}
+
+/// Only a session that had actually reached `Streaming` should be marked
+/// disconnected when its connection drops. A connection that ended before
+/// streaming began (failed pairing, or a control read error before `Hello`)
+/// must leave the session untouched, otherwise a fresh `Hello` on the very
+/// next connection lands on the `Disconnected` arm of `on_message` and is
+/// rejected.
+fn should_mark_disconnected(state: &ReceiverState) -> bool {
+    matches!(state, ReceiverState::Streaming { .. })
 }
 
 async fn handle_connection(
@@ -401,5 +413,22 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
             }
             _ = link.closed() => return Err(anyhow!("connection lost")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_streaming_marks_disconnected() {
+        assert!(should_mark_disconnected(&ReceiverState::Streaming {
+            params: None
+        }));
+        assert!(!should_mark_disconnected(&ReceiverState::AwaitingHello));
+        assert!(!should_mark_disconnected(&ReceiverState::Disconnected {
+            since_us: 0
+        }));
+        assert!(!should_mark_disconnected(&ReceiverState::Closed));
     }
 }
