@@ -37,6 +37,10 @@ pub enum UiEvent {
     Quit,
 }
 
+/// How far an audio packet's timestamp may fall behind the newest video
+/// timestamp before it stops driving the audio-master clock.
+const AUDIO_LAG_LIMIT_US: u64 = 1_000_000;
+
 fn now_us(start: Instant) -> u64 {
     start.elapsed().as_micros() as u64
 }
@@ -151,6 +155,11 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     // SDL main loop.
     let mut pending: Option<RawFrame> = None;
     let mut last_video = Instant::now();
+    // Newest video timestamp seen (presented or pending). Audio that lags far
+    // behind it must not drive the master clock, or a sender with a broken
+    // audio clock holds every video frame back forever.
+    let mut latest_video_ts: Option<u64> = None;
+    let mut warned_audio_lag = false;
     loop {
         if renderer.poll_quit() {
             break;
@@ -158,15 +167,33 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         while let Ok(ev) = ui_rx.try_recv() {
             match ev {
                 UiEvent::Overlay(t) => renderer.set_overlay(t.as_deref()),
-                UiEvent::Frame(f) => pending = Some(f),
+                UiEvent::Frame(f) => {
+                    latest_video_ts = Some(match latest_video_ts {
+                        Some(v) => v.max(f.timestamp_us),
+                        None => f.timestamp_us,
+                    });
+                    pending = Some(f);
+                }
                 UiEvent::AudioPacket { ts_us, data } if data.is_empty() => {
                     // Lost packet: let Opus conceal it so the clock keeps advancing smoothly.
                     let _ = audio.conceal_one();
                     let _ = ts_us;
                 }
                 UiEvent::AudioPacket { ts_us, data } => {
+                    let lagging = latest_video_ts
+                        .is_some_and(|v| v.saturating_sub(ts_us) > AUDIO_LAG_LIMIT_US);
                     let ratio = clock.drift_ratio(audio.buffered_us(), audio.target_us);
-                    if audio.push_packet(&data, ratio).unwrap_or(false) {
+                    let queued = audio.push_packet(&data, ratio).unwrap_or(false);
+                    if lagging {
+                        if !warned_audio_lag {
+                            warned_audio_lag = true;
+                            tracing::warn!(
+                                "audio timestamps lag video by more than {} ms; \
+                                 ignoring audio for the master clock",
+                                AUDIO_LAG_LIMIT_US / 1000
+                            );
+                        }
+                    } else if queued {
                         let played_ts = ts_us.saturating_sub(audio.buffered_us());
                         clock.audio_played(played_ts, now_us(start));
                     }

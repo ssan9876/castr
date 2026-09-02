@@ -318,6 +318,38 @@ struct AudioOut {
     packet: Vec<u8>,
 }
 
+/// Timestamps for the 10 ms Opus frames produced by one WASAPI drain.
+///
+/// WASAPI loopback delivers nothing while the desktop is silent, so a
+/// free-running counter (`origin + n * 10 ms`) drifts behind the video clock
+/// by the total silence time and, since the receiver uses audio as its master
+/// clock, eventually wedges video. Instead every drain re-anchors to the wall
+/// clock: `now_us` is the moment the drain returned, `buffered_samples_per_channel`
+/// is everything still queued in the chunker (including what was just drained),
+/// so the oldest queued sample was captured `buffered / 48 kHz` ago. Frames are
+/// then stamped 10 ms apart from that anchor, clamped to stay monotonic.
+fn audio_frame_timestamps(
+    now_us: u64,
+    buffered_samples_per_channel: usize,
+    frames_out: usize,
+    last_ts: Option<u64>,
+) -> Vec<u64> {
+    let backlog_us =
+        buffered_samples_per_channel as u64 * 1_000_000 / castr_media::audio::SAMPLE_RATE as u64;
+    let base = now_us.saturating_sub(backlog_us);
+    let mut out = Vec::with_capacity(frames_out);
+    let mut last = last_ts;
+    for i in 0..frames_out {
+        let mut ts = base + i as u64 * 10_000;
+        if let Some(l) = last {
+            ts = ts.max(l + 10_000);
+        }
+        out.push(ts);
+        last = Some(ts);
+    }
+    out
+}
+
 #[cfg(windows)]
 fn spawn_audio(
     out: mpsc::Sender<AudioOut>,
@@ -343,18 +375,33 @@ fn spawn_audio(
             };
             let mut chunker = FrameChunker::new();
             let mut buf = Vec::new();
-            let mut frames_sent: u64 = 0;
-            let origin = start.elapsed().as_micros() as u64;
+            // The chunker has no length accessor, so mirror its fill level here.
+            let mut queued_interleaved: usize = 0;
+            let mut last_ts: Option<u64> = None;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 buf.clear();
                 if let Err(e) = cap.drain(&mut buf) {
                     tracing::warn!("audio drain: {e:#}");
                     break;
                 }
+                let now = start.elapsed().as_micros() as u64;
                 chunker.push(&buf);
+                queued_interleaved += buf.len();
+                let frames_out = queued_interleaved / castr_media::audio::FRAME_INTERLEAVED;
+                let stamps = audio_frame_timestamps(
+                    now,
+                    queued_interleaved / castr_media::audio::CHANNELS,
+                    frames_out,
+                    last_ts,
+                );
+                let mut stamps = stamps.into_iter();
                 while let Some(frame) = chunker.next_frame() {
-                    let ts = origin + frames_sent * 10_000;
-                    frames_sent += 1;
+                    queued_interleaved -= frame.len();
+                    let ts = match stamps.next() {
+                        Some(t) => t,
+                        None => last_ts.map(|l| l + 10_000).unwrap_or(now),
+                    };
+                    last_ts = Some(ts);
                     match enc.encode(&frame) {
                         Ok(p) => {
                             if out
@@ -772,5 +819,42 @@ mod tests {
         assert_eq!(p.bitrate_bps, 5_000_000);
         let p2 = choose_params((1000, 601), 60, None, Mode::Quality, &caps);
         assert_eq!((p2.width, p2.height), (1000, 600));
+    }
+
+    #[test]
+    fn audio_timestamps_without_backlog_use_now() {
+        assert_eq!(
+            audio_frame_timestamps(1_000_000, 0, 1, None),
+            vec![1_000_000]
+        );
+    }
+
+    #[test]
+    fn audio_timestamps_subtract_the_backlog() {
+        // 480 samples per channel = exactly one 10 ms frame still queued.
+        assert_eq!(
+            audio_frame_timestamps(1_000_000, 480, 1, None),
+            vec![990_000]
+        );
+        // Two frames queued: the oldest is 20 ms old, the next 10 ms later.
+        assert_eq!(
+            audio_frame_timestamps(1_000_000, 960, 2, None),
+            vec![980_000, 990_000]
+        );
+    }
+
+    #[test]
+    fn audio_timestamps_are_clamped_monotonic() {
+        // A drain whose anchor would go backwards past the last emitted frame
+        // is pushed forward to last + 10 ms instead.
+        assert_eq!(
+            audio_frame_timestamps(1_000_000, 480, 2, Some(995_000)),
+            vec![1_005_000, 1_015_000]
+        );
+        // A forward-moving anchor is left alone.
+        assert_eq!(
+            audio_frame_timestamps(1_000_000, 480, 1, Some(900_000)),
+            vec![990_000]
+        );
     }
 }
