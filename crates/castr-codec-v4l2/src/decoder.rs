@@ -188,15 +188,23 @@ impl<O: Ops> V4l2Decoder<O> {
         })
     }
 
+    /// A well-behaved driver ends the ENUM_FMT probe with EINVAL once its
+    /// format list is exhausted; a driver that never does (or a device node
+    /// that isn't really this decoder) would otherwise spin here forever,
+    /// inside `open_decoder`, before the receiver ever starts listening -
+    /// which means systemd's `Restart=always` never gets a chance to fire,
+    /// since the process never exits. 64 formats is far more than any real
+    /// V4L2 device advertises for one buffer type.
     fn supports(ops: &mut O, buf_type: u32, fourcc: u32) -> anyhow::Result<bool> {
-        for i in 0.. {
+        const MAX_FORMATS: u32 = 64;
+        for i in 0..MAX_FORMATS {
             match ops.enum_fmt(buf_type, i).context("ENUM_FMT")? {
                 Some(f) if f == fourcc => return Ok(true),
                 Some(_) => continue,
                 None => return Ok(false),
             }
         }
-        Ok(false)
+        bail!("device listed more than {MAX_FORMATS} formats")
     }
 
     /// Visible (width, height) once the stream's SPS has been parsed.
@@ -534,7 +542,15 @@ impl<O: Ops> V4l2Decoder<O> {
     /// once whenever a queue is readable, so rounds are no measure of time
     /// (measured on the Pi: 100 rounds in 72 ms).
     fn wait_for_slot(&mut self, budget: &mut usize) -> anyhow::Result<()> {
-        let mut deadline = self.ops.now() + std::time::Duration::from_millis(STALL_POLL_MS);
+        let entered = self.ops.now();
+        // The per-progress deadline above resets every time a picture is
+        // collected, so a driver that keeps yielding pictures without ever
+        // releasing an OUTPUT buffer - broken, but not distinguishable from
+        // healthy throughput by that rule alone - would otherwise keep this
+        // call (and the decode thread with it) inside `decode` forever. This
+        // cap is absolute, measured from entry, and independent of progress.
+        let absolute_deadline = entered + std::time::Duration::from_millis(4 * STALL_POLL_MS);
+        let mut deadline = entered + std::time::Duration::from_millis(STALL_POLL_MS);
         while self.output.in_flight() >= MAX_IN_FLIGHT {
             let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
             if r.error {
@@ -558,6 +574,12 @@ impl<O: Ops> V4l2Decoder<O> {
                 deadline = self.ops.now() + std::time::Duration::from_millis(STALL_POLL_MS);
             } else if self.ops.now() >= deadline {
                 bail!("decoder stalled: no progress for {STALL_POLL_MS} ms");
+            }
+            if self.ops.now() >= absolute_deadline {
+                bail!(
+                    "decoder stalled: no output slot freed within {} ms despite ongoing progress",
+                    4 * STALL_POLL_MS
+                );
             }
         }
         Ok(())
@@ -1511,5 +1533,43 @@ mod tests {
         ops.granted = Some(1);
         let e = V4l2Decoder::with_ops(ops).err().unwrap();
         assert!(e.to_string().contains("buffer"), "{e:#}");
+    }
+
+    #[test]
+    fn the_format_probe_is_bounded_against_a_driver_that_never_says_einval() {
+        // A driver (or a wrong device node) that answers ENUM_FMT with a
+        // fresh, always-successful format for every index would otherwise
+        // spin `supports` forever, before the receiver ever starts listening.
+        let mut ops = FakeOps::new();
+        ops.output_formats = vec![V4L2_PIX_FMT_NV12; 1000]; // never H264, never runs out
+        let e = V4l2Decoder::<FakeOps>::supports(&mut ops, OUT, V4L2_PIX_FMT_H264).unwrap_err();
+        assert!(e.to_string().contains("more than 64 formats"), "{e:#}");
+    }
+
+    #[test]
+    fn wait_for_slot_gives_up_after_the_absolute_cap_despite_ongoing_progress() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        // A capture picture is ready every round (empty, so it is not kept as
+        // a real frame, just counted as progress) but the OUTPUT queue never
+        // completes: the per-progress deadline never fires on its own, so
+        // only the absolute cap can end this call.
+        let rounds = (4 * STALL_POLL_MS / POLL_STEP_MS as u64) as usize + 10;
+        for i in 0..rounds {
+            ops.push_dequeue(
+                CAP,
+                Dequeued {
+                    index: (i % 6) as u32,
+                    bytesused: 0,
+                    timestamp_us: 0,
+                    flags: 0,
+                },
+            );
+        }
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        d.decode(&DELTA, 1).unwrap();
+        let e = d.decode(&DELTA, 2).unwrap_err();
+        assert!(e.to_string().contains("despite ongoing progress"), "{e:#}");
     }
 }
