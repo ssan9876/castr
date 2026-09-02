@@ -1,6 +1,8 @@
 # castr sub-project 2 (Pi hardware decode) end-to-end verification (2026-09-02)
 
-Windows sender host: `DESKTOP-C6QHH2A` (same box as the core e2e verification), `target/release/castr-sender.exe` built from `master` (untouched by this sub-project). Pi receiver: `dietpi@192.168.88.157` (DietPi 10 / Debian 13 trixie, `bcm2835-codec` V4L2 decoder), branch `pi-hardening` HEAD `da5830f`, deployed fresh with `scripts/pi/deploy.sh` at the start of this session. All steps run by an automated agent over SSH. Two frame dumps (`CASTR_DUMP_FRAME`) were captured with a hand-run receiver instance and are included below as PNGs.
+Windows sender host: `DESKTOP-C6QHH2A` (same box as the core e2e verification), `target/release/castr-sender.exe` built from `master` (untouched by this sub-project). Pi receiver: `dietpi@192.168.88.157` (DietPi 10 / Debian 13 trixie, `bcm2835-codec` V4L2 decoder), branch `pi-hardening` HEAD `da5830f` for the original run below; re-verified after the final review at HEAD `6af3def` plus the ops/docs fix wave (device-wait unit, redeployed on every run, hw-test exit status, spec/README corrections). All steps run by an automated agent over SSH. Frame dumps (`CASTR_DUMP_FRAME`) were captured with a hand-run receiver instance and are included below as PNGs.
+
+**Update (re-verification after the final review, see bottom section): the frame-dump overlay caveat below is resolved.** The receiver now clears the stale "WAITING FOR SENDER" overlay when video starts drawing, and the fresh mid-cast dump (`2026-09-02-pi-cast.png`, replaced) shows only live desktop content with no leftover overlay text.
 
 ## Summary
 
@@ -8,10 +10,11 @@ Windows sender host: `DESKTOP-C6QHH2A` (same box as the core e2e verification), 
 |---|------|--------|-------------------|
 | 1 | Deploy + pair | PASS | `decoder: v4l2-bcm2835`; sender lists/pairs as `DietPi` |
 | 2 | Reboot, no-login boot, crash recovery | PASS | active post-reboot with no login (frame dump confirms WAITING FOR SENDER on screen); `pkill -x` restart in 2 s (< 3 s) |
-| 3 | 60 s game-mode cast | PASS (frame-dump overlay caveat) | 1920x802 @ 30 fps held; decode avg 1.3-2.9 ms (< 15 ms); present avg 8.3-25.7 ms (one 5 s window at 25.7 ms during warm-up, all others < 20 ms); pictures 148-156/5 s (~150, one merged/partial window noted below); queue 0-1; zero `decode error`; a separate frame dump confirms real desktop content reaches the screen during a cast (see below, with one caveat) |
+| 3 | 60 s game-mode cast | PASS (frame-dump overlay caveat, resolved below) | 1920x802 @ 30 fps held; decode avg 1.3-2.9 ms (< 15 ms); present avg 8.3-25.7 ms (one 5 s window at 25.7 ms during warm-up, all others < 20 ms); pictures 148-156/5 s (~150, one merged/partial window noted below); queue 0-1; zero `decode error`; a separate frame dump confirms real desktop content reaches the screen during a cast (see below, with one caveat) |
 | 1b | 20 s quality-mode cast | PASS (queue by design) | pictures ~66-150/5 s; present avg 9.0-9.8 ms; queue 5-6 (the 150 ms playout buffer, not decoder lag, per Task 6's finding); zero `decode error` |
 | 3b | Network blip (eth0 down 3 s mid-cast), re-run with unfiltered journal | PASS | cast resumed, 2 `requesting keyframe (stall)` lines plus a QUIC `connection lost` / `session resumed` cycle, zero `Deactivated`/`Scheduled restart`/`Started` lines for `castr-receiver.service` in the unfiltered excerpt — no service restart |
 | 4 | Software fallback (`--decoder sw`) | PASS | `decoder: openh264`; cast ran at 1280x534 @ 30 fps (sender stepped down, matching Task 6's measured sw ceiling); decode avg 25-30 ms; drop-in removed, `decoder: v4l2-bcm2835` confirmed restored |
+| 5 | Re-verification after the final review (see bottom section) | PASS | HEAD `6af3def` + ops/docs fix wave deployed; unit now waits for `/dev/video10` and is redeployed every run; hw tests 4/4 exit 0 (and exit non-zero proven on a deliberately failing run); game-mode `pictures` 149-156/5 s with `presented` matching almost exactly (within 1 frame), `queue` 0; quality-mode `queue` 5-6 as expected; zero `decode error`; fresh mid-cast dump shows clean desktop content, overlay caveat gone |
 | - | Task 6 1080p hardware-test timing (Throughput fix round) | for reference | `1080p: 300 frames (64 drained) in 4.881545107s, worst steady call 27.753967ms, capture bring-up 78.530138ms` (and a second run: `5.393213802s`, `29.341048ms`, `82.700705ms`) |
 
 Every numeric criterion in spec 8.3 was met (one present-avg window slightly over 20 ms during cast warm-up, discussed below). The idle frame dump cleanly confirms WAITING FOR SENDER; the mid-cast frame dump confirms real desktop content is reaching the decode/render path but also shows a leftover WAITING FOR SENDER overlay baked into that same dump — see "Frame dumps" and "What did not meet the numbers" below for the honest account of what the images show.
@@ -331,3 +334,144 @@ This is consistent with the live-cast decode averages measured above (1080p `dec
 - **Game-mode present avg, first 5 s window: 25.7 ms** (criterion: < 20 ms). This occurred in the very first `perf:` window after the cast connected, when only 6 frames were presented in that window while the sender was still ramping fps from 0 to 30 and the SDL/EGL swap chain was warming up. Every subsequent window for the remainder of the 60 s cast was 8.3-18.0 ms, comfortably under 20 ms. Not treated as a failure of the steady-state target the spec is describing, but recorded here since it is a literal number over the line.
 - **Cast frame dump shows a leftover WAITING FOR SENDER overlay on top of real desktop content** (`2026-09-02-pi-cast.png`). The spec's literal wording is "Frame dump (CASTR_DUMP_FRAME) shows the desktop" — the desktop *is* visible in the dump (browser window, animation window), so the letter of the criterion is met, but the image is not the clean "just the desktop" picture a reader would expect from that sentence, and the same artifact reproduced on an independent second capture. The receiver's own `perf:`/journal lines for both of those casts show normal decoding and presenting (no `decode error`, `presented` counts in the tens per 5 s window), so this looks like a rendering/compositing quirk specific to what `CASTR_DUMP_FRAME` captures (possibly an OSD/status layer not cleared before the dump is taken) rather than evidence the actual displayed picture is broken — but no on-screen photograph was taken to independently confirm the physical monitor doesn't show the same overlay, so this is recorded as an open question rather than dismissed. This is a genuine gap against a fully clean pass on that specific spec sentence, even though every other 8.3.2 criterion (resolution, fps, decode/present ms, queue, decode errors, pictures/5s) was met.
 - No other criterion in spec 8.3 fell short. Quality mode's queue of 5-6 is expected and documented behavior (the playout buffer), not a shortfall against 8.3's game-mode-specific queue <= 2 criterion, which was measured separately in Step 2 above and met there.
+
+## Re-verification after the final review (2026-09-02, HEAD `6af3def` + ops/docs fix wave)
+
+This section re-runs the checks that matter after the code fixes at HEAD `6af3def` (displaced-pending-frame presentation, stale-overlay clear on video draw, bounded format probe, capped `wait_for_slot`) and the ops/docs fix wave on top of it (`castr-receiver.service` waits for `/dev/video10`, `deploy.sh` redeploys the unit on every run, `run-hw-tests.sh` propagates a non-zero exit on failure, spec 4.4/3.1 rewritten to match the code, README limitations added).
+
+### Build and lint
+
+```
+$ cargo fmt -p castr-codec-v4l2          # no output, clean
+$ bash scripts/pi/test-linux.sh
+running 42 tests
+test result: ok. 42 passed; 0 failed; 0 ignored
+running 4 tests (ignored, not run)
+running 0 tests
+
+$ cargo test -q --workspace              # Windows host
+test result: ok. 48 passed
+test result: ok. 8 passed
+test result: ok. 9 passed
+test result: ok. 28 passed
+test result: ok. 16 passed
+test result: ok. 6 passed
+(all other crates: 0 tests, ok)
+
+$ cargo clippy --workspace --tests
+# exactly 4 warnings, all pre-existing and unrelated to this branch:
+crates\castr-media\src\clock.rs:101:17
+crates\castr-proto\src\packetize.rs:69:9
+crates\castr-proto\src\reassemble.rs:148:9
+crates\castr-proto\src\session.rs:126:9
+
+$ bash scripts/pi/build-pi.sh
+...
+built dist/castr-receiver-aarch64
+```
+
+No new warnings beyond the four pre-existing ones.
+
+### Deploy and confirm the new unit
+
+```
+$ bash scripts/pi/deploy.sh dietpi@192.168.88.157
+...
+active
+deployed to dietpi@192.168.88.157
+
+$ ssh dietpi@192.168.88.157 'sudo systemctl cat castr-receiver'
+# /etc/systemd/system/castr-receiver.service
+[Unit]
+Description=castr screen receiver
+After=network-online.target sound.target systemd-modules-load.service
+Wants=network-online.target
+
+[Service]
+User=castr
+Group=castr
+SupplementaryGroups=video render input audio
+Environment=SDL_VIDEODRIVER=kmsdrm
+Environment=XDG_CONFIG_HOME=/var/lib/castr/config
+ExecStartPre=/usr/local/lib/castr/wait-devices.sh
+TimeoutStartSec=30
+ExecStart=/usr/local/bin/castr-receiver --fullscreen
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+
+$ ssh dietpi@192.168.88.157 'sudo systemctl is-active castr-receiver'
+active
+
+$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver -n 30 --no-pager | grep -i decoder'
+... decoder: v4l2-bcm2835
+```
+
+PASS: the unit deployed by `deploy.sh` matches the repo's `scripts/pi/castr-receiver.service` (device wait moved to `/usr/local/lib/castr/wait-devices.sh`, `After=systemd-modules-load.service` present), the service is active, and hardware decode is selected.
+
+### Hardware tests, with exit-status proof
+
+Normal run:
+
+```
+$ bash scripts/pi/run-hw-tests.sh dietpi@192.168.88.157; echo "EXIT=$?"
+running 4 tests
+1080p: 300 frames (64 drained) in 6.008703218s, worst steady call 27.650022ms, capture bring-up 96.254036ms
+ok
+ok
+ok
+test open_fails_cleanly_on_a_non_device ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 46.01s
+EXIT=0
+```
+
+4/4, exit 0, `1080p: 300 frames (64 drained) in 6.008703218s, worst steady call 27.650022ms, capture bring-up 96.254036ms`.
+
+Deliberately failing run (forced by pointing the decoder at `/dev/null` instead of `/dev/video10` via `CASTR_V4L2_DEVICE`, run through the exact same remote pipeline the script uses — cat/chmod, `set -o pipefail`, `grep -vF '[OpenH264]' | tail -20`, then `exit $rc`):
+
+```
+$ ssh dietpi@192.168.88.157 "... CASTR_V4L2_DEVICE=/dev/null /tmp/v4l2-1.bin --ignored --test-threads=1 --nocapture 2>&1 | grep -vF '[OpenH264]' | tail -20; rc=\$?; rm -f /tmp/v4l2-1.bin; exit \$rc"; echo "EXIT=$?"
+thread 'follows_a_resolution_change' panicked at crates/castr-codec-v4l2/tests/hw.rs:135:39:
+called `Result::unwrap()` on an `Err` value: initialise /dev/null
+test result: FAILED. 1 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 39.18s
+EXIT=101
+```
+
+PASS: the normal run exits 0 with 4/4, and the deliberately-broken run exits 101 (non-zero) instead of being swallowed by the `grep`/`tail`/`rm` pipeline as it was before this fix. No broken test was committed; the failing run used a manually pushed copy of the same binary with a bad device override, not a change to `hw.rs`.
+
+### Casts
+
+30 s game-mode cast (`timeout 60 ./target/release/castr-sender.exe cast DietPi --mode game --fps 30 --duration 30`, animation window restarted partway through). Sender held `1920x802` at 30 fps for the whole run (confirmed continuously in the sender log, no resolution or fps drop). Receiver `perf:` lines, full 5 s windows only (pictures/presented pairs):
+
+```
+perf: pictures 156 (...), presented 155 (...), queue 0, dropped 0
+perf: pictures 149 (...), presented 149 (...), queue 0, dropped 0
+perf: pictures 151 (...), presented 151 (...), queue 0, dropped 0
+perf: pictures 149 (...), presented 149 (...), queue 0, dropped 0
+perf: pictures 151 (...), presented 151 (...), queue 0, dropped 0
+```
+
+Every full window: `pictures` >= 140 (149-156) and `presented` within 1 frame of `pictures` (well inside 10%). `queue` is 0 throughout (<= 2 satisfied). Zero `decode error` lines in the journal for this window.
+
+20 s quality-mode cast (`castr-sender.exe cast DietPi --mode quality --fps 30 --duration 20`, animation window restarted first). Sender held `1920x802` at 30 fps throughout. Receiver `perf:` lines, full 5 s windows:
+
+```
+perf: pictures 149 (...), presented 149 (...), queue 6, dropped 0
+perf: pictures 150 (...), presented 150 (...), queue 6, dropped 0
+perf: pictures 150 (...), presented 150 (...), queue 6, dropped 0
+```
+
+`pictures` 149-150, `presented` exactly matching `pictures` each window, `queue` 5-7 (6) as the spec explains (150 ms playout delay), zero `decode error`.
+
+**Neither run's `presented` count is far below `pictures`** — they match within one frame in every window. The earlier warm-up caveat about a single low-`presented` window at the very start of a cast does not appear in either of these runs.
+
+### Mid-cast frame dump
+
+Captured by stopping the service, running the receiver by hand as `castr` with `CASTR_DUMP_FRAME=/tmp/x.raw`, and casting from Windows with the animation window active and undimmed. `docs/superpowers/verification/2026-09-02-pi-cast.png` was replaced with this capture and inspected directly: it shows live desktop windows (browser tabs, a game UI panel, a YouTube video) with **no leftover "WAITING FOR SENDER" overlay text** anywhere on the frame — the stale-overlay-clear fix in this HEAD resolves the artifact recorded in "What did not meet the numbers" above. The manual receiver instance was stopped (`pkill -x castr-receiver`), `/tmp/x.raw` removed, and the systemd service restarted and confirmed active afterward.
+
+### What this re-verification found
+
+- Every criterion re-checked here passed cleanly: build/lint/tests clean (only the four known-unrelated clippy warnings), the redeployed unit and hw-test exit-status fix both work exactly as specified, both casts hold resolution/fps with `presented` tracking `pictures` closely, and the mid-cast dump is now a clean picture of the desktop with the overlay bug gone.
+- No new issues were found. The **headline for this branch is now a clean pass** on every item in this fix wave and every re-checked spec criterion, superseding the "frame-dump overlay caveat" noted in the original run above.
