@@ -9,6 +9,7 @@ use castr_proto::*;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -17,7 +18,96 @@ use tokio::sync::mpsc;
 pub enum DecoderChoice {
     Auto,
     Mf,
+    V4l2,
     Sw,
+}
+
+/// Counts decoder errors and trips when `limit` occur within `within`.
+pub struct ErrorWindow {
+    limit: usize,
+    within: Duration,
+    times: std::collections::VecDeque<Instant>,
+}
+
+impl ErrorWindow {
+    pub fn new(limit: usize, within: Duration) -> Self {
+        Self {
+            limit,
+            within,
+            times: std::collections::VecDeque::new(),
+        }
+    }
+    /// Records an error at `now`; true when the window has tripped (and resets).
+    pub fn record(&mut self, now: Instant) -> bool {
+        while self
+            .times
+            .front()
+            .is_some_and(|&t| now.duration_since(t) > self.within)
+        {
+            self.times.pop_front();
+        }
+        self.times.push_back(now);
+        if self.times.len() >= self.limit {
+            self.times.clear();
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Decode/present timing shared between the decode thread and the SDL loop,
+/// reported every few seconds (spec section 5).
+#[derive(Default)]
+pub struct PerfStats {
+    decoded: u32,
+    decode_total: Duration,
+    decode_max: Duration,
+    presented: u32,
+    present_total: Duration,
+    present_max: Duration,
+}
+
+impl PerfStats {
+    pub fn decode(&mut self, d: Duration) {
+        self.decoded += 1;
+        self.decode_total += d;
+        self.decode_max = self.decode_max.max(d);
+    }
+    /// Counts a picture drained via `poll_frame` as decoded, with zero decode
+    /// time attributed to it (the time was already spent in the `decode` call
+    /// that produced it internally).
+    pub fn decoded_extra(&mut self) {
+        self.decoded += 1;
+    }
+    pub fn present(&mut self, d: Duration) {
+        self.presented += 1;
+        self.present_total += d;
+        self.present_max = self.present_max.max(d);
+    }
+    fn avg(total: Duration, n: u32) -> f64 {
+        if n == 0 {
+            0.0
+        } else {
+            total.as_secs_f64() * 1000.0 / n as f64
+        }
+    }
+    /// One log line, then reset.
+    pub fn take_report(&mut self, queue_depth: u32, dropped: u32) -> String {
+        let s = format!(
+            "perf: decoded {} decode avg {:.1} ms max {:.1} ms, presented {} present avg {:.1} ms max {:.1} ms, queue {}, dropped {}",
+            self.decoded,
+            Self::avg(self.decode_total, self.decoded),
+            self.decode_max.as_secs_f64() * 1000.0,
+            self.presented,
+            Self::avg(self.present_total, self.presented),
+            self.present_max.as_secs_f64() * 1000.0,
+            queue_depth,
+            dropped
+        );
+        *self = Self::default();
+        s
+    }
 }
 
 pub struct ReceiverConfig {
@@ -56,11 +146,29 @@ fn open_decoder(choice: DecoderChoice) -> anyhow::Result<Box<dyn VideoDecoder>> 
                 Err(e) => tracing::warn!("MF decoder unavailable, falling back to openh264: {e:#}"),
             }
         }
+        if choice == DecoderChoice::V4l2 {
+            anyhow::bail!("V4L2 decode is Linux only");
+        }
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
+        if matches!(choice, DecoderChoice::Auto | DecoderChoice::V4l2) {
+            match castr_codec_v4l2::V4l2Decoder::open() {
+                Ok(d) => return Ok(Box::new(d)),
+                Err(e) if choice == DecoderChoice::V4l2 => return Err(e),
+                Err(e) => {
+                    tracing::warn!("V4L2 decoder unavailable, falling back to openh264: {e:#}")
+                }
+            }
+        }
         if choice == DecoderChoice::Mf {
             anyhow::bail!("Media Foundation is Windows only");
+        }
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        if matches!(choice, DecoderChoice::Mf | DecoderChoice::V4l2) {
+            anyhow::bail!("{choice:?} is not available on this platform");
         }
     }
     Ok(Box::new(SwDecoder::new()?))
@@ -94,12 +202,15 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(64);
     let jitter = Arc::new(Mutex::new(JitterBuffer::new(Mode::Game, 33_333)));
     let stats = Arc::new(Mutex::new(Stats::default()));
+    let perf = Arc::new(Mutex::new(PerfStats::default()));
+    let dropped_since_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     // Decode thread: jitter buffer -> decoder -> UI.
     {
         let jitter = jitter.clone();
         let ui = ui_tx.clone();
         let stats = stats.clone();
+        let perf = perf.clone();
         let choice = cfg.decoder;
         std::thread::Builder::new()
             .name("decode".into())
@@ -114,16 +225,31 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                 };
                 tracing::info!("decoder: {}", decoder.name());
                 let mut last_decoded: Option<u32> = None;
+                let mut errors = ErrorWindow::new(3, Duration::from_secs(10));
+                let mut choice = choice;
                 loop {
                     let frame = jitter.lock().unwrap().pop(now_us(start));
                     let Some(f) = frame else {
+                        match decoder.poll_frame() {
+                            Ok(Some(raw)) => {
+                                perf.lock().unwrap().decoded_extra();
+                                if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!("poll_frame error: {e:#}"),
+                        }
                         std::thread::sleep(Duration::from_millis(2));
                         continue;
                     };
                     stats.lock().unwrap().decode_queue_depth =
                         jitter.lock().unwrap().depth() as u32;
                     tracing::debug!("decode frame {} key={}", f.frame_number, f.keyframe);
-                    match decoder.decode(&f.data, f.timestamp_us) {
+                    let t = Instant::now();
+                    let result = decoder.decode(&f.data, f.timestamp_us);
+                    perf.lock().unwrap().decode(t.elapsed());
+                    match result {
                         Ok(Some(raw)) => {
                             last_decoded = Some(f.frame_number);
                             if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
@@ -141,6 +267,34 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                             // Deltas are useless without a reference: skip them
                             // until the network loop has fetched a fresh IDR.
                             jitter.lock().unwrap().require_keyframe();
+                            if errors.record(Instant::now()) {
+                                // Three failures in ten seconds: rebuild, then
+                                // fall back to software for the session (spec 3.1).
+                                tracing::warn!("rebuilding decoder after repeated errors");
+                                decoder = match open_decoder(choice) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        tracing::error!("decoder rebuild failed ({e:#}); using openh264 for the rest of the session");
+                                        choice = DecoderChoice::Sw;
+                                        match open_decoder(choice) {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                tracing::error!("software decoder failed too: {e:#}");
+                                                let _ = ui.blocking_send(UiEvent::Quit);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                };
+                                tracing::info!("decoder: {}", decoder.name());
+                            }
+                            continue;
+                        }
+                    }
+                    while let Ok(Some(raw)) = decoder.poll_frame() {
+                        perf.lock().unwrap().decoded_extra();
+                        if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
+                            return;
                         }
                     }
                 }
@@ -160,6 +314,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         ui: ui_tx,
         start,
         pairing_guard: Mutex::new(PairingGuard::new()),
+        dropped: dropped_since_report.clone(),
     };
     rt.spawn(async move {
         if let Err(e) = network_main(net_cfg).await {
@@ -175,6 +330,8 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     // audio clock holds every video frame back forever.
     let mut latest_video_ts: Option<u64> = None;
     let mut warned_audio_lag = false;
+    let mut last_perf = Instant::now();
+    let mut streaming_seen = false;
     loop {
         if renderer.poll_quit() {
             break;
@@ -225,10 +382,22 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         }
         if let Some(f) = pending.take() {
             if clock.video_due(f.timestamp_us, now_us(start)) {
+                let t = Instant::now();
                 renderer.present(&f)?;
+                perf.lock().unwrap().present(t.elapsed());
                 last_video = Instant::now();
+                streaming_seen = true;
             } else {
                 pending = Some(f);
+            }
+        }
+        if streaming_seen && last_perf.elapsed() >= Duration::from_secs(5) {
+            last_perf = Instant::now();
+            let depth = jitter.lock().unwrap().depth() as u32;
+            let dropped = dropped_since_report.swap(0, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("{}", perf.lock().unwrap().take_report(depth, dropped));
+            if last_video.elapsed() > Duration::from_secs(5) {
+                streaming_seen = false; // idle: stop reporting until video flows again
             }
         }
         if last_video.elapsed() > Duration::from_millis(50) {
@@ -294,6 +463,7 @@ struct NetConfig {
     ui: mpsc::Sender<UiEvent>,
     start: Instant,
     pairing_guard: Mutex<PairingGuard>,
+    dropped: Arc<std::sync::atomic::AtomicU32>,
 }
 
 async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
@@ -538,6 +708,7 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
             }
             _ = stats_tick.tick() => {
                 let dropped = cfg.jitter.lock().unwrap().dropped();
+                cfg.dropped.fetch_add(dropped, Ordering::Relaxed);
                 let depth = cfg.stats.lock().unwrap().decode_queue_depth;
                 let s = Stats { frames_received, frames_dropped: dropped, fragments_lost: (video_reasm.fragments_lost() + audio_reasm.fragments_lost()) as u32, fragments_received, decode_queue_depth: depth, interval_ms: 100 };
                 frames_received = 0; fragments_received = 0;
@@ -609,5 +780,41 @@ mod tests {
         g.record_failure(t0 + Duration::from_secs(70));
         g.record_failure(t0 + Duration::from_secs(140));
         assert!(!g.is_locked(t0 + Duration::from_secs(140)));
+    }
+
+    #[test]
+    fn error_window_trips_on_the_third_error_within_ten_seconds() {
+        let t0 = Instant::now();
+        let mut w = ErrorWindow::new(3, Duration::from_secs(10));
+        assert!(!w.record(t0));
+        assert!(!w.record(t0 + Duration::from_secs(4)));
+        assert!(w.record(t0 + Duration::from_secs(9)));
+        // Tripping clears the window.
+        assert!(!w.record(t0 + Duration::from_secs(9)));
+    }
+
+    #[test]
+    fn error_window_forgets_old_errors() {
+        let t0 = Instant::now();
+        let mut w = ErrorWindow::new(3, Duration::from_secs(10));
+        w.record(t0);
+        w.record(t0 + Duration::from_secs(1));
+        assert!(!w.record(t0 + Duration::from_secs(12)));
+    }
+
+    #[test]
+    fn perf_stats_report_averages_and_maxima() {
+        let mut p = PerfStats::default();
+        p.decode(Duration::from_millis(10));
+        p.decode(Duration::from_millis(30));
+        p.present(Duration::from_millis(5));
+        let s = p.take_report(2, 1);
+        assert!(s.contains("decoded 2"), "{s}");
+        assert!(s.contains("decode avg 20.0 ms max 30.0 ms"), "{s}");
+        assert!(s.contains("present avg 5.0 ms max 5.0 ms"), "{s}");
+        assert!(s.contains("queue 2"), "{s}");
+        assert!(s.contains("dropped 1"), "{s}");
+        // Taking resets the counters.
+        assert!(p.take_report(0, 0).contains("decoded 0"));
     }
 }

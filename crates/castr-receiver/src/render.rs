@@ -104,7 +104,9 @@ impl Renderer {
         if std::env::var_os("CASTR_SDL_VERBOSE").is_some() {
             // SAFETY: plain SDL log-priority setter, safe to call before/after init.
             unsafe {
-                sdl2::sys::SDL_LogSetAllPriority(sdl2::sys::SDL_LogPriority::SDL_LOG_PRIORITY_VERBOSE)
+                sdl2::sys::SDL_LogSetAllPriority(
+                    sdl2::sys::SDL_LogPriority::SDL_LOG_PRIORITY_VERBOSE,
+                )
             };
         }
         let sdl = sdl2::init().map_err(|e| anyhow!(e))?;
@@ -163,7 +165,9 @@ impl Renderer {
 
     /// Read back the last presented frame for `CASTR_DUMP_FRAME`, at most every 2 s.
     fn maybe_dump(&mut self) {
-        let Some((path, last)) = &mut self.dump else { return };
+        let Some((path, last)) = &mut self.dump else {
+            return;
+        };
         if last.elapsed() < std::time::Duration::from_secs(2) {
             return;
         }

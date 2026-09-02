@@ -24,9 +24,19 @@ struct Cli {
 }
 
 fn default_name() -> String {
-    std::env::var("COMPUTERNAME")
-        .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "castr receiver".into())
+    if let Ok(n) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
+        if !n.trim().is_empty() {
+            return n;
+        }
+    }
+    // systemd services have no HOSTNAME in their environment.
+    if let Ok(n) = std::fs::read_to_string("/etc/hostname") {
+        let n = n.trim();
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    "castr receiver".into()
 }
 
 fn default_bitrate() -> u32 {
