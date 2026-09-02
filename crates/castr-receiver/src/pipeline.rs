@@ -6,6 +6,7 @@ use castr_media::jitter::JitterBuffer;
 use castr_media::{sw::SwDecoder, RawFrame, VideoDecoder};
 use castr_net::*;
 use castr_proto::*;
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -145,6 +146,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         stats: stats.clone(),
         ui: ui_tx,
         start,
+        pairing_guard: Mutex::new(PairingGuard::new()),
     };
     rt.spawn(async move {
         if let Err(e) = network_main(net_cfg).await {
@@ -226,6 +228,48 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Attempt limiter for PIN pairing (spec 5.2: three failed attempts close the
+/// connection). Three failures inside a minute lock pairing for a further
+/// minute, during which an unpaired `Hello` is refused without generating or
+/// displaying a PIN, so an attacker cannot brute-force the 6-digit PIN by
+/// reconnecting in a loop.
+struct PairingGuard {
+    failures: VecDeque<Instant>,
+    locked_until: Option<Instant>,
+}
+
+const PAIRING_WINDOW: Duration = Duration::from_secs(60);
+const PAIRING_LOCKOUT: Duration = Duration::from_secs(60);
+const PAIRING_MAX_FAILURES: usize = 3;
+
+impl PairingGuard {
+    fn new() -> Self {
+        Self {
+            failures: VecDeque::new(),
+            locked_until: None,
+        }
+    }
+
+    fn is_locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| now < until)
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        while let Some(&oldest) = self.failures.front() {
+            if now.duration_since(oldest) > PAIRING_WINDOW {
+                self.failures.pop_front();
+            } else {
+                break;
+            }
+        }
+        self.failures.push_back(now);
+        if self.failures.len() >= PAIRING_MAX_FAILURES {
+            self.failures.clear();
+            self.locked_until = Some(now + PAIRING_LOCKOUT);
+        }
+    }
+}
+
 struct NetConfig {
     name: String,
     bind: SocketAddr,
@@ -236,6 +280,7 @@ struct NetConfig {
     stats: Arc<Mutex<Stats>>,
     ui: mpsc::Sender<UiEvent>,
     start: Instant,
+    pairing_guard: Mutex<PairingGuard>,
 }
 
 async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
@@ -308,6 +353,16 @@ async fn handle_connection(
         let is_paired = cfg.paired.lock().unwrap().is_paired(&fp);
         match msg {
             ControlMessage::Hello { .. } if !is_paired => {
+                if cfg.pairing_guard.lock().unwrap().is_locked(Instant::now()) {
+                    tracing::warn!("pairing locked out; refusing {}", hex_short(&fp));
+                    link.send_control(&ControlMessage::Error {
+                        code: 4,
+                        message: "pairing locked, try again later".into(),
+                    })
+                    .await?;
+                    link.close("pairing locked");
+                    return Ok(());
+                }
                 link.send_control(&ControlMessage::Error {
                     code: 4,
                     message: "pairing required".into(),
@@ -328,6 +383,14 @@ async fn handle_connection(
                     }
                     Err(e) => {
                         tracing::warn!("pairing failed: {e:#}");
+                        let mut guard = cfg.pairing_guard.lock().unwrap();
+                        guard.record_failure(Instant::now());
+                        if guard.is_locked(Instant::now()) {
+                            tracing::warn!(
+                                "{PAIRING_MAX_FAILURES} failed PIN attempts; pairing locked for {}s",
+                                PAIRING_LOCKOUT.as_secs()
+                            );
+                        }
                         return Ok(());
                     }
                 }
@@ -457,5 +520,29 @@ mod tests {
             since_us: 0
         }));
         assert!(!should_mark_disconnected(&ReceiverState::Closed));
+    }
+
+    #[test]
+    fn three_failures_lock_pairing_and_the_lock_expires() {
+        let t0 = Instant::now();
+        let mut g = PairingGuard::new();
+        assert!(!g.is_locked(t0));
+        g.record_failure(t0);
+        g.record_failure(t0 + Duration::from_secs(1));
+        assert!(!g.is_locked(t0 + Duration::from_secs(1)));
+        g.record_failure(t0 + Duration::from_secs(2));
+        assert!(g.is_locked(t0 + Duration::from_secs(2)));
+        assert!(g.is_locked(t0 + Duration::from_secs(61)));
+        assert!(!g.is_locked(t0 + Duration::from_secs(63)));
+    }
+
+    #[test]
+    fn failures_spread_beyond_the_window_do_not_lock() {
+        let t0 = Instant::now();
+        let mut g = PairingGuard::new();
+        g.record_failure(t0);
+        g.record_failure(t0 + Duration::from_secs(70));
+        g.record_failure(t0 + Duration::from_secs(140));
+        assert!(!g.is_locked(t0 + Duration::from_secs(140)));
     }
 }
