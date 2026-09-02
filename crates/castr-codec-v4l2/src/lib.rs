@@ -8,12 +8,12 @@ pub mod sys;
 
 #[cfg(target_os = "linux")]
 pub mod decoder;
+#[cfg(all(target_os = "linux", test))]
+pub(crate) mod fake;
 #[cfg(target_os = "linux")]
 pub mod ops;
 #[cfg(target_os = "linux")]
 pub mod queue;
-#[cfg(all(target_os = "linux", test))]
-pub(crate) mod fake;
 
 #[cfg(target_os = "linux")]
 pub use decoder::V4l2Decoder;
