@@ -323,7 +323,7 @@ SD-card image.
 
 ## 10. Key dependencies
 
-- `nix` 0.29 (ioctl, mmap, poll), `v4l2-sys-mit` 0.3 (videodev2 bindings),
+- `nix` 0.31 (ioctl, mmap, poll), `v4l2-sys-mit` 0.3 (videodev2 bindings),
   both in `castr-codec-v4l2` only, `cfg(target_os = "linux")`.
 - No new dependencies elsewhere. The Windows build must not compile or link
   the new crate (`[target.'cfg(target_os = "linux")'.dependencies]` in the
