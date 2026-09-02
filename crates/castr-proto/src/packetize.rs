@@ -3,7 +3,7 @@ use bytes::{Bytes, BytesMut};
 
 #[derive(Debug, Default)]
 pub struct Packetizer {
-    pub next_frame: u32,
+    pub(crate) next_frame: u32,
 }
 
 impl Packetizer {

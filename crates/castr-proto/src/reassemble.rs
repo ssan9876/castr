@@ -28,8 +28,8 @@ struct Partial {
 pub struct Reassembler {
     max_age_us: u64,
     partial: BTreeMap<u32, Partial>,
-    /// Frame numbers completed recently, so late duplicates are dropped.
-    completed: std::collections::VecDeque<u32>,
+    /// Watermark of newest completed frame, so late duplicates are dropped.
+    newest_completed: Option<u32>,
     lost: u64,
 }
 
@@ -43,7 +43,7 @@ impl Reassembler {
         Self {
             max_age_us,
             partial: BTreeMap::new(),
-            completed: std::collections::VecDeque::new(),
+            newest_completed: None,
             lost: 0,
         }
     }
@@ -62,8 +62,13 @@ impl Reassembler {
         now_us: u64,
     ) -> Result<Option<CompleteFrame>, HeaderError> {
         let (h, payload) = DatagramHeader::decode(datagram)?;
-        if self.completed.contains(&h.frame_number) {
-            return Ok(None);
+        // Check if this is a duplicate of an already-completed frame or a frame we've given up on
+        if let Some(n) = self.newest_completed {
+            if (!frame_newer_or_eq(h.frame_number, n) || h.frame_number == n)
+                && !self.partial.contains_key(&h.frame_number)
+            {
+                return Ok(None);
+            }
         }
         let count = h.fragment_count.max(1) as usize;
         let entry = self
@@ -87,7 +92,14 @@ impl Reassembler {
             return Ok(None);
         }
         let done = self.partial.remove(&h.frame_number).unwrap();
-        self.remember_completed(h.frame_number);
+        // Update newest_completed watermark
+        if let Some(n) = self.newest_completed {
+            if frame_newer_or_eq(h.frame_number, n) {
+                self.newest_completed = Some(h.frame_number);
+            }
+        } else {
+            self.newest_completed = Some(h.frame_number);
+        }
         let mut data = Vec::new();
         for p in done.parts.into_iter() {
             data.extend_from_slice(&p.unwrap());
@@ -99,13 +111,6 @@ impl Reassembler {
             keyframe: done.keyframe,
             data,
         }))
-    }
-
-    fn remember_completed(&mut self, n: u32) {
-        self.completed.push_back(n);
-        while self.completed.len() > 64 {
-            self.completed.pop_front();
-        }
     }
 
     pub fn tick(&mut self, now_us: u64) -> Vec<Nack> {
@@ -242,5 +247,29 @@ mod tests {
     fn rejects_bad_header() {
         let mut r = Reassembler::new(1);
         assert_eq!(r.push(&[0u8; 3], 0).unwrap_err(), HeaderError::TooShort);
+    }
+
+    #[test]
+    fn stale_fragment_for_old_completed_frame_is_dropped_after_many_frames() {
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new(500_000);
+
+        // Complete frames 0 through 99 (single-fragment each)
+        let mut frame_0_dg = None;
+        for i in 0..100 {
+            let dgs = p.packetize(STREAM_VIDEO, false, i as u64, &[i as u8], HEADER_LEN + 100);
+            assert_eq!(dgs.len(), 1);
+            if i == 0 {
+                frame_0_dg = Some(dgs[0].clone());
+            }
+            let result = r.push(&dgs[0], 0).unwrap();
+            assert!(result.is_some());
+        }
+
+        // Try to push a duplicate of frame 0's fragment
+        let frame_0_dup = frame_0_dg.unwrap();
+        let result = r.push(&frame_0_dup, 0).unwrap();
+        assert_eq!(result, None);
+        assert_eq!(r.pending(), 0);
     }
 }
