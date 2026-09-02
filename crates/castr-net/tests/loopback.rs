@@ -200,3 +200,72 @@ async fn browse_with_nothing_advertised_returns_empty() {
         .unwrap();
     assert!(found.iter().all(|r| r.fingerprint != [0x42u8; 32]));
 }
+
+#[tokio::test]
+async fn nack_recovers_dropped_keyframe_fragment() {
+    let (_, _, server, client) = pair();
+    let addr = server.local_addr().unwrap();
+    let (r, s) = tokio::join!(server.accept(), client.connect(addr));
+    let (r, s) = (r.unwrap(), s.unwrap());
+
+    // Drop fragment index 1 of frame 0 the first time it is sent.
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let d2 = dropped.clone();
+    s.set_send_filter(Some(Arc::new(move |d: &[u8]| {
+        let (h, _) = DatagramHeader::decode(d).unwrap();
+        if h.frame_number == 0
+            && h.fragment_index == 1
+            && !d2.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return false;
+        }
+        true
+    })));
+
+    let mut packetizer = Packetizer::new();
+    let mut rtx = RetransmitBuffer::new(500_000);
+    let data: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+    let frags = packetizer.packetize(STREAM_VIDEO, true, 0, &data, 1200);
+    rtx.record(0, true, frags.clone(), 0);
+    for f in &frags {
+        s.send_datagram(f.clone()).unwrap();
+    }
+
+    let mut reasm = Reassembler::new(500_000);
+    let mut nack_tx = r.open_nack_stream().await.unwrap();
+    let recv_task = async {
+        loop {
+            let d = tokio::time::timeout(std::time::Duration::from_millis(200), r.recv_datagram())
+                .await;
+            match d {
+                Ok(Ok(d)) => {
+                    if let Some(f) = reasm.push(&d, 0).unwrap() {
+                        return f;
+                    }
+                }
+                _ => {
+                    for n in reasm.tick(100_000) {
+                        nack_tx.send(&n).await.unwrap();
+                    }
+                }
+            }
+        }
+    };
+    let sender_task = async {
+        let mut nack_rx = s.accept_nack_stream().await.unwrap();
+        let n = nack_rx.recv().await.unwrap();
+        assert_eq!(
+            n,
+            Nack {
+                frame_number: 0,
+                missing: vec![1]
+            }
+        );
+        for f in rtx.lookup(&n, 10_000, 33_333) {
+            s.send_datagram(f).unwrap();
+        }
+    };
+    let (frame, _) = tokio::join!(recv_task, sender_task);
+    assert_eq!(frame.data, data);
+    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+}

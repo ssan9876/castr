@@ -2,10 +2,12 @@
 pub mod discovery;
 pub mod identity;
 pub mod pairing;
+pub mod retransmit;
 pub mod tls;
 pub mod transport;
 pub use discovery::*;
 pub use identity::*;
 pub use pairing::*;
+pub use retransmit::*;
 pub use tls::*;
 pub use transport::*;
