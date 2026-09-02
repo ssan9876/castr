@@ -48,8 +48,11 @@ impl Endpoint {
     /// How long `accept` waits for a handshaked peer to open and use its control stream
     /// before giving up on it and moving on to the next incoming connection. Without this,
     /// a peer that completes the QUIC handshake but never opens a control stream (buggy,
-    /// malicious, or just gone) would stall the accept loop forever.
-    const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+    /// malicious, or just gone) would stall the accept loop forever. Kept below the 3s QUIC
+    /// idle timeout (see `tls::transport_config`) so a stalled peer can never hold the
+    /// serial accept loop longer than the idle-timeout budget of the next legitimate sender
+    /// waiting to connect.
+    const CONTROL_OPEN_TIMEOUT: Duration = Duration::from_secs(2);
 
     pub async fn accept(&self) -> anyhow::Result<Link> {
         loop {
@@ -66,13 +69,13 @@ impl Endpoint {
                 }
             };
             let remote = conn.remote_address();
-            match tokio::time::timeout(Self::CONTROL_STREAM_TIMEOUT, Self::establish_control(&conn))
+            match tokio::time::timeout(Self::CONTROL_OPEN_TIMEOUT, Self::establish_control(&conn))
                 .await
             {
                 Ok(Ok(link)) => return Ok(link),
                 Ok(Err(e)) => tracing::warn!("control stream setup failed for {remote}: {e}"),
                 Err(_) => {
-                    tracing::warn!("control stream timeout for {remote}");
+                    tracing::warn!("control stream open timeout for {remote}");
                     conn.close(1u32.into(), b"control stream timeout");
                 }
             }

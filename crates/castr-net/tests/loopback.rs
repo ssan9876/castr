@@ -141,41 +141,36 @@ async fn accept_survives_peer_that_never_opens_control_stream() {
     let server = Endpoint::server(loopback(), &recv_id, accept_any()).unwrap();
     let addr = server.local_addr().unwrap();
 
-    // Run the receiver's single accept() call as its own task: internally it must survive
-    // the stalling peer below and loop around to accept the well-behaved peer afterward.
-    let accept_task = tokio::spawn(async move { server.accept().await });
-
     // A raw quinn client that completes the QUIC handshake but never opens any stream,
-    // simulating a peer that stalls the receiver's accept loop.
+    // simulating a peer that stalls the receiver's accept loop. `quinn::Endpoint::connect`
+    // only initiates the handshake; it must be polled concurrently with `server.accept()`
+    // for that handshake to actually be driven to completion (a not-yet-`accept()`-ed
+    // incoming connection does no protocol work on its own), so we start it here and
+    // await it in the same `tokio::join!` as everything else below.
     let mut stalling = quinn::Endpoint::client(loopback()).unwrap();
     stalling.set_default_client_config(client_config(&stalling_id, accept_any()).unwrap());
-    let stalling_conn = stalling
-        .connect(addr, "castr.local")
-        .unwrap()
-        .await
-        .unwrap();
-
-    // Deterministically wait for the receiver's own control-stream timeout to close this
-    // connection (rather than guessing at a sleep duration). Once it fires, the accept loop
-    // is guaranteed to have moved on to its next iteration, so a well-behaved peer connecting
-    // afterward isn't racing the stalling peer's still-live (if idle) handshake slot.
-    stalling_conn.closed().await;
-    stalling.close(0u32.into(), b"bye");
+    let stalling_connecting = stalling.connect(addr, "castr.local").unwrap();
 
     let good_client = Endpoint::client(loopback(), &good_id, accept_any()).unwrap();
 
-    let (accept_res, connect_res) =
+    let (accept_res, stalling_res, good_res) =
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(accept_task, good_client.connect(addr))
+            tokio::join!(
+                server.accept(),
+                stalling_connecting,
+                good_client.connect(addr)
+            )
         })
         .await
         .expect("well-behaved peer accepted within 10s");
 
-    let r = accept_res
-        .expect("accept task did not panic")
-        .expect("accept succeeded");
-    let s = connect_res.expect("connect succeeded");
+    let stalling_conn = stalling_res.expect("stalling peer completed its handshake");
+    let r = accept_res.expect("accept succeeded");
+    let s = good_res.expect("connect succeeded");
 
     assert_eq!(r.peer_fingerprint(), good_id.fingerprint);
     assert_eq!(s.peer_fingerprint(), recv_id.fingerprint);
+
+    stalling_conn.close(0u32.into(), b"bye");
+    stalling.close(0u32.into(), b"bye");
 }
