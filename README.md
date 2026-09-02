@@ -85,18 +85,53 @@ into `sender/` and `receiver/`. Each holds `identity.crt`, `identity.key`, and
 
 ## Raspberry Pi receiver
 
-Verified on a Pi 3 Model B running DietPi (Debian 13, 64-bit). Do not build on
-the Pi: its SD card and 1 GB of RAM make that a multi-hour job. Cross-compile
-from Windows or Linux with Docker instead:
+Verified on a Pi 3 Model B running DietPi (Debian 13, 64-bit) with hardware
+H.264 decode. Do not build on the Pi; cross-compile with Docker and deploy:
 
 ```
-bash scripts/pi/build-pi.sh        # -> dist/castr-receiver-aarch64 (~10 MB, needs only glibc/libstdc++)
+bash scripts/pi/deploy.sh dietpi@<pi>     # first run installs everything, later runs update + restart
 ```
 
-Copy the binary to the Pi (DietPi ships dropbear without SFTP, so `scp` fails;
+The first run copies `setup.sh` over and runs it as root: it enables full KMS
+and `gpu_mem=128` in `config.txt` (the VideoCore firmware does not start the
+decoder below 64 MB), loads `bcm2835_codec` at boot, installs runtime packages,
+creates a `castr` system user, and installs `castr-receiver.service`. If it
+prints REBOOT REQUIRED, reboot; the receiver is then on screen about 20 s after
+power-on, named after the hostname, and pairing state lives in
+`/var/lib/castr/config/castr/receiver/`. Pair once from each sender after setup.
+
+Logs: `journalctl -u castr-receiver -f`. The `perf:` line every 5 s shows
+decode and present times; on a Pi 3 expect 1080p30 with decode under 15 ms. Its
+current format is:
+
+```
+perf: pictures P (decode calls C avg X ms max Y ms, drain avg X ms max Y ms), presented N present avg X ms max Y ms, queue Q, dropped D
+```
+
+`--decoder auto` (default) uses V4L2 hardware decode and falls back to openh264
+if `/dev/video10` is missing; `--decoder sw` forces software.
+
+The receiver asks SDL for its `opengles2` renderer on Linux. SDL's default
+order tries desktop `opengl` first, and on a Pi without libGL that renderer is
+created with shaders disabled and draws a black screen. Debug switches for a
+headless box: `CASTR_DUMP_FRAME=/tmp/f.raw` writes the rendered output every
+2 s (RGB24 with a `CASTRDUMP w h` header), `CASTR_SDL_VERBOSE=1` prints SDL's
+internal log, and `CASTR_SOFTWARE_RENDER=1 SDL_RENDER_DRIVER=software` bypasses
+the GPU entirely.
+
+Use a proper 2.5 A power supply. On a weak one the kernel logs "Undervoltage
+detected", the SD card slows to a crawl (2 MB/s reads instead of 20+), and
+package installs stall for hours.
+
+### Manual alternative
+
+`deploy.sh` and the systemd unit are the supported path; running the binary by
+hand under a login shell still works for one-off testing. Cross-compile, then
+copy the binary to the Pi (DietPi ships dropbear without SFTP, so `scp` fails;
 pipe it over ssh):
 
 ```
+bash scripts/pi/build-pi.sh        # -> dist/castr-receiver-aarch64 (~10 MB, needs only glibc/libstdc++)
 cat dist/castr-receiver-aarch64 | ssh dietpi@<pi> 'mkdir -p ~/bin && cat > ~/bin/castr-receiver && chmod +x ~/bin/castr-receiver'
 ```
 
@@ -115,22 +150,6 @@ Run it from an SSH session or the console (not inside a desktop):
 ```
 SDL_VIDEODRIVER=kmsdrm ~/bin/castr-receiver --name pi --fullscreen
 ```
-
-The receiver asks SDL for its `opengles2` renderer on Linux. SDL's default
-order tries desktop `opengl` first, and on a Pi without libGL that renderer is
-created with shaders disabled and draws a black screen. Debug switches for a
-headless box: `CASTR_DUMP_FRAME=/tmp/f.raw` writes the rendered output every
-2 s (RGB24 with a `CASTRDUMP w h` header), `CASTR_SDL_VERBOSE=1` prints SDL's
-internal log, and `CASTR_SOFTWARE_RENDER=1 SDL_RENDER_DRIVER=software` bypasses
-the GPU entirely.
-
-Use a proper 2.5 A power supply. On a weak one the kernel logs "Undervoltage
-detected", the SD card slows to a crawl (2 MB/s reads instead of 20+), and
-package installs stall for hours.
-
-What to expect: decoding is software (openh264) until the V4L2 sub-project
-lands, so the sender's game-mode ladder settles at 1280x534 or 960x400 for a
-1920-wide desktop within a few seconds, at 30 fps with audio over HDMI.
 
 The generic Linux recipe (untested beyond the Docker image) is the package list
 in `scripts/pi/Dockerfile` plus `LIBOPUS_LIB_DIR=/usr/lib/<triplet>
