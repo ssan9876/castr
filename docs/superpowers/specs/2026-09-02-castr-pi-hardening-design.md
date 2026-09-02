@@ -90,7 +90,7 @@ is what the Windows Media Foundation decoder already produces, and
 - `sw`: openh264, as today.
 
 Open probes `/dev/video10` (override with `CASTR_V4L2_DEVICE`), checks
-`V4L2_CAP_VIDEO_M2M_MPLANE` (or `_M2M`), and checks that `H264` is listed as an
+`V4L2_CAP_VIDEO_M2M_MPLANE`, and checks that `H264` is listed as an
 OUTPUT format and `NV12` as a CAPTURE format. A missing device or module is an
 ordinary error, not a panic; `auto` then falls back to software.
 
@@ -199,13 +199,36 @@ The game-mode ladder switches between 1920, 1280 and 960 wide every few
 seconds under load, so this path is routine, not exceptional. On
 `SOURCE_CHANGE` with `V4L2_EVENT_SRC_CH_RESOLUTION`:
 
-1. `VIDIOC_STREAMOFF` CAPTURE (returns all CAPTURE buffers).
-2. Unmap and close the old CAPTURE buffers, `REQBUFS(0)` to free them.
-3. `G_FMT` / `S_FMT` CAPTURE, `REQBUFS`, `QUERYBUF`, `mmap`, `EXPBUF`, queue,
-   `STREAMON` CAPTURE, refresh the compose rectangle.
+1. Drain the old sequence to its end first, unless the CAPTURE queue is still
+   the provisional one from 4.2 step 5 (nothing decoded from it is kept
+   anyway). The kernel's stateful decoder contract is that a picture keeps
+   coming out until one is flagged `V4L2_BUF_FLAG_LAST`; stopping the queue
+   before that arrives throws those pictures away, including the new
+   sequence's IDR, after which every following delta frame decodes to
+   nothing. Draining collects CAPTURE buffers (queueing each straight back)
+   and services OUTPUT in a bounded loop until `LAST` is seen or the loop's
+   round budget runs out. Two conditions end the drain the same way `LAST`
+   does: `DQBUF` on CAPTURE returning `EPIPE`, and a requeue of a drained
+   buffer being refused with `EINVAL` (the driver has already reformatted the
+   queue out from under it). Either is treated as end-of-sequence rather than
+   an error - a driver that signals the end this way instead of with `LAST`
+   still needs the reconfigure below to run.
+2. `VIDIOC_STREAMOFF` CAPTURE (returns any CAPTURE buffers still queued).
+3. `VIDIOC_G_FMT` CAPTURE to read the driver's new coded geometry. If it is
+   unchanged from what the current buffers were allocated for (width, height,
+   `bytesperline`, and `sizeimage` all equal), the buffers are still the
+   right size: restart the queue (`QBUF` every buffer, `STREAMON`) and just
+   refresh the compose rectangle. This is the common case for the game-mode
+   ladder's *chroma-only* renegotiations and for the first event after
+   startup replacing the provisional queue with one at the same size.
+4. Otherwise the geometry actually changed: unmap and close the old CAPTURE
+   buffers, `REQBUFS(0)` to free them, then `S_FMT` CAPTURE, `REQBUFS`,
+   `QUERYBUF`, `mmap`, `EXPBUF`, queue all, `STREAMON` CAPTURE, and read the
+   compose rectangle.
 
 OUTPUT streaming continues throughout; buffers queued before the change stay
-valid. The first event after startup follows exactly the same steps, so there
+valid. The first event after startup follows exactly the same steps (skipping
+the drain, since the provisional queue held nothing worth keeping), so there
 is one code path.
 
 A resolution change always arrives on a keyframe (the sender restarts the

@@ -111,6 +111,14 @@ perf: pictures P (decode calls C avg X ms max Y ms, drain avg X ms max Y ms), pr
 `--decoder auto` (default) uses V4L2 hardware decode and falls back to openh264
 if `/dev/video10` is missing; `--decoder sw` forces software.
 
+Known limitations: the V4L2 decoder's dominant per-frame cost is copying each
+picture out of its uncached CAPTURE mapping (~15 ms at 1080p on a Pi 3); there
+is no zero-copy present path yet, so that copy stays on the hot path even
+though DMABUFs are already exported for every CAPTURE buffer (unused for
+now). Quality mode's `perf:` line legitimately shows `queue 5-7` - its 150 ms
+playout delay means several pictures are buffered waiting to be shown, not
+that anything is backing up.
+
 The receiver asks SDL for its `opengles2` renderer on Linux. SDL's default
 order tries desktop `opengl` first, and on a Pi without libGL that renderer is
 created with shaders disabled and draws a black screen. Debug switches for a
