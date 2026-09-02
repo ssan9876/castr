@@ -45,6 +45,12 @@ impl Endpoint {
     /// resolve on the client side before the server has verified the client's certificate.
     const CONTROL_ACK: &'static [u8; 2] = b"OK";
 
+    /// How long `accept` waits for a handshaked peer to open and use its control stream
+    /// before giving up on it and moving on to the next incoming connection. Without this,
+    /// a peer that completes the QUIC handshake but never opens a control stream (buggy,
+    /// malicious, or just gone) would stall the accept loop forever.
+    const CONTROL_STREAM_TIMEOUT: Duration = Duration::from_secs(5);
+
     pub async fn accept(&self) -> anyhow::Result<Link> {
         loop {
             let incoming = self
@@ -52,26 +58,43 @@ impl Endpoint {
                 .accept()
                 .await
                 .ok_or_else(|| anyhow!("endpoint closed"))?;
-            match incoming.await {
-                Ok(conn) => match conn.accept_bi().await {
-                    Ok((mut tx, mut rx)) => {
-                        let mut preamble = [0u8; 4];
-                        match rx.read_exact(&mut preamble).await {
-                            Ok(()) if &preamble == Self::CONTROL_PREAMBLE => {
-                                match tx.write_all(Self::CONTROL_ACK).await {
-                                    Ok(()) => return Link::new(conn, tx, rx),
-                                    Err(e) => tracing::warn!("control ack write failed: {e}"),
-                                }
-                            }
-                            Ok(()) => tracing::warn!("bad control preamble {preamble:?}"),
-                            Err(e) => tracing::warn!("control preamble read failed: {e}"),
-                        }
-                    }
-                    Err(e) => tracing::warn!("control stream not opened: {e}"),
-                },
-                Err(e) => tracing::warn!("handshake failed: {e}"),
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!("handshake failed: {e}");
+                    continue;
+                }
+            };
+            let remote = conn.remote_address();
+            match tokio::time::timeout(Self::CONTROL_STREAM_TIMEOUT, Self::establish_control(&conn))
+                .await
+            {
+                Ok(Ok(link)) => return Ok(link),
+                Ok(Err(e)) => tracing::warn!("control stream setup failed for {remote}: {e}"),
+                Err(_) => {
+                    tracing::warn!("control stream timeout for {remote}");
+                    conn.close(1u32.into(), b"control stream timeout");
+                }
             }
         }
+    }
+
+    async fn establish_control(conn: &quinn::Connection) -> anyhow::Result<Link> {
+        let (mut tx, mut rx) = conn
+            .accept_bi()
+            .await
+            .context("control stream not opened")?;
+        let mut preamble = [0u8; 4];
+        rx.read_exact(&mut preamble)
+            .await
+            .context("control preamble read failed")?;
+        if &preamble != Self::CONTROL_PREAMBLE {
+            bail!("bad control preamble {preamble:?}");
+        }
+        tx.write_all(Self::CONTROL_ACK)
+            .await
+            .context("control ack write failed")?;
+        Link::new(conn.clone(), tx, rx)
     }
 
     pub async fn connect(&self, addr: SocketAddr) -> anyhow::Result<Link> {

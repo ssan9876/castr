@@ -4,6 +4,54 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+/// Writes `data` to `path` atomically: writes to a `.tmp` sibling in the same directory,
+/// then renames it over `path`. On Windows, `rename` can fail with `AlreadyExists` if the
+/// destination already exists, so fall back to removing it first and retrying. When
+/// `secret` is true and we're on unix, the temp file is created with mode 0o600 before any
+/// data is written to it, so the private key is never briefly world-readable.
+fn write_atomic(path: &Path, data: &[u8], secret: bool) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
+    let tmp_path = dir.join(format!(
+        "{}.tmp",
+        path.file_name()
+            .ok_or_else(|| anyhow::anyhow!("{} has no file name", path.display()))?
+            .to_string_lossy()
+    ));
+
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        if secret {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let _ = secret;
+        let mut file = opts
+            .open(&tmp_path)
+            .with_context(|| format!("create {}", tmp_path.display()))?;
+        std::io::Write::write_all(&mut file, data)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", tmp_path.display()))?;
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp_path, path)
+                .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))?;
+        } else {
+            return Err(e)
+                .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()));
+        }
+    }
+    Ok(())
+}
+
 pub struct Identity {
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
@@ -48,8 +96,8 @@ impl Identity {
             });
         }
         let id = Self::generate()?;
-        std::fs::write(&cert_path, &id.cert_der)?;
-        std::fs::write(&key_path, &id.key_der)?;
+        write_atomic(&cert_path, &id.cert_der, false)?;
+        write_atomic(&key_path, &id.key_der, true)?;
         Ok(id)
     }
 
@@ -89,8 +137,11 @@ impl PairedStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, toml::to_string_pretty(&self.file)?)?;
-        Ok(())
+        write_atomic(
+            &self.path,
+            toml::to_string_pretty(&self.file)?.as_bytes(),
+            false,
+        )
     }
 
     pub fn is_paired(&self, fp: &[u8; 32]) -> bool {
@@ -164,6 +215,35 @@ mod tests {
         let b = Identity::load_or_create(&dir).unwrap();
         assert_eq!(a.fingerprint, b.fingerprint);
         assert!(dir.join("identity.crt").exists() && dir.join("identity.key").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn key_file_is_written_atomically_and_reloads() {
+        let dir = std::env::temp_dir().join(format!("castr-id-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let a = Identity::load_or_create(&dir).unwrap();
+        let entries: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !entries.iter().any(|n| n.ends_with(".tmp")),
+            "no .tmp files should remain: {entries:?}"
+        );
+        let b = Identity::load_or_create(&dir).unwrap();
+        assert_eq!(a.fingerprint, b.fingerprint);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.join("identity.key"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
