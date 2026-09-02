@@ -36,6 +36,16 @@ pub struct V4l2Decoder<O: Ops = RealOps> {
     finished: bool,
 }
 
+impl<O: Ops> std::fmt::Debug for V4l2Decoder<O> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("V4l2Decoder")
+            .field("unanswered", &self.unanswered)
+            .field("finished", &self.finished)
+            .field("has_capture", &self.capture.is_some())
+            .finish()
+    }
+}
+
 impl V4l2Decoder<RealOps> {
     pub fn open() -> anyhow::Result<Self> {
         let path = std::env::var("CASTR_V4L2_DEVICE").unwrap_or_else(|_| DEFAULT_DEVICE.into());
