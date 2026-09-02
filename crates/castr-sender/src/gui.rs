@@ -21,7 +21,7 @@ struct ActiveCast {
 }
 
 struct App {
-    rt: tokio::runtime::Runtime,
+    rt: tokio::runtime::Handle,
     shared: Arc<Mutex<Shared>>,
     config_dir: PathBuf,
     sender_name: String,
@@ -57,7 +57,10 @@ impl App {
             // `read_pin` below blocks this runtime worker thread until the
             // user submits a PIN through the GUI (or cancels, which drops
             // `pin_tx` and makes `recv()` return an error). That is
-            // acceptable because the runtime is multi-threaded.
+            // acceptable because the runtime is multi-threaded; if the
+            // window is closed while this is pending, `App::on_exit` takes
+            // and drops `shared.pairing_pin_tx`, closing the channel and
+            // releasing this worker thread.
             let result = pair_interactive(&target, &dir, move || {
                 pin_rx
                     .recv()
@@ -239,12 +242,26 @@ impl eframe::App for App {
             }
         });
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // If a pairing is pending, the spawned task is blocked in
+        // `pin_rx.recv()` on a runtime worker thread. Dropping the sender
+        // half here closes the channel, so `recv()` errors out and the
+        // task finishes instead of blocking forever (which would otherwise
+        // hang `rt.shutdown_timeout` below).
+        if let Some(tx) = self.shared.lock().unwrap().pairing_pin_tx.take() {
+            drop(tx);
+        }
+        if let Some(a) = &self.active {
+            let _ = a.cmd.try_send(CastCommand::Stop);
+        }
+    }
 }
 
 pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
     let app = App {
-        rt,
+        rt: rt.handle().clone(),
         shared: Arc::new(Mutex::new(Shared {
             receivers: Vec::new(),
             scanning: false,
@@ -264,6 +281,11 @@ pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size([420.0, 320.0]),
         ..Default::default()
     };
-    eframe::run_native("castr", options, Box::new(|_| Ok(Box::new(app))))
-        .map_err(|e| anyhow::anyhow!("gui: {e}"))
+    let result = eframe::run_native("castr", options, Box::new(|_| Ok(Box::new(app))))
+        .map_err(|e| anyhow::anyhow!("gui: {e}"));
+    // `App::on_exit` releases any worker thread blocked on a pending
+    // pairing's PIN channel, but give shutdown a bound anyway so the
+    // process exits even if some task is still stuck.
+    rt.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
