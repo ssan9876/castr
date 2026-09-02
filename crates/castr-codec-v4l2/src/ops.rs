@@ -21,6 +21,17 @@ pub struct Dequeued {
     pub flags: u32,
 }
 
+/// The outcome of one non-blocking DQBUF.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dequeue {
+    /// Nothing ready yet (EAGAIN).
+    Idle,
+    Buffer(Dequeued),
+    /// The driver has already handed over the last buffer of the sequence
+    /// (EPIPE). Nothing more comes out of this queue until it is restarted.
+    EndOfSequence,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Event {
     pub kind: u32,
@@ -32,6 +43,10 @@ pub struct PollResult {
     pub readable: bool,
     pub writable: bool,
     pub event: bool,
+    /// POLLERR/POLLHUP/POLLNVAL. On an M2M device this means the driver has
+    /// failed the stream (or neither queue is streaming with buffers queued);
+    /// it never clears by itself, so callers must treat it as fatal.
+    pub error: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -112,14 +127,20 @@ pub trait Ops {
         bytesused: u32,
         timestamp_us: u64,
     ) -> io::Result<()>;
-    /// None when nothing is ready (EAGAIN).
-    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Option<Dequeued>>;
+    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Dequeue>;
     fn streamon(&mut self, buf_type: u32) -> io::Result<()>;
     fn streamoff(&mut self, buf_type: u32) -> io::Result<()>;
     fn subscribe(&mut self, event_type: u32) -> io::Result<()>;
     /// None when no event is pending (ENOENT).
     fn dqevent(&mut self) -> io::Result<Option<Event>>;
     fn poll(&mut self, timeout_ms: i32) -> io::Result<PollResult>;
+    /// Monotonic clock. It lives on `Ops` so the fake can drive the decoder's
+    /// stall detector deterministically instead of the tests sleeping.
+    fn now(&mut self) -> std::time::Instant {
+        std::time::Instant::now()
+    }
+    /// Reads an integer control; used for V4L2_CID_MIN_BUFFERS_FOR_CAPTURE.
+    fn g_ctrl(&mut self, id: u32) -> io::Result<i32>;
     fn g_selection_compose(&mut self, buf_type: u32) -> io::Result<v4l2_rect>;
 }
 
@@ -290,17 +311,20 @@ impl Ops for RealOps {
         self.ioctl(VIDIOC_QBUF, &mut b)
     }
 
-    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Option<Dequeued>> {
+    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Dequeue> {
         let mut planes = [v4l2_plane::default(); 1];
         let mut b = v4l2_buffer::mplane(buf_type, 0, &mut planes);
         match self.ioctl(VIDIOC_DQBUF, &mut b) {
-            Ok(()) => Ok(Some(Dequeued {
+            Ok(()) => Ok(Dequeue::Buffer(Dequeued {
                 index: b.index,
                 bytesused: planes[0].bytesused,
                 timestamp_us: join_ts(b.timestamp),
                 flags: b.flags,
             })),
-            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(None),
+            Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => Ok(Dequeue::Idle),
+            // The kernel reports the end of a decoded sequence by failing
+            // every DQBUF after the LAST buffer with EPIPE.
+            Err(e) if e.raw_os_error() == Some(libc::EPIPE) => Ok(Dequeue::EndOfSequence),
             Err(e) => Err(e),
         }
     }
@@ -352,7 +376,14 @@ impl Ops for RealOps {
             readable: pfd.revents & libc::POLLIN != 0,
             writable: pfd.revents & libc::POLLOUT != 0,
             event: pfd.revents & libc::POLLPRI != 0,
+            error: pfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0,
         })
+    }
+
+    fn g_ctrl(&mut self, id: u32) -> io::Result<i32> {
+        let mut c = v4l2_control { id, value: 0 };
+        self.ioctl(VIDIOC_G_CTRL, &mut c)?;
+        Ok(c.value)
     }
 
     fn g_selection_compose(&mut self, buf_type: u32) -> io::Result<v4l2_rect> {

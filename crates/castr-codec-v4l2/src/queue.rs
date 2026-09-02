@@ -2,7 +2,7 @@
 //! export, queue/dequeue bookkeeping and teardown. Pure bookkeeping over `Ops`,
 //! so it is unit-tested with `FakeOps`.
 
-use crate::ops::{Dequeued, Mapping, Ops};
+use crate::ops::{Dequeue, Mapping, Ops};
 use std::io;
 use std::os::fd::OwnedFd;
 
@@ -97,20 +97,20 @@ impl Queue {
         Ok(())
     }
 
-    pub fn dequeue<O: Ops>(&mut self, ops: &mut O) -> io::Result<Option<Dequeued>> {
-        let Some(d) = ops.dqbuf(self.buf_type)? else {
-            return Ok(None);
-        };
-        match self.buffers.get_mut(d.index as usize) {
-            Some(b) => b.queued = false,
-            None => {
-                return Err(io::Error::other(format!(
-                    "driver dequeued unknown buffer {}",
-                    d.index
-                )))
+    pub fn dequeue<O: Ops>(&mut self, ops: &mut O) -> io::Result<Dequeue> {
+        let r = ops.dqbuf(self.buf_type)?;
+        if let Dequeue::Buffer(d) = r {
+            match self.buffers.get_mut(d.index as usize) {
+                Some(b) => b.queued = false,
+                None => {
+                    return Err(io::Error::other(format!(
+                        "driver dequeued unknown buffer {}",
+                        d.index
+                    )))
+                }
             }
         }
-        Ok(Some(d))
+        Ok(r)
     }
 
     pub fn release<O: Ops>(&mut self, ops: &mut O) -> io::Result<()> {
@@ -127,6 +127,7 @@ impl Queue {
 mod tests {
     use super::*;
     use crate::fake::FakeOps;
+    use crate::ops::Dequeued;
     use crate::sys::*;
 
     const OUT: u32 = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
@@ -173,7 +174,7 @@ mod tests {
         assert_eq!(q.free_slot(), Some(1));
         q.queue(&mut ops, 1, 50, 2_000).unwrap();
         assert_eq!(q.free_slot(), None);
-        assert!(q.dequeue(&mut ops).unwrap().is_none());
+        assert_eq!(q.dequeue(&mut ops).unwrap(), Dequeue::Idle);
         ops.push_dequeue(
             OUT,
             Dequeued {
@@ -183,7 +184,9 @@ mod tests {
                 flags: 0,
             },
         );
-        let d = q.dequeue(&mut ops).unwrap().unwrap();
+        let Dequeue::Buffer(d) = q.dequeue(&mut ops).unwrap() else {
+            panic!("expected a buffer")
+        };
         assert_eq!(d.index, 0);
         assert_eq!(q.in_flight(), 1);
         assert_eq!(q.free_slot(), Some(0));

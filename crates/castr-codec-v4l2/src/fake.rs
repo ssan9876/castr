@@ -18,11 +18,15 @@ pub(crate) struct FakeOps {
     pub output_format: FormatInfo,
     pub compose: v4l2_rect,
     pub granted: Option<u32>,
-    dequeues: VecDeque<(u32, Dequeued)>,
+    dequeues: VecDeque<(u32, Dequeue)>,
     events: VecDeque<Event>,
     pub polls: VecDeque<PollResult>,
     pub fail_next: Option<&'static str>,
     pub captures_filled: Vec<u8>,
+    /// Value served for V4L2_CID_MIN_BUFFERS_FOR_CAPTURE.
+    pub min_capture_buffers: i32,
+    /// Virtual clock; only `advance` moves it.
+    clock: std::time::Instant,
     pub sink: Option<Arc<Mutex<Vec<String>>>>,
 }
 
@@ -75,11 +79,21 @@ impl FakeOps {
             polls: VecDeque::new(),
             fail_next: None,
             captures_filled: Vec::new(),
+            min_capture_buffers: 1,
+            clock: std::time::Instant::now(),
             sink: None,
         }
     }
+    /// Move the virtual clock forward.
+    pub fn advance(&mut self, d: std::time::Duration) {
+        self.clock += d;
+    }
     pub fn push_dequeue(&mut self, buf_type: u32, d: Dequeued) {
-        self.dequeues.push_back((buf_type, d));
+        self.dequeues.push_back((buf_type, Dequeue::Buffer(d)));
+    }
+    /// Script the EPIPE the kernel returns once the sequence is finished.
+    pub fn push_end_of_sequence(&mut self, buf_type: u32) {
+        self.dequeues.push_back((buf_type, Dequeue::EndOfSequence));
     }
     pub fn push_event(&mut self, e: Event) {
         self.events.push_back(e);
@@ -184,12 +198,12 @@ impl Ops for FakeOps {
             "qbuf({buf_type},{index},{bytesused},{timestamp_us})"
         ))
     }
-    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Option<Dequeued>> {
+    fn dqbuf(&mut self, buf_type: u32) -> io::Result<Dequeue> {
         self.record(format!("dqbuf({buf_type})"))?;
         if let Some(pos) = self.dequeues.iter().position(|(t, _)| *t == buf_type) {
-            return Ok(Some(self.dequeues.remove(pos).unwrap().1));
+            return Ok(self.dequeues.remove(pos).unwrap().1);
         }
-        Ok(None)
+        Ok(Dequeue::Idle)
     }
     fn streamon(&mut self, buf_type: u32) -> io::Result<()> {
         self.record(format!("streamon({buf_type})"))
@@ -207,6 +221,17 @@ impl Ops for FakeOps {
     fn poll(&mut self, timeout_ms: i32) -> io::Result<PollResult> {
         self.record(format!("poll({timeout_ms})"))?;
         Ok(self.polls.pop_front().unwrap_or_default())
+    }
+    fn now(&mut self) -> std::time::Instant {
+        self.clock
+    }
+    fn g_ctrl(&mut self, id: u32) -> io::Result<i32> {
+        self.record(format!("g_ctrl({id:#x})"))?;
+        if id == V4L2_CID_MIN_BUFFERS_FOR_CAPTURE {
+            Ok(self.min_capture_buffers)
+        } else {
+            Err(io::Error::from_raw_os_error(libc::EINVAL))
+        }
     }
     fn g_selection_compose(&mut self, buf_type: u32) -> io::Result<v4l2_rect> {
         self.record(format!("g_selection({buf_type})"))?;
@@ -231,11 +256,11 @@ mod tests {
             f.calls,
             vec!["reqbufs(10,4)", "mmap(16,0)", "qbuf(10,1,5,1000)"]
         );
-        // Nothing scripted: dequeue is EAGAIN -> None.
-        assert!(f
-            .dqbuf(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE)
-            .unwrap()
-            .is_none());
+        // Nothing scripted: dequeue is EAGAIN -> Idle.
+        assert_eq!(
+            f.dqbuf(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE).unwrap(),
+            Dequeue::Idle
+        );
         f.push_dequeue(
             V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
             Dequeued {
@@ -245,8 +270,15 @@ mod tests {
                 flags: 0,
             },
         );
-        let d = f.dqbuf(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE).unwrap().unwrap();
+        let Dequeue::Buffer(d) = f.dqbuf(V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE).unwrap() else {
+            panic!("expected a buffer")
+        };
         assert_eq!(d.index, 1);
+        f.push_end_of_sequence(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE);
+        assert_eq!(
+            f.dqbuf(V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE).unwrap(),
+            Dequeue::EndOfSequence
+        );
     }
 
     #[test]

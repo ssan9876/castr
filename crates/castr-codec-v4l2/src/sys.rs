@@ -16,6 +16,8 @@ pub const V4L2_EVENT_SOURCE_CHANGE: u32 = 5;
 pub const V4L2_EVENT_SRC_CH_RESOLUTION: u32 = 1;
 pub const V4L2_SEL_TGT_COMPOSE: u32 = 0x0100;
 pub const V4L2_BUF_FLAG_LAST: u32 = 0x0010_0000;
+/// Smallest CAPTURE buffer count the decoder needs to make progress.
+pub const V4L2_CID_MIN_BUFFERS_FOR_CAPTURE: u32 = 0x0098_0927;
 pub const VIDEO_MAX_PLANES: usize = 8;
 
 pub const fn fourcc(a: u8, b: u8, c: u8, d: u8) -> u32 {
@@ -53,6 +55,7 @@ pub const VIDIOC_EXPBUF: u64 = iowr(16, size_of::<v4l2_exportbuffer>());
 pub const VIDIOC_DQBUF: u64 = iowr(17, size_of::<v4l2_buffer>());
 pub const VIDIOC_STREAMON: u64 = iow(18, size_of::<i32>());
 pub const VIDIOC_STREAMOFF: u64 = iow(19, size_of::<i32>());
+pub const VIDIOC_G_CTRL: u64 = iowr(27, size_of::<v4l2_control>());
 pub const VIDIOC_DQEVENT: u64 = ior(89, size_of::<v4l2_event>());
 pub const VIDIOC_SUBSCRIBE_EVENT: u64 = iow(90, size_of::<v4l2_event_subscription>());
 pub const VIDIOC_G_SELECTION: u64 = iowr(94, size_of::<v4l2_selection>());
@@ -251,6 +254,13 @@ impl v4l2_buffer {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct v4l2_control {
+    pub id: u32,
+    pub value: i32,
+}
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct v4l2_exportbuffer {
     pub type_: u32,
@@ -277,12 +287,22 @@ pub struct v4l2_timespec {
     pub tv_nsec: i64,
 }
 
+/// The event's `u` union: 64 bytes, but 8-aligned because `v4l2_event_ctrl`
+/// holds a `__s64`. That alignment puts four bytes of padding between `type`
+/// and the payload; without it every event field reads four bytes early and
+/// `changes` comes back as 0.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub struct v4l2_event_u {
+    pub data: [u8; 64],
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct v4l2_event {
     pub type_: u32,
     /// Union payload; for SOURCE_CHANGE the first u32 is `changes`.
-    pub u: [u8; 64],
+    pub u: v4l2_event_u,
     pub pending: u32,
     pub sequence: u32,
     pub timestamp: v4l2_timespec,
@@ -292,7 +312,8 @@ pub struct v4l2_event {
 
 impl v4l2_event {
     pub fn src_changes(&self) -> u32 {
-        u32::from_ne_bytes([self.u[0], self.u[1], self.u[2], self.u[3]])
+        let d = self.u.data;
+        u32::from_ne_bytes([d[0], d[1], d[2], d[3]])
     }
 }
 
@@ -336,9 +357,14 @@ mod tests {
         assert_eq!(size_of::<v4l2_requestbuffers>(), 20);
         assert_eq!(size_of::<v4l2_plane>(), 64);
         assert_eq!(size_of::<v4l2_buffer>(), 88);
+        assert_eq!(size_of::<v4l2_control>(), 8);
         assert_eq!(size_of::<v4l2_exportbuffer>(), 64);
         assert_eq!(size_of::<v4l2_event_subscription>(), 32);
         assert_eq!(size_of::<v4l2_event>(), 136);
+        // The payload starts at offset 8, not 4: the union is 8-aligned.
+        assert_eq!(std::mem::offset_of!(v4l2_event, u), 8);
+        assert_eq!(std::mem::offset_of!(v4l2_event, pending), 72);
+        assert_eq!(std::mem::offset_of!(v4l2_event, timestamp), 80);
         assert_eq!(size_of::<v4l2_selection>(), 64);
     }
 
@@ -356,6 +382,7 @@ mod tests {
         assert_eq!(VIDIOC_DQBUF, 0xC058_5611);
         assert_eq!(VIDIOC_STREAMON, 0x4004_5612);
         assert_eq!(VIDIOC_STREAMOFF, 0x4004_5613);
+        assert_eq!(VIDIOC_G_CTRL, 0xC008_561B);
         assert_eq!(VIDIOC_DQEVENT, 0x8088_5659);
         assert_eq!(VIDIOC_SUBSCRIBE_EVENT, 0x4020_565A);
         assert_eq!(VIDIOC_G_SELECTION, 0xC040_565E);
