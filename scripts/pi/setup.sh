@@ -28,9 +28,10 @@ echo "== decoder module at boot"
 # need the camera/codec stack); systemd-modules-load honours blacklists even
 # for modules named explicitly in modules-load.d, so it has to come out or our
 # entry below is silently skipped at boot.
-if grep -rl '^blacklist bcm2835_codec$' /etc/modprobe.d/ >/dev/null 2>&1; then
-  sed -i '/^blacklist bcm2835_codec$/d' /etc/modprobe.d/*.conf
-  echo "   removed bcm2835_codec from modprobe blacklist"
+files=$(grep -rl '^blacklist bcm2835_codec$' /etc/modprobe.d/ 2>/dev/null || true)
+if [ -n "$files" ]; then
+  sed -i '/^blacklist bcm2835_codec$/d' $files
+  echo "   removed bcm2835_codec from modprobe blacklist: $files"
 fi
 if [ ! -f /etc/modules-load.d/castr.conf ]; then
   echo bcm2835_codec > /etc/modules-load.d/castr.conf
@@ -40,6 +41,7 @@ fi
 
 echo "== packages"
 export DEBIAN_FRONTEND=noninteractive
+apt-get update -q >/dev/null
 apt-get install -y -q libstdc++6 libasound2 libdrm2 libgbm1 libgles2 libegl1 v4l-utils >/dev/null
 
 echo "== user castr"
