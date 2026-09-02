@@ -219,10 +219,12 @@ fn spawn_capture(
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         EncCmd::Bitrate(b) => {
+                            cfg.bitrate_bps = b;
                             let _ = enc.set_bitrate(b);
                         }
                         EncCmd::Keyframe => enc.request_keyframe(),
                         EncCmd::Mode(m) => {
+                            cfg.mode = m;
                             let _ = enc.set_mode(m);
                         }
                         EncCmd::Resolution(nw, nh) => {
@@ -422,20 +424,17 @@ pub async fn cast(
         .max_bitrate
         .unwrap_or(u32::MAX)
         .min(caps.max_bitrate_bps);
-    let _cap_thread = spawn_capture(
-        native_tx,
-        enc_rx,
-        video_tx,
-        opts.fps,
-        mode,
-        ceiling / 2,
-        start,
-    )?;
+    // `choose_params` clamps fps the same way; compute it once up front so the
+    // capture/encode thread is started at the fps that will actually be used,
+    // rather than the requested (possibly higher) fps.
+    let fps = opts.fps.min(caps.max_fps).max(1);
+    let _cap_thread = spawn_capture(native_tx, enc_rx, video_tx, fps, mode, ceiling / 2, start)?;
     let native =
         tokio::task::spawn_blocking(move || native_rx.recv_timeout(Duration::from_secs(5)))
             .await?
             .context("capture did not start")?;
     let mut params = choose_params(native, opts.fps, opts.max_bitrate, mode, &caps);
+    debug_assert_eq!(params.fps, fps);
     if (params.width, params.height) != native {
         enc_tx
             .send(EncCmd::Resolution(params.width, params.height))
@@ -461,6 +460,8 @@ pub async fn cast(
     let mut sent_frames = 0u32;
     let mut fps_window = Instant::now();
     let mut nack_rx: Option<NackReceiver> = None;
+    let mut control_errors: u32 = 0;
+    let mut audio_alive = true;
     set_state("casting");
     status.send_modify(|st| {
         st.width = params.width;
@@ -471,7 +472,12 @@ pub async fn cast(
     loop {
         let now = start.elapsed().as_micros() as u64;
         tokio::select! {
-            Some(v) = video_rx.recv() => {
+            v = video_rx.recv() => {
+                let Some(v) = v else {
+                    set_state("failed");
+                    stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
+                    bail!("capture thread exited");
+                };
                 let frags = packetizer.packetize(STREAM_VIDEO, v.frame.keyframe, v.frame.timestamp_us, &v.frame.data, link.max_datagram_size());
                 rtx.record(packetizer.last_frame_number(), v.frame.keyframe, frags.clone(), now);
                 for f in frags { if let Err(e) = link.send_datagram(f) { tracing::debug!("send: {e:#}"); } }
@@ -482,16 +488,25 @@ pub async fn cast(
                     sent_frames = 0; fps_window = Instant::now();
                 }
             }
-            Some(a) = audio_rx.recv() => {
-                for f in packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
-                    let _ = link.send_datagram(f);
+            a = audio_rx.recv(), if audio_alive => {
+                match a {
+                    Some(a) => {
+                        for f in packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
+                            let _ = link.send_datagram(f);
+                        }
+                    }
+                    None => {
+                        tracing::warn!("audio thread exited; continuing without audio");
+                        audio_alive = false;
+                    }
                 }
             }
             m = link.recv_control() => {
                 match m {
-                    Ok(ControlMessage::SessionToken(t)) => token = Some(t),
-                    Ok(ControlMessage::RequestKeyframe) => { enc_tx.send(EncCmd::Keyframe).ok(); }
+                    Ok(ControlMessage::SessionToken(t)) => { token = Some(t); control_errors = 0; }
+                    Ok(ControlMessage::RequestKeyframe) => { enc_tx.send(EncCmd::Keyframe).ok(); control_errors = 0; }
                     Ok(ControlMessage::Stats(s)) => {
+                        control_errors = 0;
                         let total = s.fragments_lost + s.fragments_received;
                         let loss = if total == 0 { 0.0 } else { s.fragments_lost as f32 * 100.0 / total as f32 };
                         status.send_modify(|st| st.loss_pct = loss);
@@ -508,10 +523,19 @@ pub async fn cast(
                             status.send_modify(|st| { st.bitrate_bps = params.bitrate_bps; st.width = params.width; st.height = params.height; });
                         }
                     }
-                    Ok(ControlMessage::Error { code, message }) => tracing::warn!("receiver error {code}: {message}"),
+                    Ok(ControlMessage::Error { code, message }) => { control_errors = 0; tracing::warn!("receiver error {code}: {message}"); }
                     Ok(ControlMessage::Goodbye { reason }) => { tracing::info!("receiver said goodbye: {reason}"); break; }
-                    Ok(_) => {}
-                    Err(e) => tracing::debug!("control: {e:#}"),
+                    Ok(_) => { control_errors = 0; }
+                    Err(e) => {
+                        control_errors += 1;
+                        tracing::debug!("control: {e:#} ({control_errors}/20)");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if control_errors >= 20 {
+                            tracing::warn!("control stream unresponsive, treating link as lost");
+                            link.close("control stream failed");
+                            control_errors = 0;
+                        }
+                    }
                 }
             }
             ev = async {
@@ -541,7 +565,7 @@ pub async fn cast(
             _ = link.closed() => {
                 set_state("reconnecting");
                 tracing::warn!("connection lost, reconnecting");
-                match connect_with_retry(&ep, target.addr, &opts.sender_name, &mut token, Duration::from_secs(30)).await {
+                match reconnect_draining(&ep, target.addr, &opts.sender_name, &mut token, &mut video_rx, &mut audio_rx).await {
                     Ok(l) => {
                         link = l;
                         match link.recv_control().await? {
@@ -563,11 +587,54 @@ pub async fn cast(
             reason: "stopped".into(),
         })
         .await;
-    link.close("stopped");
+    // Closing the connection right after queuing the Goodbye can race the
+    // QUIC stream flush and cut it off before the receiver reads it (seen as
+    // "connection lost" on the receiver instead of "goodbye: stopped"). Give
+    // the receiver a moment to read it and close its end first; only force
+    // the close if it doesn't.
+    tokio::select! {
+        _ = link.closed() => {}
+        _ = tokio::time::sleep(Duration::from_millis(500)) => { link.close("stopped"); }
+    }
     enc_tx.send(EncCmd::Stop).ok();
     stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
     set_state("stopped");
     Ok(())
+}
+
+/// Reconnects like `connect_with_retry`, but keeps draining `video_rx` and
+/// `audio_rx` while doing so. Without this, the capture/audio threads block
+/// on `blocking_send` into full channels once reconnection takes longer than
+/// a few frames, stalling capture for the whole outage.
+async fn reconnect_draining(
+    ep: &Endpoint,
+    addr: std::net::SocketAddr,
+    name: &str,
+    token: &mut Option<[u8; 16]>,
+    video_rx: &mut mpsc::Receiver<VideoOut>,
+    audio_rx: &mut mpsc::Receiver<AudioOut>,
+) -> anyhow::Result<Link> {
+    let mut dropped = 0u64;
+    let mut connect_fut = std::pin::pin!(connect_with_retry(
+        ep,
+        addr,
+        name,
+        token,
+        Duration::from_secs(30)
+    ));
+    loop {
+        tokio::select! {
+            biased;
+            res = &mut connect_fut => {
+                if dropped > 0 {
+                    tracing::info!("discarded {dropped} capture/audio frames while reconnecting");
+                }
+                return res;
+            }
+            v = video_rx.recv() => { if v.is_some() { dropped += 1; } }
+            a = audio_rx.recv() => { if a.is_some() { dropped += 1; } }
+        }
+    }
 }
 
 async fn connect_with_retry(
@@ -582,13 +649,24 @@ async fn connect_with_retry(
     loop {
         match ep.connect(addr).await {
             Ok(link) => {
-                link.send_control(&ControlMessage::Hello {
+                let hello = ControlMessage::Hello {
                     version: PROTOCOL_VERSION,
                     name: name.to_string(),
                     resume_token: *token,
-                })
-                .await?;
-                return Ok(link);
+                };
+                match link.send_control(&hello).await {
+                    Ok(()) => return Ok(link),
+                    Err(e) if Instant::now() + backoff < deadline => {
+                        tracing::debug!("hello send failed ({e:#}), retry in {backoff:?}");
+                        link.close("hello failed");
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_secs(5));
+                    }
+                    Err(e) => {
+                        link.close("hello failed");
+                        return Err(e).context("could not reach receiver");
+                    }
+                }
             }
             Err(e) if Instant::now() + backoff < deadline => {
                 tracing::debug!("connect failed ({e:#}), retry in {backoff:?}");

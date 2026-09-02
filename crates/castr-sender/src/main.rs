@@ -27,6 +27,9 @@ enum Cmd {
         fps: u32,
         #[arg(long)]
         max_bitrate: Option<u32>,
+        /// Stop automatically after this many seconds (mainly for testing)
+        #[arg(long)]
+        duration: Option<u64>,
     },
 }
 
@@ -90,13 +93,24 @@ fn main() -> anyhow::Result<()> {
             mode,
             fps,
             max_bitrate,
+            duration,
         }) => rt.block_on(async {
             let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel(4);
             let (status_tx, mut status_rx) = tokio::sync::watch::channel(CastStatus::default());
-            tokio::spawn(async move {
-                let _ = tokio::signal::ctrl_c().await;
-                let _ = cmd_tx.send(CastCommand::Stop).await;
-            });
+            {
+                let cmd_tx = cmd_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    let _ = cmd_tx.send(CastCommand::Stop).await;
+                });
+            }
+            if let Some(secs) = duration {
+                let cmd_tx = cmd_tx.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(secs)).await;
+                    let _ = cmd_tx.send(CastCommand::Stop).await;
+                });
+            }
             tokio::spawn(async move {
                 while status_rx.changed().await.is_ok() {
                     let s = status_rx.borrow().clone();
