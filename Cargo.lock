@@ -104,6 +104,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "castr-codec-win"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "castr-media",
+ "tracing",
+ "windows",
+]
+
+[[package]]
 name = "castr-media"
 version = "0.1.0"
 dependencies = [
