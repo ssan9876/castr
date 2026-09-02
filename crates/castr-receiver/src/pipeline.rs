@@ -427,6 +427,8 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
     let mut video_reasm = Reassembler::new(500_000);
     let mut audio_reasm = Reassembler::new(500_000);
     let mut nack_tx = link.open_nack_stream().await?;
+    // Last time a NACK went out for each frame number, for rate limiting.
+    let mut last_nack: std::collections::HashMap<u32, Instant> = std::collections::HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     let mut stats_tick = tokio::time::interval(Duration::from_millis(100));
     let mut stall_check = tokio::time::interval(Duration::from_millis(250));
@@ -497,7 +499,25 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
                 // Audio frames are never fragmented, so its reassembler is only
                 // ticked to expire partials; its NACKs are meaningless.
                 let _ = audio_reasm.tick(now_us(cfg.start));
-                for n in video_reasm.tick(now_us(cfg.start)) { nack_tx.send(&n).await?; }
+                let nacks = video_reasm.tick(now_us(cfg.start));
+                // Re-NACKing the same frame every 20 ms floods the sender with
+                // requests for retransmits still in flight. Wait at least one
+                // RTT (floor 20 ms) before asking for the same frame again.
+                let now = Instant::now();
+                let min_gap = link.rtt().max(Duration::from_millis(20));
+                let mut still_pending = std::collections::HashSet::new();
+                for n in &nacks {
+                    still_pending.insert(n.frame_number);
+                    let due = last_nack.get(&n.frame_number).is_none_or(|t| now.duration_since(*t) >= min_gap);
+                    if due {
+                        last_nack.insert(n.frame_number, now);
+                        nack_tx.send(n).await?;
+                    }
+                }
+                // Frames that no longer appear have completed or expired.
+                last_nack.retain(|f, t| {
+                    still_pending.contains(f) && now.duration_since(*t) < Duration::from_secs(1)
+                });
             }
             _ = stats_tick.tick() => {
                 let dropped = cfg.jitter.lock().unwrap().dropped();
