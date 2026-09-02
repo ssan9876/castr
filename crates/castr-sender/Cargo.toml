@@ -18,6 +18,7 @@ castr-net = { path = "../castr-net" }
 castr-media = { path = "../castr-media" }
 
 [target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
 castr-capture-win = { path = "../castr-capture-win" }
 castr-codec-win = { path = "../castr-codec-win" }
 

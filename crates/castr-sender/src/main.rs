@@ -1,4 +1,3 @@
-#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 mod cast;
 mod gui;
 
@@ -65,7 +64,17 @@ fn main() -> anyhow::Result<()> {
     let config_dir = castr_net::config_dir().join("sender");
     let rt = tokio::runtime::Runtime::new()?;
     match cli.cmd {
-        None => gui::run_gui(config_dir, sender_name()),
+        None => {
+            // The GUI path is what a double-clicked exe hits. The binary is a
+            // console subsystem exe (so `list`/`pair`/`cast` keep a working
+            // stdin/stdout when run from a shell); detach the console that
+            // Explorer allocated for us so it does not sit behind the window.
+            #[cfg(windows)]
+            unsafe {
+                let _ = windows::Win32::System::Console::FreeConsole();
+            }
+            gui::run_gui(config_dir, sender_name())
+        }
         Some(Cmd::List) => rt.block_on(async {
             for r in discover(Duration::from_secs(2)).await? {
                 println!("{:<24} {}  {}", r.name, r.addr, hex::encode(r.fingerprint));
