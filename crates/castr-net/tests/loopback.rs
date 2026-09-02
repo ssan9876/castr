@@ -95,3 +95,39 @@ async fn send_filter_drops_datagrams() {
         Bytes::from_static(b"keep")
     );
 }
+
+async fn connected_any() -> (Link, Link, Identity, Identity) {
+    let recv_id = Identity::generate().unwrap();
+    let send_id = Identity::generate().unwrap();
+    let server = Endpoint::server(loopback(), &recv_id, accept_any()).unwrap();
+    let client = Endpoint::client(loopback(), &send_id, accept_any()).unwrap();
+    let addr = server.local_addr().unwrap();
+    let (r, s) = tokio::join!(server.accept(), client.connect(addr));
+    std::mem::forget(server);
+    std::mem::forget(client);
+    (r.unwrap(), s.unwrap(), recv_id, send_id)
+}
+
+#[tokio::test]
+async fn pairing_succeeds_with_matching_pin() {
+    let (r, s, recv_id, send_id) = connected_any().await;
+    let pin = generate_pin();
+    assert_eq!(pin.len(), 6);
+    let (a, b) = tokio::join!(
+        pair_as_receiver(&r, recv_id.fingerprint, &pin),
+        pair_as_sender(&s, send_id.fingerprint, &pin),
+    );
+    a.unwrap();
+    b.unwrap();
+}
+
+#[tokio::test]
+async fn pairing_fails_with_wrong_pin() {
+    let (r, s, recv_id, send_id) = connected_any().await;
+    let (a, b) = tokio::join!(
+        pair_as_receiver(&r, recv_id.fingerprint, "111111"),
+        pair_as_sender(&s, send_id.fingerprint, "222222"),
+    );
+    assert!(a.is_err());
+    assert!(b.is_err());
+}

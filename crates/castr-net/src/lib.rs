@@ -1,7 +1,9 @@
 //! See docs/superpowers/specs/2026-09-01-castr-core-design.md
 pub mod identity;
+pub mod pairing;
 pub mod tls;
 pub mod transport;
 pub use identity::*;
+pub use pairing::*;
 pub use tls::*;
 pub use transport::*;
