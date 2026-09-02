@@ -1,0 +1,16 @@
+[package]
+name = "castr-codec-v4l2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+castr-media = { path = "../castr-media" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+castr-media = { path = "../castr-media" }

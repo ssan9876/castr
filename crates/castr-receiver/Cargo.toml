@@ -20,3 +20,6 @@ castr-media = { path = "../castr-media" }
 
 [target.'cfg(windows)'.dependencies]
 castr-codec-win = { path = "../castr-codec-win" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+castr-codec-v4l2 = { path = "../castr-codec-v4l2" }

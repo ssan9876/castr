@@ -730,6 +730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "castr-codec-v4l2"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "castr-media",
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "castr-codec-win"
 version = "0.1.0"
 dependencies = [
@@ -794,6 +804,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "castr-codec-v4l2",
  "castr-codec-win",
  "castr-media",
  "castr-net",
