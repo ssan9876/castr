@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # scripts/pi/deploy.sh <user@pi>
 # Cross-build the receiver, push it to the Pi, install it and restart the
-# service. First run on a fresh Pi copies setup.sh + the unit and runs setup.
+# service. First run on a fresh Pi also runs setup.sh (config.txt, module
+# load, user/group, packages). Every run - first or not - pushes and installs
+# the current unit file and wait-devices.sh, so unit changes always reach an
+# already-provisioned Pi.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 PI="${1:?usage: deploy.sh user@host}"
@@ -12,12 +15,30 @@ if ! ssh "$PI" 'test -f /etc/systemd/system/castr-receiver.service'; then
   echo "== first deploy: running setup.sh on $PI"
   push scripts/pi/setup.sh /tmp/castr-setup.sh
   push scripts/pi/castr-receiver.service /tmp/castr-receiver.service
-  ssh "$PI" 'mkdir -p /tmp/castr-setup && mv /tmp/castr-setup.sh /tmp/castr-setup/setup.sh && mv /tmp/castr-receiver.service /tmp/castr-setup/ && mv /tmp/castr-receiver /tmp/castr-setup/castr-receiver && chmod +x /tmp/castr-setup/setup.sh && sudo /tmp/castr-setup/setup.sh'
+  push scripts/pi/wait-devices.sh /tmp/castr-wait-devices.sh
+  ssh "$PI" 'mkdir -p /tmp/castr-setup && mv /tmp/castr-setup.sh /tmp/castr-setup/setup.sh && mv /tmp/castr-receiver.service /tmp/castr-setup/ && mv /tmp/castr-wait-devices.sh /tmp/castr-setup/wait-devices.sh && mv /tmp/castr-receiver /tmp/castr-setup/castr-receiver && chmod +x /tmp/castr-setup/setup.sh && sudo /tmp/castr-setup/setup.sh'
   exit 0
 fi
+# Not just the binary: push the unit and wait script too and reinstall them,
+# so a unit-only change (this branch added a device wait and an After=) still
+# reaches a Pi that was provisioned before that change. Idempotent - installs
+# are just `install -m`, and daemon-reload before restart picks up the new
+# unit content.
+push scripts/pi/castr-receiver.service /tmp/castr-receiver.service
+push scripts/pi/wait-devices.sh /tmp/castr-wait-devices.sh
 # sudo, not plain systemctl/journalctl: these Pis have no dbus daemon, and
 # without it an unprivileged user can't talk to systemd's system bus at all
 # (root bypasses dbus via /run/systemd/private).
-ssh "$PI" 'sudo install -m 0755 /tmp/castr-receiver /usr/local/bin/castr-receiver && rm -f /tmp/castr-receiver && sudo systemctl restart castr-receiver && sleep 5 && sudo systemctl is-active castr-receiver' \
-  || { echo "service not active after restart:"; ssh "$PI" 'sudo journalctl -u castr-receiver -n 20 --no-pager'; exit 1; }
+ssh "$PI" '
+  set -e
+  sudo install -m 0755 /tmp/castr-receiver /usr/local/bin/castr-receiver
+  sudo install -d -m 0755 /usr/local/lib/castr
+  sudo install -m 0755 /tmp/castr-wait-devices.sh /usr/local/lib/castr/wait-devices.sh
+  sudo install -m 0644 /tmp/castr-receiver.service /etc/systemd/system/castr-receiver.service
+  rm -f /tmp/castr-receiver /tmp/castr-receiver.service /tmp/castr-wait-devices.sh
+  sudo systemctl daemon-reload
+  sudo systemctl restart castr-receiver
+  sleep 5
+  sudo systemctl is-active castr-receiver
+' || { echo "service not active after restart:"; ssh "$PI" 'sudo journalctl -u castr-receiver -n 20 --no-pager'; exit 1; }
 echo "deployed to $PI"

@@ -177,11 +177,14 @@ fn decodes_1080p_in_real_time() {
             worst = worst.max(call);
         }
     }
-    let total = start.elapsed();
     // Pictures still inside the decoder count too: fed this much faster than
     // real time the driver batches, so the tail comes out after the feed.
+    // Measure `total` only after draining it, so the reported time covers
+    // every frame the assertions below count, not just the ones the feed
+    // loop produced synchronously.
     let tail = tail(&mut dec, aus.len() - n).len();
     n += tail;
+    let total = start.elapsed();
     eprintln!(
         "1080p: {n} frames ({tail} drained) in {total:?}, worst steady call {worst:?}, capture bring-up {bring_up:?}"
     );

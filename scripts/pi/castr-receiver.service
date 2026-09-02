@@ -1,6 +1,6 @@
 [Unit]
 Description=castr screen receiver
-After=network-online.target sound.target
+After=network-online.target sound.target systemd-modules-load.service
 Wants=network-online.target
 
 [Service]
@@ -9,9 +9,10 @@ Group=castr
 SupplementaryGroups=video render input audio
 Environment=SDL_VIDEODRIVER=kmsdrm
 Environment=XDG_CONFIG_HOME=/var/lib/castr/config
-# Wait for udev to create the DRM device on early boot. No `$` in this line:
-# systemd substitutes $WORD tokens before the shell sees them.
-ExecStartPre=/bin/sh -c 'until [ -e /dev/dri/card0 ]; do sleep 0.2; done'
+# Wait (bounded) for the DRM device and the V4L2 codec device on early boot.
+# The loops live in a separate script because unit files must not contain a
+# literal `$` - systemd substitutes $WORD tokens before the shell sees them.
+ExecStartPre=/usr/local/lib/castr/wait-devices.sh
 TimeoutStartSec=30
 ExecStart=/usr/local/bin/castr-receiver --fullscreen
 Restart=always

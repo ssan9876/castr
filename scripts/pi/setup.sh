@@ -10,6 +10,16 @@ REBOOT=0
 CFG=/boot/firmware/config.txt
 [ -f "$CFG" ] || CFG=/boot/config.txt
 echo "== config.txt ($CFG)"
+# config.txt is sectioned by [filter] headers (e.g. [pi4], [cm5], [all]); a
+# setting appended after a model-specific header only applies to that model.
+# If our additions would land after a non-[all] header, open a fresh [all]
+# section first so they apply everywhere, as intended.
+last_header=$(grep -o '^\[[^]]*\]' "$CFG" | tail -1)
+if [ -n "$last_header" ] && [ "$last_header" != "[all]" ] \
+  && { ! grep -q '^dtoverlay=vc4-kms-v3d$' "$CFG" || ! grep -q '^gpu_mem=128$' "$CFG"; }; then
+  echo '[all]' >> "$CFG"
+  echo "   opened [all] section (last header was $last_header)"
+fi
 if ! grep -q '^dtoverlay=vc4-kms-v3d$' "$CFG"; then
   sed -i 's/^#\?dtoverlay=vc4-kms-v3d.*$/dtoverlay=vc4-kms-v3d/' "$CFG"
   grep -q '^dtoverlay=vc4-kms-v3d$' "$CFG" || echo 'dtoverlay=vc4-kms-v3d' >> "$CFG"
@@ -61,6 +71,8 @@ else
 fi
 
 echo "== service"
+install -d -m 0755 /usr/local/lib/castr
+install -m 0755 "$HERE/wait-devices.sh" /usr/local/lib/castr/wait-devices.sh
 install -m 0644 "$HERE/castr-receiver.service" /etc/systemd/system/castr-receiver.service
 systemctl daemon-reload
 systemctl enable castr-receiver >/dev/null 2>&1

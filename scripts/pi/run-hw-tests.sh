@@ -14,7 +14,14 @@ docker run --rm -v "$(pwd -W 2>/dev/null || pwd):/src:ro" -v "$(pwd -W 2>/dev/nu
       | grep -o "\"executable\":\"[^\"]*\"" | cut -d\" -f4 | sort -u > /out/tests/v4l2-list.txt
     rm -f /out/tests/v4l2-*bin
     i=0; for f in $(cat /out/tests/v4l2-list.txt); do cp "$f" "/out/tests/v4l2-$i.bin"; i=$((i+1)); done'
+status=0
 for f in dist/tests/v4l2-*.bin; do
   name=$(basename "$f")
-  cat "$f" | ssh "$PI" "cat > /tmp/$name && chmod +x /tmp/$name && /tmp/$name --ignored --test-threads=1 --nocapture 2>&1 | grep -vF '[OpenH264]' | tail -20; rm -f /tmp/$name"
+  cat "$f" | ssh "$PI" "cat > /tmp/$name && chmod +x /tmp/$name
+    set -o pipefail
+    /tmp/$name --ignored --test-threads=1 --nocapture 2>&1 | grep -vF '[OpenH264]' | tail -20
+    rc=\$?
+    rm -f /tmp/$name
+    exit \$rc" || status=1
 done
+exit $status
