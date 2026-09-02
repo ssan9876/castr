@@ -126,12 +126,21 @@ larger than the buffer is rejected with an error rather than truncated.
 3. `VIDIOC_SUBSCRIBE_EVENT` for `V4L2_EVENT_SOURCE_CHANGE` and `V4L2_EVENT_EOS`.
 4. `VIDIOC_REQBUFS` + `VIDIOC_QUERYBUF` + `mmap` for OUTPUT, `VIDIOC_STREAMON`
    OUTPUT.
-5. Feed access units. The decoder cannot produce or size CAPTURE buffers until
-   it has parsed an SPS, so the CAPTURE side is brought up on the first
-   `SOURCE_CHANGE` event: `VIDIOC_G_FMT` CAPTURE (driver reports coded size,
+5. Bring CAPTURE up provisionally, at whatever format `G_FMT` reports (32x32
+   on this driver): `S_FMT` `NV12`, `REQBUFS`, `QUERYBUF`, `mmap`, `EXPBUF`,
+   queue all, `STREAMON`. An M2M job only runs when *both* queues are
+   streaming with buffers queued, so without this the pipeline is idle during
+   the warm-up and the pictures decoded from the access units fed meanwhile
+   are lost. It does not make the first `SOURCE_CHANGE` any earlier (measured
+   on a Pi 3: about 70 ms after the first access unit either way). Pictures
+   dequeued from the provisional queue are recycled, never returned: they
+   carry the driver's default geometry, not the stream's.
+6. Feed access units. The decoder cannot size real CAPTURE buffers until it
+   has parsed an SPS, so the CAPTURE side is rebuilt on the first
+   `SOURCE_CHANGE` event, by the same path as any later one (4.4): `VIDIOC_G_FMT` CAPTURE (driver reports coded size,
    `bytesperline`, `sizeimage`), `VIDIOC_S_FMT` CAPTURE to `NV12`, `REQBUFS`,
    `QUERYBUF`, `mmap`, `EXPBUF`, queue all buffers, `STREAMON` CAPTURE.
-6. Apply `VIDIOC_G_SELECTION` (`V4L2_SEL_TGT_COMPOSE`) to learn the visible
+7. Apply `VIDIOC_G_SELECTION` (`V4L2_SEL_TGT_COMPOSE`) to learn the visible
    rectangle inside the coded size (e.g. 1920x802 visible inside 1920x816),
    and crop rows when copying out.
 
@@ -140,8 +149,12 @@ larger than the buffer is rejected with an error rather than truncated.
 `decode(data, ts)`:
 
 1. Reject data that does not start with an Annex B start code.
-2. If no OUTPUT buffer is free, `poll` for one (timeout 200 ms), dequeuing
-   completed OUTPUT buffers. Copy the access unit in, set `bytesused`,
+2. If no OUTPUT buffer is free, `poll` for one (timeout 20 ms per round),
+   dequeuing completed OUTPUT buffers. The driver does not release a finished
+   job's OUTPUT buffer until its CAPTURE buffer has been dequeued - while
+   waiting it reports `POLLIN` with no `POLLOUT` - so a ready picture is
+   collected here too, and the OUTPUT queue re-checked straight after; that is
+   what frees the slot. Copy the access unit in, set `bytesused`,
    `timestamp = ts` (as `timeval`, microseconds), `VIDIOC_QBUF`.
 3. Drain events (`VIDIOC_DQEVENT`, non-blocking). On `SOURCE_CHANGE` run the
    renegotiation in 4.4. On `EOS` mark the decoder as finished.
@@ -159,11 +172,26 @@ Timestamps round-trip through the driver, so the frame returned carries the
 timestamp of the access unit it decoded, not the one just fed. The pipeline
 already tolerates that (the Media Foundation decoder behaves the same way).
 
-The copy out of the CAPTURE mapping is the only per-frame CPU work: 3 MB at
-30 fps for 1080p, about 90 MB/s. It is done row by row with the visible width
-so the `RawFrame` stride equals the width, matching what the Windows decoder
-produces and what `Renderer::present` expects for NV12 (`tex.update(None,
-&data, w)`).
+The copy out of the CAPTURE mapping is the only per-frame CPU work, and it is
+the decoder's dominant cost. The mapping is uncached, so reading it runs at
+about 105 MB/s on one Pi 3 core: 2.31 MB (1920x802) takes 26.8 ms on one
+thread. It is done row by row with the visible width so the `RawFrame` stride
+equals the width, matching what the Windows decoder produces and what
+`Renderer::present` expects for NV12 (`tex.update(None, &data, w)`); one
+`memcpy` per plane measured the same, so the shape of the copy is not the
+cost. It does scale across cores (19.4 ms on two threads, 16.3 on three, 14.3
+on four), so the rows are split across up to three scoped threads - about
+15 ms at 1080p - leaving a core for the presenter. The threads are joined
+before the call returns (4.6).
+
+Only one picture is copied per `decode` call, on top of whatever step 2 has to
+collect to free an OUTPUT buffer. `poll_frame` (on the `VideoDecoder` trait)
+hands back a picture the decoder is still holding, with a zero poll timeout:
+it never waits, because callers drain it in a loop until it returns `None` and
+a blocking call there costs a whole poll step per frame for nothing.
+
+A picture the driver produced on the provisional CAPTURE queue (4.2 step 5) is
+recycled, not returned.
 
 ### 4.4 Resolution change
 
@@ -190,16 +218,28 @@ about.
 - Any ioctl failure other than `EAGAIN` on a non-blocking `DQBUF` is an
   `Err` from `decode`.
 - If 60 consecutive access units have been queued with no CAPTURE buffer
-  dequeued (2 s at 30 fps), `decode` returns `Err("decoder stalled")`. The
-  decode thread's rebuild rule in 3.1 handles repeats.
+  dequeued **and** 2 s have passed since the last picture, `decode` returns
+  `Err("decoder stalled")`. Both halves are needed: 60 access units are 2 s of
+  video only when the caller feeds in real time, and a receiver catching up
+  after a jitter-buffer burst legitimately pushes a second of video into the
+  hardware in milliseconds. The decode thread's rebuild rule in 3.1 handles
+  repeats.
+- A wait inside `decode` gives up after 2 s without progress. That budget is
+  wall clock, not a count of poll rounds: `poll` returns immediately whenever a
+  queue is readable, so rounds are no measure of time (measured on the Pi: 100
+  rounds in 72 ms).
+- `POLLERR`/`POLLHUP`/`POLLNVAL` on the device is fatal to the decoder
+  immediately; on an M2M device it never clears by itself.
 - `Drop` for `V4l2Decoder`: `STREAMOFF` both queues, unmap, close fds. Errors
   during drop are logged, not propagated.
 
 ### 4.6 Threading
 
 `V4l2Decoder` is used from the receiver's single decode thread only; it is
-`Send` and not `Sync`. No internal threads. `poll` timeouts keep the decode
-thread responsive to the jitter buffer.
+`Send` and not `Sync`. It spawns no background threads and holds no shared
+state; the only threads it creates are the scoped copy threads of 4.3, which
+are joined before `decode` or `poll_frame` returns. `poll` timeouts keep the
+decode thread responsive to the jitter buffer.
 
 ## 5. Receiver changes
 

@@ -1,5 +1,17 @@
 //! `V4l2Decoder`: H.264 in, NV12 out, over the bcm2835 V4L2 M2M decoder.
 //! See spec section 4 for the sequence this implements.
+//!
+//! # Why there is `unsafe` here
+//!
+//! Two blocks - `copy_planes` and the `set_len` in its caller - write a
+//! picture into a freshly allocated `Vec` through `spare_capacity_mut`. The
+//! safe alternative is to zero the buffer first (`resize`), and on a Pi 3
+//! that memset costs about 4.8 ms of a roughly 16 ms 1080p copy: a third of
+//! the per-frame budget spent writing zeros that are immediately overwritten.
+//! The soundness argument is confined to `copy_planes`, which asserts once
+//! per picture that every source row lies inside the mapping and that the
+//! destination is exactly `rows * w` bytes; its row loop then does no
+//! arithmetic those asserts do not already cover.
 
 use crate::annexb;
 use crate::ops::{Dequeue, FormatInfo, Ops, RealOps};
@@ -29,8 +41,9 @@ pub const STALL_POLL_MS: u64 = 2_000;
 /// not spent waiting past the moment the hardware became ready.
 const POLL_STEP_MS: i32 = 20;
 /// Poll rounds spent waiting for the end-of-sequence buffer when a resolution
-/// change arrives, before the CAPTURE queue is rebuilt anyway.
-const DRAIN_ROUNDS: u32 = 5;
+/// change arrives, before the CAPTURE queue is rebuilt anyway: a 1 s window,
+/// in `POLL_STEP_MS` rounds.
+const DRAIN_ROUNDS: u32 = 1_000 / POLL_STEP_MS as u32;
 /// Threads used to copy one picture out of the driver's uncached buffer.
 /// Measured on a Pi 3 at 1920x802 (2.31 MB per picture): 26.8 ms with one
 /// thread, 19.4 with two, 16.3 with three, 14.3 with four. Three takes most
@@ -450,22 +463,19 @@ impl<O: Ops> V4l2Decoder<O> {
                 let uv_base = stride * coded_h;
                 let total = w * h + w * (h / 2);
                 let mut data: Vec<u8> = Vec::with_capacity(total);
-                {
-                    let spare = &mut data.spare_capacity_mut()[..total];
-                    let (y_dst, uv_dst) = spare.split_at_mut(w * h);
-                    let threads = copy_threads();
-                    copy_rows(y_dst, src, top * stride + left, stride, w, h, threads);
-                    copy_rows(
-                        uv_dst,
-                        src,
-                        uv_base + top / 2 * stride + left,
-                        stride,
-                        w,
-                        h / 2,
-                        threads,
-                    );
-                }
-                // SAFETY: `copy_rows` initialised every byte of both halves.
+                copy_planes(
+                    &mut data.spare_capacity_mut()[..total],
+                    src,
+                    stride,
+                    w,
+                    (top * stride + left, h),
+                    (uv_base + top / 2 * stride + left, h / 2),
+                    copy_threads(),
+                );
+                // SAFETY: `copy_planes` writes every one of the `total` bytes
+                // it is given - it asserts its destination is exactly
+                // `rows * w` bytes and copies every row - so all of the
+                // capacity claimed here is initialised.
                 unsafe { data.set_len(total) };
                 Ok(Some(RawFrame {
                     format: PixelFormat::Nv12,
@@ -575,24 +585,49 @@ fn copy_threads() -> usize {
     })
 }
 
-/// Copy `rows` rows of `w` visible bytes each out of the driver's mapping -
-/// row `r` starts at `base + r * stride` - into `dst`, packed at `w` bytes
-/// per row.
+/// Copy one picture out of the driver's mapping into `dst`, packed at `w`
+/// bytes per row. `y` and `uv` each give their plane's first visible byte
+/// offset and its number of rows; row `r` of a plane starts at
+/// `base + r * stride`.
 ///
 /// The mapping is uncached: reading it runs at about 105 MB/s on one Pi 3
 /// core, which is most of what a 1080p picture costs. One core cannot keep
 /// enough reads in flight to saturate the path, so the rows are split across
-/// `threads`.
-fn copy_rows(
+/// `threads` scoped threads, all joined before this returns. Both planes are
+/// covered by one scope, so a picture costs `threads - 1` spawns.
+fn copy_planes(
     dst: &mut [std::mem::MaybeUninit<u8>],
     src: &[u8],
-    base: usize,
     stride: usize,
     w: usize,
-    rows: usize,
+    y: (usize, usize),
+    uv: (usize, usize),
     threads: usize,
 ) {
-    debug_assert_eq!(dst.len(), rows * w);
+    let (y_base, y_rows) = y;
+    let (uv_base, uv_rows) = uv;
+    let rows = y_rows + uv_rows;
+    // The invariants the `unsafe` in the row loop rests on, established here
+    // once per picture instead of being argued per row: every source row lies
+    // inside the mapping, and the destination is exactly the packed output.
+    // The caller's geometry check is not enough on its own, because nothing
+    // in this signature ties `base`, `stride` and `rows` to `src`.
+    assert_eq!(dst.len(), rows * w, "destination is not rows * w bytes");
+    assert!(
+        y_rows == 0 || y_base + (y_rows - 1) * stride + w <= src.len(),
+        "luma rows run past the mapping"
+    );
+    assert!(
+        uv_rows == 0 || uv_base + (uv_rows - 1) * stride + w <= src.len(),
+        "chroma rows run past the mapping"
+    );
+    let row_src = |r: usize| {
+        if r < y_rows {
+            y_base + r * stride
+        } else {
+            uv_base + (r - y_rows) * stride
+        }
+    };
     let per = rows.div_ceil(threads.max(1));
     let mut rest = dst;
     let mut first = 0;
@@ -605,10 +640,13 @@ fn copy_rows(
             first += n;
             let mut run = move || {
                 for i in 0..n {
-                    let o = base + (start + i) * stride;
-                    // SAFETY: `mine` is this thread's own `n * w` bytes of
-                    // spare capacity, and `src[o..o + w]` is in bounds - the
-                    // caller checked the geometry against the mapping.
+                    let o = row_src(start + i);
+                    // SAFETY: `o + w <= src.len()` for every row, from the
+                    // per-plane asserts above (a row's offset grows with its
+                    // index, so the last row bounds them all). `mine` is this
+                    // thread's own `n * w` bytes of the destination, handed
+                    // out by `split_at_mut`, so no two threads write the same
+                    // byte and row `i` ends at `(i + 1) * w <= n * w`.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
                             src.as_ptr().add(o),
@@ -645,9 +683,11 @@ impl<O: Ops + Send> VideoDecoder for V4l2Decoder<O> {
             bail!("decoder reported end of stream");
         }
         // Copying a picture out of the driver's (uncached) buffer is the
-        // expensive part of a decode call - about 20 ms for 1080p on a Pi 3 -
-        // so at most one is copied per call. That still recycles one CAPTURE
-        // buffer per access unit, which is exactly the steady-state rate.
+        // expensive part of a decode call - about 15 ms for 1080p on a Pi 3 -
+        // so this call copies one, on top of whatever `wait_for_slot` has to
+        // collect to free an OUTPUT buffer (the driver holds one until its
+        // picture is out). In the steady state that is one copy per access
+        // unit, which is the rate pictures arrive at.
         let mut budget = 1usize;
         self.wait_for_slot(&mut budget)?;
         let slot = self

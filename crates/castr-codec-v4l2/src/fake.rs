@@ -30,7 +30,8 @@ pub(crate) struct FakeOps {
     pub min_capture_buffers: i32,
     /// Model the bcm2835 behaviour the hardware showed: the OUTPUT buffer of
     /// a finished job is only released once its CAPTURE buffer is dequeued.
-    /// When set, a successful CAPTURE dequeue queues this OUTPUT index.
+    /// When set, the next successful CAPTURE dequeue queues this OUTPUT index
+    /// and clears the field: it fires once, not on every dequeue.
     pub release_output_on_capture: Option<u32>,
     /// Virtual clock; only `advance` moves it.
     clock: std::time::Instant,
