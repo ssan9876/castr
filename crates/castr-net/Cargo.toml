@@ -24,3 +24,6 @@ toml.workspace = true
 dirs.workspace = true
 mdns-sd.workspace = true
 castr-proto = { path = "../castr-proto" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
