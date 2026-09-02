@@ -63,6 +63,16 @@ const FONT: &[(char, [u8; GLYPH_ROWS])] = &[
     ('Z', [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F]),
 ];
 
+/// Whether an overlay showing `text` should stay up despite a video frame
+/// having just been presented. A PIN prompt must survive (pairing is still
+/// waiting on the viewer to read and type it; no video is really flowing
+/// yet); every other overlay ("Waiting for sender", "Reconnecting") is
+/// stale the instant a real picture is drawn. Free function (rather than a
+/// `Renderer` method) so it is testable without an SDL canvas.
+fn overlay_survives_frame(text: &str) -> bool {
+    text.starts_with("PIN ")
+}
+
 /// Rows for `c`, or the blank glyph for anything the font does not cover.
 fn glyph(c: char) -> &'static [u8; GLYPH_ROWS] {
     let c = c.to_ascii_uppercase();
@@ -232,6 +242,20 @@ impl Renderer {
 
     pub fn present(&mut self, f: &RawFrame) -> anyhow::Result<()> {
         self.ensure_texture(f)?;
+        // Belt-and-braces against a stale "Waiting for sender"/"Reconnecting"
+        // overlay surviving into a live cast: whatever the network side's
+        // message ordering did or didn't guarantee, an actual decoded
+        // picture being drawn is unambiguous proof video is flowing, so any
+        // overlay that isn't a PIN prompt (pairing still needs the viewer to
+        // read it; no video is really flowing during that wait) is stale the
+        // moment a frame is presented.
+        if self
+            .overlay
+            .as_deref()
+            .is_some_and(|t| !overlay_survives_frame(t))
+        {
+            self.set_overlay(None);
+        }
         let (w, h) = (f.width as usize, f.height as usize);
         let tex = self.texture.as_mut().unwrap();
         match f.format {
@@ -330,6 +354,14 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_pin_prompt_survives_a_presented_frame() {
+        assert!(overlay_survives_frame("PIN 123456"));
+        assert!(!overlay_survives_frame("Waiting for sender"));
+        assert!(!overlay_survives_frame("Reconnecting"));
+        assert!(!overlay_survives_frame(""));
+    }
 
     #[test]
     fn every_glyph_is_seven_rows_of_five_bits() {

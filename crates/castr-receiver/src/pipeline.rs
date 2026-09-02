@@ -9,7 +9,7 @@ use castr_proto::*;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
@@ -129,6 +129,72 @@ impl PerfStats {
     }
 }
 
+/// The SDL loop's one-frame lookahead slot. In game mode the decoder can
+/// produce pictures much faster than the audio clock allows them to be
+/// shown (measured on the Pi: 151 decoded per 5 s, 9 presented), and the
+/// naive "overwrite `pending` with whatever just arrived" policy discards
+/// every frame that arrives before its predecessor became due - which is
+/// almost all of them, since a newer frame's mere existence says nothing
+/// about whether the older one was ever shown. A frame that already has a
+/// successor waiting is by definition the best frame available right now,
+/// so displacing it should present it immediately rather than drop it; the
+/// audio clock then only has to gate the newest frame. Quality mode, whose
+/// pictures arrive close to playout rate, is unaffected: displacement there
+/// is rare, so this changes essentially nothing for it.
+#[derive(Default)]
+struct PendingFrame(Option<RawFrame>);
+
+impl PendingFrame {
+    /// Puts `f` in the slot, returning whatever was already there so the
+    /// caller can present it right away instead of losing it.
+    fn offer(&mut self, f: RawFrame) -> Option<RawFrame> {
+        self.0.replace(f)
+    }
+
+    /// Takes the held frame if `clock` says it is due, leaving it in place
+    /// otherwise.
+    fn take_if_due(&mut self, clock: &mut AvClock, now_us: u64) -> Option<RawFrame> {
+        if self
+            .0
+            .as_ref()
+            .is_some_and(|f| clock.video_due(f.timestamp_us, now_us))
+        {
+            self.0.take()
+        } else {
+            None
+        }
+    }
+}
+
+/// Presents `f` and does the bookkeeping the SDL loop needs whichever path
+/// produced it (a frame due per the audio clock, or one displaced from
+/// `pending` by a newer arrival): times the call into `perf`, and updates
+/// `last_video`/`last_present`, restarting the perf-report window on the
+/// idle -> streaming transition exactly as the other call site does. Kept as
+/// one function so the two present sites cannot drift apart.
+fn present_and_record(
+    renderer: &mut Renderer,
+    perf: &Mutex<PerfStats>,
+    f: &RawFrame,
+    last_video: &mut Instant,
+    last_present: &mut Instant,
+    streaming_seen: &mut bool,
+    last_perf: &mut Instant,
+) -> anyhow::Result<()> {
+    let t = Instant::now();
+    renderer.present(f)?;
+    perf.lock().unwrap().present(t.elapsed());
+    *last_video = Instant::now();
+    *last_present = Instant::now();
+    if !*streaming_seen {
+        // Resuming after idle: start the report window fresh so the first
+        // report doesn't fire immediately over a mostly-idle partial window.
+        *streaming_seen = true;
+        *last_perf = Instant::now();
+    }
+    Ok(())
+}
+
 pub struct ReceiverConfig {
     pub name: String,
     pub fullscreen: bool,
@@ -223,6 +289,14 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let perf = Arc::new(Mutex::new(PerfStats::default()));
     let dropped_since_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Microseconds-since-`start` of the last `decode` call, so the SDL loop's
+    // idle detection (below) can key off decoding as well as presenting: a
+    // receiver whose decoder is running but whose presenter is stuck (e.g.
+    // starved by a broken audio clock) should not go quiet in the log right
+    // when the numbers would matter most. A plain atomic, not a `Mutex`,
+    // because the decode thread's hot path already pays for one `decode`
+    // call per frame and this must not add a lock to it.
+    let last_decode_us = Arc::new(AtomicU64::new(0));
 
     // Decode thread: jitter buffer -> decoder -> UI.
     {
@@ -230,6 +304,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         let ui = ui_tx.clone();
         let stats = stats.clone();
         let perf = perf.clone();
+        let last_decode_us = last_decode_us.clone();
         let choice = cfg.decoder;
         std::thread::Builder::new()
             .name("decode".into())
@@ -268,6 +343,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                     tracing::debug!("decode frame {} key={}", f.frame_number, f.keyframe);
                     let t = Instant::now();
                     let result = decoder.decode(&f.data, f.timestamp_us);
+                    last_decode_us.store(now_us(start), Ordering::Relaxed);
                     perf.lock()
                         .unwrap()
                         .decode(t.elapsed(), matches!(result, Ok(Some(_))));
@@ -360,7 +436,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     });
 
     // SDL main loop.
-    let mut pending: Option<RawFrame> = None;
+    let mut pending = PendingFrame::default();
     let mut last_video = Instant::now();
     // Newest video timestamp seen (presented or pending). Audio that lags far
     // behind it must not drive the master clock, or a sender with a broken
@@ -385,7 +461,22 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                         Some(v) => v.max(f.timestamp_us),
                         None => f.timestamp_us,
                     });
-                    pending = Some(f);
+                    // A frame that displaces a not-yet-due `pending` already
+                    // has a successor, so it is the best frame to show now -
+                    // present it immediately rather than let it be silently
+                    // dropped (spec fix: game mode was presenting 9 of 151
+                    // pictures per 5 s window this way).
+                    if let Some(displaced) = pending.offer(f) {
+                        present_and_record(
+                            &mut renderer,
+                            &perf,
+                            &displaced,
+                            &mut last_video,
+                            &mut last_present,
+                            &mut streaming_seen,
+                            &mut last_perf,
+                        )?;
+                    }
                 }
                 UiEvent::AudioPacket { ts_us, data } if data.is_empty() => {
                     // Lost packet: let Opus conceal it so the clock keeps advancing smoothly.
@@ -421,30 +512,29 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                 UiEvent::Quit => return Err(anyhow!("fatal error, see log")),
             }
         }
-        if let Some(f) = pending.take() {
-            if clock.video_due(f.timestamp_us, now_us(start)) {
-                let t = Instant::now();
-                renderer.present(&f)?;
-                perf.lock().unwrap().present(t.elapsed());
-                last_video = Instant::now();
-                last_present = Instant::now();
-                if !streaming_seen {
-                    // Resuming after idle: start the report window fresh so
-                    // the first report doesn't fire immediately over a
-                    // mostly-idle partial window.
-                    streaming_seen = true;
-                    last_perf = Instant::now();
-                }
-            } else {
-                pending = Some(f);
-            }
+        if let Some(f) = pending.take_if_due(&mut clock, now_us(start)) {
+            present_and_record(
+                &mut renderer,
+                &perf,
+                &f,
+                &mut last_video,
+                &mut last_present,
+                &mut streaming_seen,
+                &mut last_perf,
+            )?;
         }
         if streaming_seen && last_perf.elapsed() >= Duration::from_secs(5) {
             last_perf = Instant::now();
             let depth = jitter.lock().unwrap().depth() as u32;
             let dropped = dropped_since_report.swap(0, std::sync::atomic::Ordering::Relaxed);
             tracing::info!("{}", perf.lock().unwrap().take_report(depth, dropped));
-            if last_present.elapsed() > Duration::from_secs(5) {
+            // Idle means neither presenting nor decoding recently: a
+            // receiver that decodes but cannot present (e.g. starved by a
+            // stuck audio clock) must not go quiet in the log exactly when
+            // that gap matters most.
+            let decode_idle = now_us(start).saturating_sub(last_decode_us.load(Ordering::Relaxed))
+                > Duration::from_secs(5).as_micros() as u64;
+            if last_present.elapsed() > Duration::from_secs(5) && decode_idle {
                 streaming_seen = false; // idle: stop reporting until video flows again
             }
         }
@@ -646,7 +736,15 @@ async fn handle_connection(
             other => tracing::debug!("ignoring {other:?} before streaming"),
         }
     }
-    cfg.ui.send(UiEvent::Overlay(None)).await.ok();
+    // The overlay is cleared once real video parameters are known (a
+    // resumed session's cached params, or a fresh `StartStream`, both
+    // handled inside `stream` below) - not merely because the control
+    // handshake reached `Streaming`, which a bare capability probe (Hello,
+    // then an immediate Goodbye with no video ever sent, as the GUI's
+    // "already paired?" check does) also does. Clearing on Hello alone let a
+    // probe's own teardown re-arm the "Waiting for sender" overlay after
+    // this connection's clear had already been sent, racing the real cast on
+    // the very same channel.
     stream(cfg, link, session).await
 }
 
@@ -670,8 +768,13 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
     let mut fragments_received = 0u32;
     let mut last_audio_ts: Option<u64> = None;
     if let Some(p) = session.params() {
+        // A resumed session already knows its stream parameters (a fresh
+        // `StartStream` normally follows anyway, but there is no need to
+        // wait for it to clear the overlay: the resume itself is already
+        // proof real video was flowing on this session).
         cfg.jitter.lock().unwrap().set_mode(p.mode);
         cfg.ui.send(UiEvent::Mode(p.mode)).await.ok();
+        cfg.ui.send(UiEvent::Overlay(None)).await.ok();
     }
     loop {
         tokio::select! {
@@ -715,6 +818,12 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
                             *j = JitterBuffer::new(p.mode, 1_000_000 / p.fps.max(1) as u64);
                         }
                         cfg.ui.send(UiEvent::Mode(p.mode)).await.ok();
+                        // `StartStream` is the strongest evidence real video
+                        // is about to flow (a bare Hello also reaches
+                        // `Streaming` for a capability probe that never
+                        // sends this), so clearing the overlay here, rather
+                        // than on Hello, cannot race a probe's own teardown.
+                        cfg.ui.send(UiEvent::Overlay(None)).await.ok();
                     }
                     ControlMessage::SetMode(mode) => {
                         cfg.jitter.lock().unwrap().set_mode(*mode);
@@ -793,6 +902,39 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn frame(ts: u64) -> RawFrame {
+        RawFrame {
+            format: castr_media::PixelFormat::Nv12,
+            width: 2,
+            height: 2,
+            stride: 2,
+            data: vec![0u8; 6],
+            timestamp_us: ts,
+        }
+    }
+
+    #[test]
+    fn offering_into_an_empty_slot_returns_none() {
+        let mut p = PendingFrame::default();
+        assert!(p.offer(frame(1)).is_none());
+    }
+
+    #[test]
+    fn offering_into_an_occupied_slot_returns_the_older_frame_and_keeps_the_newer() {
+        let mut p = PendingFrame::default();
+        assert!(p.offer(frame(1)).is_none());
+        let displaced = p
+            .offer(frame(2))
+            .expect("the first frame is displaced, not dropped");
+        assert_eq!(displaced.timestamp_us, 1);
+        // The newer frame is retained in the slot.
+        let mut clock = AvClock::new();
+        let kept = p
+            .take_if_due(&mut clock, 0)
+            .expect("the newer frame is still pending");
+        assert_eq!(kept.timestamp_us, 2);
+    }
 
     #[test]
     fn only_streaming_marks_disconnected() {
