@@ -1,0 +1,25 @@
+[package]
+name = "castr-sender"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+clap.workspace = true
+hex.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+eframe.workspace = true
+castr-proto = { path = "../castr-proto" }
+castr-net = { path = "../castr-net" }
+castr-media = { path = "../castr-media" }
+
+[target.'cfg(windows)'.dependencies]
+castr-capture-win = { path = "../castr-capture-win" }
+castr-codec-win = { path = "../castr-codec-win" }
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
