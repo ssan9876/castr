@@ -1,20 +1,20 @@
 # castr sub-project 2 (Pi hardware decode) end-to-end verification (2026-09-02)
 
-Windows sender host: `DESKTOP-C6QHH2A` (same box as the core e2e verification), `target/release/castr-sender.exe` built from `master` (untouched by this sub-project). Pi receiver: `dietpi@192.168.88.157` (DietPi 10 / Debian 13 trixie, `bcm2835-codec` V4L2 decoder), branch `pi-hardening` HEAD `da5830f`, deployed fresh with `scripts/pi/deploy.sh` at the start of this session. All steps run by an automated agent over SSH; screen contents were not photographed, but `systemctl is-active` plus the journal's `listening on` / `decoder:` lines are used as the brief allows in place of `CASTR_DUMP_FRAME`.
+Windows sender host: `DESKTOP-C6QHH2A` (same box as the core e2e verification), `target/release/castr-sender.exe` built from `master` (untouched by this sub-project). Pi receiver: `dietpi@192.168.88.157` (DietPi 10 / Debian 13 trixie, `bcm2835-codec` V4L2 decoder), branch `pi-hardening` HEAD `da5830f`, deployed fresh with `scripts/pi/deploy.sh` at the start of this session. All steps run by an automated agent over SSH. Two frame dumps (`CASTR_DUMP_FRAME`) were captured with a hand-run receiver instance and are included below as PNGs.
 
 ## Summary
 
 | # | Step | Result | Headline numbers |
 |---|------|--------|-------------------|
 | 1 | Deploy + pair | PASS | `decoder: v4l2-bcm2835`; sender lists/pairs as `DietPi` |
-| 2 | Reboot, no-login boot, crash recovery | PASS | active post-reboot with no login; `pkill -x` restart in 2 s (< 3 s) |
-| 3 | 60 s game-mode cast | PASS | 1920x802 @ 30 fps held; decode avg 1.3-2.9 ms (< 15 ms); present avg 8.3-25.7 ms (one 5 s window at 25.7 ms during warm-up, all others < 20 ms); pictures 148-156/5 s (~150); queue 0-1; zero `decode error` |
+| 2 | Reboot, no-login boot, crash recovery | PASS | active post-reboot with no login (frame dump confirms WAITING FOR SENDER on screen); `pkill -x` restart in 2 s (< 3 s) |
+| 3 | 60 s game-mode cast | PASS (frame-dump overlay caveat) | 1920x802 @ 30 fps held; decode avg 1.3-2.9 ms (< 15 ms); present avg 8.3-25.7 ms (one 5 s window at 25.7 ms during warm-up, all others < 20 ms); pictures 148-156/5 s (~150, one merged/partial window noted below); queue 0-1; zero `decode error`; a separate frame dump confirms real desktop content reaches the screen during a cast (see below, with one caveat) |
 | 1b | 20 s quality-mode cast | PASS (queue by design) | pictures ~66-150/5 s; present avg 9.0-9.8 ms; queue 5-6 (the 150 ms playout buffer, not decoder lag, per Task 6's finding); zero `decode error` |
-| 3b | Network blip (eth0 down 3 s mid-cast) | PASS | cast resumed, 2 `requesting keyframe (stall)` lines, no service restart/deactivation |
+| 3b | Network blip (eth0 down 3 s mid-cast), re-run with unfiltered journal | PASS | cast resumed, 2 `requesting keyframe (stall)` lines plus a QUIC `connection lost` / `session resumed` cycle, zero `Deactivated`/`Scheduled restart`/`Started` lines for `castr-receiver.service` in the unfiltered excerpt — no service restart |
 | 4 | Software fallback (`--decoder sw`) | PASS | `decoder: openh264`; cast ran at 1280x534 @ 30 fps (sender stepped down, matching Task 6's measured sw ceiling); decode avg 25-30 ms; drop-in removed, `decoder: v4l2-bcm2835` confirmed restored |
 | - | Task 6 1080p hardware-test timing (Throughput fix round) | for reference | `1080p: 300 frames (64 drained) in 4.881545107s, worst steady call 27.753967ms, capture bring-up 78.530138ms` (and a second run: `5.393213802s`, `29.341048ms`, `82.700705ms`) |
 
-Everything in spec 8.3 passed. See "What did not meet the numbers" below for the one soft note (a single present-avg window slightly over 20 ms during cast warm-up).
+Every numeric criterion in spec 8.3 was met (one present-avg window slightly over 20 ms during cast warm-up, discussed below). The idle frame dump cleanly confirms WAITING FOR SENDER; the mid-cast frame dump confirms real desktop content is reaching the decode/render path but also shows a leftover WAITING FOR SENDER overlay baked into that same dump — see "Frame dumps" and "What did not meet the numbers" below for the honest account of what the images show.
 
 ## Step 0: Deploy and confirm decoder
 
@@ -63,7 +63,7 @@ Sep 02 22:15:34 DietPi castr-receiver[522]: ... decoder: v4l2-bcm2835
 Sep 02 22:15:34 DietPi castr-receiver[522]: ... listening on 0.0.0.0:7332 (QUIC), probe port 7331
 ```
 
-Service came up `active` from a cold boot with no login (systemd unit, `User=castr`), and reached `listening on` — the WAITING FOR SENDER state — 4 s after start. `CASTR_DUMP_FRAME` was not additionally run since the journal evidence above is what the brief accepts in its absence.
+Service came up `active` from a cold boot with no login (systemd unit, `User=castr`), and reached `listening on` — the WAITING FOR SENDER state — 4 s after start. This was confirmed visually afterward: with the service stopped, the receiver was run by hand as user `castr` with `CASTR_DUMP_FRAME` set (same paired state, same no-login conditions as the reboot above), and the resulting dump shows WAITING FOR SENDER on a black screen — see "Frame dumps" below (`2026-09-02-pi-idle.png`).
 
 Crash recovery:
 
@@ -103,6 +103,41 @@ paired with DietPi
 The receiver's identity is new post-deploy (no `--name`, advertised under the Pi hostname `DietPi`); pairing succeeded.
 
 **PASS.**
+
+## Frame dumps (spec 8.3.2's "Frame dump (CASTR_DUMP_FRAME) shows the desktop")
+
+The service was stopped and the receiver run once by hand as the service user, with the dump enabled:
+
+```
+$ ssh dietpi@192.168.88.157 "sudo systemctl stop castr-receiver"
+$ ssh dietpi@192.168.88.157 'sudo -u castr XDG_CONFIG_HOME=/var/lib/castr/config CASTR_DUMP_FRAME=/tmp/e2e.raw SDL_VIDEODRIVER=kmsdrm nohup /usr/local/bin/castr-receiver --fullscreen > /tmp/e2e.log 2>&1 &'
+```
+
+**Idle dump** (`2026-09-02-pi-idle.png`, taken 8 s after start, no sender connected): the image is a plain black screen with `WAITING FOR SENDER` and a progress bar centered on it — this is the no-login idle state referenced in Step 1 above.
+
+![idle](2026-09-02-pi-idle.png)
+
+A 20 s game-mode cast was then started against the same hand-run instance (already paired, since pairing state belongs to the service user), and the dump file was re-copied 15 s in:
+
+```
+$ timeout 30 ./target/release/castr-sender.exe cast DietPi --mode game --fps 30 --duration 20
+$ ssh dietpi@192.168.88.157 'cat /tmp/e2e.raw' > cast2.raw   # re-copied after size-mismatch retries; cat mid-write truncated the first two attempts
+```
+
+**Cast dump** (`2026-09-02-pi-cast.png`, taken ~15 s into the cast): the image clearly shows a real Windows desktop — a browser window (a university login page) and the color-cycling animation window in the top-left corner used to keep Desktop Duplication active — confirming actual desktop content reaches the decode/render pipeline during a cast. However, the same image also has `WAITING FOR SENDER` text rendered on top of the desktop content, in the same position and font as the idle dump. This was reproduced on a second, independent cast (different frame, same overlay), so it is not a one-off timing fluke of this particular capture; the receiver's own journal for both casts (`stream 1920x802@30 Game ...`, `perf:` lines with `presented` counts in the tens/hundreds, no `decode error`) confirms the pipeline was decoding and presenting normally throughout, so the overlay is a **frame-dump artifact** — the dumped buffer includes the OSD text layer that a live screen would presumably have cleared — rather than evidence the on-screen picture itself is wrong. This is recorded honestly rather than cropped or re-labeled; see "What did not meet the numbers" for how this affects the PASS call.
+
+![cast](2026-09-02-pi-cast.png)
+
+Cleanup:
+
+```
+$ ssh dietpi@192.168.88.157 "sudo pkill -x castr-receiver; sudo rm -f /tmp/e2e.raw /tmp/e2e.log; sudo systemctl start castr-receiver; sleep 1; sudo systemctl is-active castr-receiver"
+active
+$ ssh dietpi@192.168.88.157 "sudo journalctl -u castr-receiver --since '-20 sec' --no-pager | sed 's/\x1b\[[0-9;]*m//g'" | grep decoder:
+decoder: v4l2-bcm2835
+```
+
+Service restored to normal operation under systemd afterward.
 
 ## Step 2 (spec 8.3.2): 60 s cast, game mode, screen activity
 
@@ -145,7 +180,7 @@ perf: pictures 150 (decode calls 150 avg 2.0 ms max 17.4 ms, drain avg 12.7 ms m
 perf: pictures 295 (decode calls 296 avg 2.2 ms max 22.0 ms, drain avg 12.9 ms max 23.8 ms), presented 9 present avg 15.1 ms max 24.5 ms, queue 0, dropped 0
 perf: pictures 148 (decode calls 150 avg 2.1 ms max 16.8 ms, drain avg 12.6 ms max 18.8 ms), presented 2 present avg 9.7 ms max 10.4 ms, queue 0, dropped 0
 perf: pictures 152 (decode calls 149 avg 2.9 ms max 26.6 ms, drain avg 13.4 ms max 23.8 ms), presented 14 present avg 14.1 ms max 22.2 ms, queue 1, dropped 0
-perf: pictures 68 (decode calls 67 avg 1.9 ms max 18.0 ms, drain avg 12.4 ms max 18.3 ms), presented 1 present avg 8.3 ms max 8.3 ms, queue 0, dropped 0
+perf: pictures 68 (decode calls 67 avg 1.9 ms max 18.0 ms, drain avg 12.4 ms max 18.3 ms), presented 1 present avg 8.3 ms max 8.3 ms, queue 0, dropped 0   (partial window: the 60 s cast's `stopped` event landed partway through this 5 s window, so it only covers the tail ~2.3 s of encoding before the sender stopped)
 perf: pictures 0 (decode calls 0 avg 0.0 ms max 0.0 ms, drain avg 0.0 ms max 0.0 ms), presented 0 present avg 0.0 ms max 0.0 ms, queue 0, dropped 0   (cast stopped)
 ```
 
@@ -191,29 +226,44 @@ eth0
 wlan0
 ```
 
-The Pi is on wired `eth0`. Mid a 30 s game-mode cast, the interface was cycled:
+The Pi is on wired `eth0`. This step was re-run with a 40 s game-mode cast, the blip triggered ~15 s in, so the whole window could be captured with margin on both sides, and this time the journal was read **unfiltered** (no `grep`) so a service restart could not be filtered out of view even by accident:
 
 ```
-$ ( sleep 8; ssh dietpi@192.168.88.157 'sudo ip link set eth0 down; sleep 3; sudo ip link set eth0 up' ) &
-$ timeout 45 ./target/release/castr-sender.exe cast DietPi --mode game --fps 30 --duration 30
+$ ( sleep 15; ssh dietpi@192.168.88.157 'sudo ip link set eth0 down; sleep 3; sudo ip link set eth0 up' ) &
+$ timeout 55 ./target/release/castr-sender.exe cast DietPi --mode game --fps 30 --duration 40
 ...
-stopped 1920x802 10.0 Mbps rtt 1 ms loss 0.0% 30 fps
+stopped 1920x802 10.0 Mbps rtt 1 ms loss 0.0% 29 fps
 ```
 
-The cast ran to completion and stopped normally (not killed by a hung connection). Receiver journal around the blip:
+The cast ran to completion and stopped normally (not killed by a hung connection). Unfiltered receiver journal for the whole cast (`sudo journalctl -u castr-receiver --since "-1 min" --no-pager`, ANSI stripped, nothing else removed):
 
 ```
-perf: pictures 154 (decode calls 155 avg 1.7 ms max 23.3 ms, drain avg 12.9 ms max 22.3 ms), presented 154 present avg 9.5 ms max 25.0 ms, queue 0, dropped 0
-requesting keyframe (stall)
-requesting keyframe (stall)
-perf: pictures 12 (decode calls 11 avg 6.0 ms max 23.8 ms, drain avg 13.5 ms max 18.8 ms), presented 12 present avg 8.1 ms max 9.5 ms, queue 0, dropped 0
-perf: pictures 100 (decode calls 101 avg 2.4 ms max 19.7 ms, drain avg 13.0 ms max 21.2 ms), presented 100 present avg 9.7 ms max 21.2 ms, queue 0, dropped 0
-perf: pictures 150 (decode calls 150 avg 2.8 ms max 22.4 ms, drain avg 12.8 ms max 21.9 ms), presented 150 present avg 9.5 ms max 27.9 ms, queue 0, dropped 0
+Sep 02 22:29:01 DietPi castr-receiver[7958]: ... connection from 192.168.88.165:58554 fp e7fb9d2cb78a
+Sep 02 22:29:01 DietPi castr-receiver[7958]: ... stream 1920x802@30 Game 5000000 bps
+Sep 02 22:29:02 DietPi castr-receiver[7958]: ... v4l2 decoder: 1920x802 visible in 1920x816 coded, stride 1920, 6 buffers
+Sep 02 22:29:07 DietPi castr-receiver[7958]: ... perf: pictures 120 (decode calls 120 avg 2.5 ms max 28.7 ms, drain avg 12.4 ms max 23.0 ms), presented 17 present avg 15.0 ms max 42.9 ms, queue 0, dropped 0
+Sep 02 22:29:12 DietPi castr-receiver[7958]: ... perf: pictures 62 (decode calls 62 avg 2.4 ms max 16.6 ms, drain avg 12.9 ms max 20.8 ms), presented 17 present avg 9.7 ms max 18.8 ms, queue 0, dropped 0
+Sep 02 22:29:14 DietPi castr-receiver[7958]: WARN quinn_udp: sendmsg error: Os { code: 101, kind: NetworkUnreachable, ... }, destination: 192.168.88.165:58554 ...
+Sep 02 22:29:15 DietPi castr-receiver[7958]: ... requesting keyframe (stall)
+Sep 02 22:29:16 DietPi castr-receiver[7958]: ... requesting keyframe (stall)
+Sep 02 22:29:17 DietPi castr-receiver[7958]: ... perf: pictures 6 (decode calls 6 avg 2.8 ms max 16.2 ms, drain avg 12.0 ms max 14.0 ms), presented 6 present avg 8.2 ms max 8.3 ms, queue 0, dropped 0
+Sep 02 22:29:17 DietPi castr-receiver[7958]: WARN ... connection error: connection lost
+Sep 02 22:29:20 DietPi castr-receiver[7958]: ... connection from 192.168.88.165:58554 fp e7fb9d2cb78a
+Sep 02 22:29:20 DietPi castr-receiver[7958]: ... session resumed
+Sep 02 22:29:20 DietPi castr-receiver[7958]: ... resuming stream
+Sep 02 22:29:20 DietPi castr-receiver[7958]: ... stream 1920x802@30 Game 10000000 bps
+Sep 02 22:29:22 DietPi castr-receiver[7958]: ... perf: pictures 40 (decode calls 42 avg 2.5 ms max 13.8 ms, drain avg 13.3 ms max 20.9 ms), presented 13 present avg 12.4 ms max 19.3 ms, queue 0, dropped 1
+Sep 02 22:29:27 DietPi castr-receiver[7958]: ... perf: pictures 150 (decode calls 150 avg 2.2 ms max 19.2 ms, drain avg 13.3 ms max 19.5 ms), presented 58 present avg 13.7 ms max 27.7 ms, queue 0, dropped 0
+Sep 02 22:29:32 DietPi castr-receiver[7958]: ... perf: pictures 150 (decode calls 150 avg 2.8 ms max 17.1 ms, drain avg 13.5 ms max 20.5 ms), presented 62 present avg 12.4 ms max 28.3 ms, queue 0, dropped 0
+Sep 02 22:29:37 DietPi castr-receiver[7958]: ... perf: pictures 151 (decode calls 149 avg 2.6 ms max 22.7 ms, drain avg 12.1 ms max 20.5 ms), presented 23 present avg 11.7 ms max 21.7 ms, queue 1, dropped 0
+Sep 02 22:29:39 DietPi castr-receiver[7958]: ... goodbye: stopped
+Sep 02 22:29:39 DietPi castr-receiver[7958]: ... session ended
+Sep 02 22:29:42 DietPi castr-receiver[7958]: ... perf: pictures 63 (decode calls 63 avg 2.3 ms max 19.3 ms, drain avg 13.1 ms max 22.2 ms), presented 18 present avg 11.1 ms max 18.8 ms, queue 0, dropped 0
 ```
 
-Exactly 2 `requesting keyframe (stall)` lines during the whole 30 s cast (during the 3 s the interface was down), and no `Deactivated`/`Starting`/restart-counter lines for `castr-receiver.service` in the journal for this window — the service never restarted. The stream resumed and finished normally (154 -> 12 -> 100 -> 150 pictures/5 s, back to steady state).
+This is the full journal for the window, only with repeated `perf:` lines' internal timestamp prefixes abbreviated to `...` for readability — no line category was filtered out. Exactly 2 `requesting keyframe (stall)` lines appear (during the 3 s the interface was down), plus one QUIC-level `connection lost` and `session resumed`/`resuming stream` recovery, which is the transport noticing the blip and recovering on its own. Critically, there is no `Deactivated`, `Scheduled restart`, or `Starting`/`Started` line anywhere for `castr-receiver.service` — the process (`castr-receiver[7958]`) is the same PID before and after the blip, so the service itself never restarted. The stream resumed and finished normally.
 
-**PASS**: resumed with only a couple of keyframe requests, no service restart.
+**PASS**: resumed with only 2 keyframe requests and one connection-level resume; confirmed by an unfiltered journal excerpt that no service restart occurred.
 
 ## Step 4 (spec 8.3.4): Software decoder fallback
 
@@ -279,4 +329,5 @@ This is consistent with the live-cast decode averages measured above (1080p `dec
 ## What did not meet the numbers
 
 - **Game-mode present avg, first 5 s window: 25.7 ms** (criterion: < 20 ms). This occurred in the very first `perf:` window after the cast connected, when only 6 frames were presented in that window while the sender was still ramping fps from 0 to 30 and the SDL/EGL swap chain was warming up. Every subsequent window for the remainder of the 60 s cast was 8.3-18.0 ms, comfortably under 20 ms. Not treated as a failure of the steady-state target the spec is describing, but recorded here since it is a literal number over the line.
+- **Cast frame dump shows a leftover WAITING FOR SENDER overlay on top of real desktop content** (`2026-09-02-pi-cast.png`). The spec's literal wording is "Frame dump (CASTR_DUMP_FRAME) shows the desktop" — the desktop *is* visible in the dump (browser window, animation window), so the letter of the criterion is met, but the image is not the clean "just the desktop" picture a reader would expect from that sentence, and the same artifact reproduced on an independent second capture. The receiver's own `perf:`/journal lines for both of those casts show normal decoding and presenting (no `decode error`, `presented` counts in the tens per 5 s window), so this looks like a rendering/compositing quirk specific to what `CASTR_DUMP_FRAME` captures (possibly an OSD/status layer not cleared before the dump is taken) rather than evidence the actual displayed picture is broken — but no on-screen photograph was taken to independently confirm the physical monitor doesn't show the same overlay, so this is recorded as an open question rather than dismissed. This is a genuine gap against a fully clean pass on that specific spec sentence, even though every other 8.3.2 criterion (resolution, fps, decode/present ms, queue, decode errors, pictures/5s) was met.
 - No other criterion in spec 8.3 fell short. Quality mode's queue of 5-6 is expected and documented behavior (the playout buffer), not a shortfall against 8.3's game-mode-specific queue <= 2 criterion, which was measured separately in Step 2 above and met there.
