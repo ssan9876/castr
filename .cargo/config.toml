@@ -1,0 +1,7 @@
+# Bundled SDL2 (sdl2-sys, `bundled` feature) ships a CMakeLists.txt that requires
+# `cmake_minimum_required(VERSION 2.8...)`, which CMake >= 4.0 refuses to configure
+# ("Compatibility with CMake < 3.5 has been removed"). This tells cmake to treat any
+# such project as requiring at least 3.5, letting the bundled build (and any other
+# cmake-built dependency) configure under CMake 4.x.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
