@@ -28,6 +28,10 @@ pub(crate) struct FakeOps {
     pub captures_filled: Vec<u8>,
     /// Value served for V4L2_CID_MIN_BUFFERS_FOR_CAPTURE.
     pub min_capture_buffers: i32,
+    /// Model the bcm2835 behaviour the hardware showed: the OUTPUT buffer of
+    /// a finished job is only released once its CAPTURE buffer is dequeued.
+    /// When set, a successful CAPTURE dequeue queues this OUTPUT index.
+    pub release_output_on_capture: Option<u32>,
     /// Virtual clock; only `advance` moves it.
     clock: std::time::Instant,
     pub sink: Option<Arc<Mutex<Vec<String>>>>,
@@ -84,6 +88,7 @@ impl FakeOps {
             fail_errno: None,
             captures_filled: Vec::new(),
             min_capture_buffers: 1,
+            release_output_on_capture: None,
             clock: std::time::Instant::now(),
             sink: None,
         }
@@ -212,7 +217,21 @@ impl Ops for FakeOps {
     fn dqbuf(&mut self, buf_type: u32) -> io::Result<Dequeue> {
         self.record(format!("dqbuf({buf_type})"))?;
         if let Some(pos) = self.dequeues.iter().position(|(t, _)| *t == buf_type) {
-            return Ok(self.dequeues.remove(pos).unwrap().1);
+            let r = self.dequeues.remove(pos).unwrap().1;
+            if buf_type == V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE {
+                if let Some(index) = self.release_output_on_capture.take() {
+                    self.push_dequeue(
+                        V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE,
+                        Dequeued {
+                            index,
+                            bytesused: 0,
+                            timestamp_us: 0,
+                            flags: 0,
+                        },
+                    );
+                }
+            }
+            return Ok(r);
         }
         Ok(Dequeue::Idle)
     }
@@ -231,7 +250,16 @@ impl Ops for FakeOps {
     }
     fn poll(&mut self, timeout_ms: i32) -> io::Result<PollResult> {
         self.record(format!("poll({timeout_ms})"))?;
-        Ok(self.polls.pop_front().unwrap_or_default())
+        match self.polls.pop_front() {
+            // A scripted result was ready at once.
+            Some(r) => Ok(r),
+            // Nothing ready: the poll ran out its timeout, which is how the
+            // decoder's wall-clock budgets pass in a test without sleeping.
+            None => {
+                self.advance(std::time::Duration::from_millis(timeout_ms.max(0) as u64));
+                Ok(PollResult::default())
+            }
+        }
     }
     fn now(&mut self) -> std::time::Instant {
         self.clock

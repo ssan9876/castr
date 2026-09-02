@@ -25,10 +25,17 @@ pub const MAX_IN_FLIGHT: usize = 2;
 pub const STALL_INPUTS: u32 = 60;
 /// Wall-clock budget for waiting on the hardware inside one `decode` call.
 pub const STALL_POLL_MS: u64 = 2_000;
-const POLL_STEP_MS: i32 = 200;
+/// Granularity of a wait inside `decode`. Fine enough that a frame budget is
+/// not spent waiting past the moment the hardware became ready.
+const POLL_STEP_MS: i32 = 20;
 /// Poll rounds spent waiting for the end-of-sequence buffer when a resolution
 /// change arrives, before the CAPTURE queue is rebuilt anyway.
 const DRAIN_ROUNDS: u32 = 5;
+/// Threads used to copy one picture out of the driver's uncached buffer.
+/// Measured on a Pi 3 at 1920x802 (2.31 MB per picture): 26.8 ms with one
+/// thread, 19.4 with two, 16.3 with three, 14.3 with four. Three takes most
+/// of the win and leaves a core for the presenter.
+const COPY_THREADS: usize = 3;
 
 struct Capture {
     queue: Queue,
@@ -440,16 +447,26 @@ impl<O: Ops> V4l2Decoder<O> {
                     src.len()
                 ))
             } else {
-                let mut data = Vec::with_capacity(w * h * 3 / 2);
-                for row in 0..h {
-                    let o = (top + row) * stride + left;
-                    data.extend_from_slice(&src[o..o + w]);
-                }
                 let uv_base = stride * coded_h;
-                for row in 0..h / 2 {
-                    let o = uv_base + (top / 2 + row) * stride + left;
-                    data.extend_from_slice(&src[o..o + w]);
+                let total = w * h + w * (h / 2);
+                let mut data: Vec<u8> = Vec::with_capacity(total);
+                {
+                    let spare = &mut data.spare_capacity_mut()[..total];
+                    let (y_dst, uv_dst) = spare.split_at_mut(w * h);
+                    let threads = copy_threads();
+                    copy_rows(y_dst, src, top * stride + left, stride, w, h, threads);
+                    copy_rows(
+                        uv_dst,
+                        src,
+                        uv_base + top / 2 * stride + left,
+                        stride,
+                        w,
+                        h / 2,
+                        threads,
+                    );
                 }
+                // SAFETY: `copy_rows` initialised every byte of both halves.
+                unsafe { data.set_len(total) };
                 Ok(Some(RawFrame {
                     format: PixelFormat::Nv12,
                     width: w as u32,
@@ -495,15 +512,19 @@ impl<O: Ops> V4l2Decoder<O> {
     }
 
     /// Wait until an OUTPUT slot is free (at most MAX_IN_FLIGHT queued),
-    /// servicing events and pictures meanwhile. Progress is measured in poll
-    /// rounds, not wall clock, so the fake (whose poll returns at once) sees
-    /// the same number of rounds as the hardware: STALL_POLL_MS / POLL_STEP_MS.
+    /// servicing events and pictures meanwhile.
+    ///
+    /// The driver does not release the OUTPUT buffer of a finished job until
+    /// its CAPTURE buffer has been dequeued: while waiting, `poll` reports
+    /// POLLIN with no POLLOUT, and collecting the picture is what frees the
+    /// slot. So a ready picture is always collected here, even when this call
+    /// has spent its copy budget - refusing would spin against the driver.
+    ///
+    /// The give-up budget is wall clock, not poll rounds: `poll` returns at
+    /// once whenever a queue is readable, so rounds are no measure of time
+    /// (measured on the Pi: 100 rounds in 72 ms).
     fn wait_for_slot(&mut self, budget: &mut usize) -> anyhow::Result<()> {
-        let max_idle = STALL_POLL_MS / POLL_STEP_MS as u64;
-        let mut idle = 0u64;
-        // The deadlock-breaking recycle below copies a picture, so like
-        // `budget` it is spent at most once per decode call.
-        let mut fallback = 1usize;
+        let mut deadline = self.ops.now() + std::time::Duration::from_millis(STALL_POLL_MS);
         while self.output.in_flight() >= MAX_IN_FLIGHT {
             let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
             if r.error {
@@ -513,24 +534,19 @@ impl<O: Ops> V4l2Decoder<O> {
             if self.drain_output()? {
                 progressed = true;
             }
-            if *budget > 0 && self.collect_capture(1)? {
-                *budget -= 1;
+            if self.output.in_flight() < MAX_IN_FLIGHT {
+                return Ok(());
+            }
+            if self.collect_capture(1)? {
+                *budget = budget.saturating_sub(1);
                 progressed = true;
+                // The OUTPUT buffer behind that picture only becomes
+                // dequeuable once the picture is out.
+                self.drain_output()?;
             }
             if progressed {
-                idle = 0;
-                continue;
-            }
-            // Nothing moved. The driver may be waiting for a CAPTURE buffer we
-            // are holding back to bound this call's latency, so recycle one
-            // anyway rather than deadlocking against our own budget.
-            if fallback > 0 && self.collect_capture(1)? {
-                fallback -= 1;
-                idle = 0;
-                continue;
-            }
-            idle += 1;
-            if idle >= max_idle {
+                deadline = self.ops.now() + std::time::Duration::from_millis(STALL_POLL_MS);
+            } else if self.ops.now() >= deadline {
                 bail!("decoder stalled: no progress for {STALL_POLL_MS} ms");
             }
         }
@@ -546,6 +562,69 @@ impl<O: Ops> V4l2Decoder<O> {
         self.ops.set_sink(sink.clone());
         sink
     }
+}
+
+/// `COPY_THREADS`, capped by the cores this machine actually has.
+fn copy_threads() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        COPY_THREADS.min(cores).max(1)
+    })
+}
+
+/// Copy `rows` rows of `w` visible bytes each out of the driver's mapping -
+/// row `r` starts at `base + r * stride` - into `dst`, packed at `w` bytes
+/// per row.
+///
+/// The mapping is uncached: reading it runs at about 105 MB/s on one Pi 3
+/// core, which is most of what a 1080p picture costs. One core cannot keep
+/// enough reads in flight to saturate the path, so the rows are split across
+/// `threads`.
+fn copy_rows(
+    dst: &mut [std::mem::MaybeUninit<u8>],
+    src: &[u8],
+    base: usize,
+    stride: usize,
+    w: usize,
+    rows: usize,
+    threads: usize,
+) {
+    debug_assert_eq!(dst.len(), rows * w);
+    let per = rows.div_ceil(threads.max(1));
+    let mut rest = dst;
+    let mut first = 0;
+    std::thread::scope(|scope| {
+        while first < rows {
+            let n = per.min(rows - first);
+            let (mine, tail) = rest.split_at_mut(n * w);
+            rest = tail;
+            let start = first;
+            first += n;
+            let mut run = move || {
+                for i in 0..n {
+                    let o = base + (start + i) * stride;
+                    // SAFETY: `mine` is this thread's own `n * w` bytes of
+                    // spare capacity, and `src[o..o + w]` is in bounds - the
+                    // caller checked the geometry against the mapping.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            src.as_ptr().add(o),
+                            mine.as_mut_ptr().add(i * w) as *mut u8,
+                            w,
+                        )
+                    };
+                }
+            };
+            if first < rows {
+                scope.spawn(run);
+            } else {
+                run();
+            }
+        }
+    });
 }
 
 fn poll_error() -> anyhow::Error {
@@ -607,17 +686,21 @@ impl<O: Ops + Send> VideoDecoder for V4l2Decoder<O> {
     }
 
     /// Collect a picture the decoder has already produced, without feeding it
-    /// anything. Waits up to one poll step for one to appear.
+    /// anything, and without waiting: the poll timeout is zero.
     ///
     /// The driver is pipelined - a picture comes out a few access units after
     /// the one that produced it - and it batches heavily when it is fed faster
     /// than real time, so a caller that has run out of input needs a way to
-    /// pull the tail out rather than growing its latency.
+    /// pull the tail out rather than growing its latency. It must not block
+    /// doing so: callers drain in a loop until this returns `None`, and with
+    /// nothing queued in the hardware that last call can only wait out the
+    /// whole timeout - measured on a Pi 3 as 200 ms out of a 33 ms frame
+    /// budget, the single largest cost in the receiver's decode thread.
     fn poll_frame(&mut self) -> anyhow::Result<Option<RawFrame>> {
         if let Some(f) = self.ready.pop_front() {
             return Ok(Some(f));
         }
-        let r = self.ops.poll(POLL_STEP_MS).context("poll")?;
+        let r = self.ops.poll(0).context("poll")?;
         if r.error {
             return Err(poll_error());
         }
@@ -1132,6 +1215,49 @@ mod tests {
     }
 
     #[test]
+    fn a_ready_picture_frees_the_output_slot_it_is_blocking() {
+        let mut ops = FakeOps::new();
+        ops.push_event(src_change());
+        // The driver holds a finished job's OUTPUT buffer until its CAPTURE
+        // buffer is dequeued, and signals only POLLIN meanwhile - so a wait
+        // for an output slot has to collect the picture to make progress,
+        // whatever this call's copy budget says.
+        ops.release_output_on_capture = Some(0);
+        let mut d = V4l2Decoder::with_ops(ops).unwrap();
+        d.decode(&KEY, 0).unwrap();
+        d.decode(&DELTA, 33_000).unwrap();
+        assert_eq!(d.output.in_flight(), MAX_IN_FLIGHT);
+        d.ops.polls.push_back(PollResult {
+            readable: true,
+            ..Default::default()
+        });
+        d.ops.push_dequeue(
+            CAP,
+            Dequeued {
+                index: 0,
+                bytesused: 640 * 368 * 3 / 2,
+                timestamp_us: 33_000,
+                flags: 0,
+            },
+        );
+        let f = d
+            .decode(&DELTA, 66_000)
+            .unwrap()
+            .expect("the picture that was blocking the slot");
+        assert_eq!(f.timestamp_us, 33_000);
+        // The freed slot took the new access unit.
+        assert_eq!(d.output.in_flight(), MAX_IN_FLIGHT);
+        let calls = &d.ops.calls;
+        let poll = calls.iter().rposition(|c| c.starts_with("poll(")).unwrap();
+        let cap = calls[poll..].iter().position(|c| c == "dqbuf(9)").unwrap();
+        let out = calls[poll + cap..]
+            .iter()
+            .position(|c| c == "dqbuf(10)")
+            .expect("the output queue is re-checked after the picture is out");
+        assert!(out > 0);
+    }
+
+    #[test]
     fn stalls_only_after_sixty_unanswered_inputs_and_two_idle_seconds() {
         let mut ops = FakeOps::new();
         ops.push_event(src_change());
@@ -1252,7 +1378,9 @@ mod tests {
             .iter()
             .filter(|c| c.starts_with("poll("))
             .count();
-        assert_eq!(polls as u64, STALL_POLL_MS / 200);
+        // The budget is wall clock, not a poll count: a finer step means
+        // proportionally more rounds, still 2 s in total.
+        assert_eq!(polls as u64, STALL_POLL_MS / POLL_STEP_MS as u64);
     }
 
     #[test]

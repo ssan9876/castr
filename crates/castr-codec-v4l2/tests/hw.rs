@@ -83,13 +83,19 @@ fn tail(dec: &mut V4l2Decoder, want: usize) -> Vec<RawFrame> {
     let mut out = Vec::new();
     let mut quiet = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
-    while out.len() < want && quiet < 5 && Instant::now() < deadline {
+    // `poll_frame` does not wait, so the waiting is here: 40 empty polls 5 ms
+    // apart is 200 ms of silence, more than the ~70 ms the driver needs to
+    // rebuild its CAPTURE queue across a resolution change.
+    while out.len() < want && quiet < 40 && Instant::now() < deadline {
         match dec.poll_frame().unwrap() {
             Some(f) => {
                 quiet = 0;
                 out.push(f);
             }
-            None => quiet += 1,
+            None => {
+                quiet += 1;
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
     out
