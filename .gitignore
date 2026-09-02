@@ -2,3 +2,4 @@
 target-linux/
 *.log
 .superpowers/
+/dist

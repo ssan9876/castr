@@ -16,15 +16,43 @@ pub struct Endpoint {
     inner: quinn::Endpoint,
 }
 
+/// UDP socket buffer size requested on both ends. A 1080p keyframe leaves the sender
+/// as a burst of ~150 datagrams (180 KB); the OS defaults (64 KiB on Windows,
+/// 208 KiB on Linux) drop the tail of that burst before QUIC ever sees it.
+/// Linux caps the request at `net.core.rmem_max`, so this is best effort.
+pub const SOCKET_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+fn bind_udp(bind: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if bind.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).context("udp socket")?;
+    let _ = sock.set_recv_buffer_size(SOCKET_BUFFER_BYTES);
+    let _ = sock.set_send_buffer_size(SOCKET_BUFFER_BYTES);
+    sock.set_nonblocking(true).context("udp nonblocking")?;
+    sock.bind(&bind.into()).context("bind udp")?;
+    Ok(sock.into())
+}
+
 impl Endpoint {
     pub fn server(bind: SocketAddr, id: &Identity, trust: TrustCheck) -> anyhow::Result<Self> {
-        let inner = quinn::Endpoint::server(server_config(id, trust)?, bind)
-            .context("bind server endpoint")?;
+        let inner = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            Some(server_config(id, trust)?),
+            bind_udp(bind)?,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("bind server endpoint")?;
         Ok(Self { inner })
     }
 
     pub fn client(bind: SocketAddr, id: &Identity, trust: TrustCheck) -> anyhow::Result<Self> {
-        let mut inner = quinn::Endpoint::client(bind).context("bind client endpoint")?;
+        let mut inner = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            bind_udp(bind)?,
+            Arc::new(quinn::TokioRuntime),
+        )
+        .context("bind client endpoint")?;
         inner.set_default_client_config(client_config(id, trust)?);
         Ok(Self { inner })
     }

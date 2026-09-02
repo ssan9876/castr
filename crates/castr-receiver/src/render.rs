@@ -93,24 +93,53 @@ pub struct Renderer {
     events: EventPump,
     base_title: String,
     pulse: u32,
+    /// Debug: `CASTR_DUMP_FRAME=<path>` writes the rendered output there every
+    /// couple of seconds (RGB24, "CASTRDUMP <w> <h>\n" header), so a headless
+    /// receiver's screen can be inspected remotely.
+    dump: Option<(std::path::PathBuf, std::time::Instant)>,
 }
 
 impl Renderer {
     pub fn new(title: &str, fullscreen: bool) -> anyhow::Result<Self> {
+        if std::env::var_os("CASTR_SDL_VERBOSE").is_some() {
+            // SAFETY: plain SDL log-priority setter, safe to call before/after init.
+            unsafe {
+                sdl2::sys::SDL_LogSetAllPriority(sdl2::sys::SDL_LogPriority::SDL_LOG_PRIORITY_VERBOSE)
+            };
+        }
         let sdl = sdl2::init().map_err(|e| anyhow!(e))?;
         let video = sdl.video().map_err(|e| anyhow!(e))?;
+        tracing::info!("SDL video driver: {}", video.current_video_driver());
         let mut builder = video.window(title, 1280, 720);
         builder.position_centered().resizable();
         if fullscreen {
             builder.fullscreen_desktop();
         }
+        // SDL tries its desktop "opengl" renderer first. On a Raspberry Pi with
+        // KMS/DRM there is no libGL, and SDL still "succeeds" in creating that
+        // renderer with shaders disabled, which draws nothing at all. Ask for
+        // GLES2 first on Linux; SDL falls back to the other renderers if it is
+        // unavailable, and an explicit SDL_RENDER_DRIVER still wins.
+        #[cfg(not(windows))]
+        if std::env::var_os("SDL_RENDER_DRIVER").is_none() {
+            sdl2::hint::set("SDL_RENDER_DRIVER", "opengles2");
+        }
         let window = builder.build().context("create window")?;
-        let canvas = window
-            .into_canvas()
-            .accelerated()
-            .present_vsync()
-            .build()
-            .context("create canvas")?;
+        let mut cb = window.into_canvas().present_vsync();
+        // `CASTR_SOFTWARE_RENDER=1` allows SDL's software renderer (with
+        // `SDL_RENDER_DRIVER=software`), for platforms whose GL renderer misbehaves.
+        if std::env::var_os("CASTR_SOFTWARE_RENDER").is_none() {
+            cb = cb.accelerated();
+        }
+        let canvas = cb.build().context("create canvas")?;
+        let info = canvas.info();
+        tracing::info!(
+            "SDL renderer: {} ({}x{} output, flags {:#x})",
+            info.name,
+            canvas.output_size().map(|s| s.0).unwrap_or(0),
+            canvas.output_size().map(|s| s.1).unwrap_or(0),
+            info.flags
+        );
         let creator = canvas.texture_creator();
         let events = sdl.event_pump().map_err(|e| anyhow!(e))?;
         Ok(Self {
@@ -123,7 +152,36 @@ impl Renderer {
             events,
             base_title: title.to_string(),
             pulse: 0,
+            dump: std::env::var_os("CASTR_DUMP_FRAME").map(|p| {
+                (
+                    std::path::PathBuf::from(p),
+                    std::time::Instant::now() - std::time::Duration::from_secs(10),
+                )
+            }),
         })
+    }
+
+    /// Read back the last presented frame for `CASTR_DUMP_FRAME`, at most every 2 s.
+    fn maybe_dump(&mut self) {
+        let Some((path, last)) = &mut self.dump else { return };
+        if last.elapsed() < std::time::Duration::from_secs(2) {
+            return;
+        }
+        *last = std::time::Instant::now();
+        let (w, h) = match self.canvas.output_size() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        match self.canvas.read_pixels(None, PixelFormatEnum::RGB24) {
+            Ok(px) => {
+                let mut out = format!("CASTRDUMP {w} {h}\n").into_bytes();
+                out.extend_from_slice(&px);
+                if let Err(e) = std::fs::write(&*path, out) {
+                    tracing::warn!("frame dump: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("frame dump read_pixels: {e}"),
+        }
     }
 
     pub fn set_overlay(&mut self, text: Option<&str>) {
@@ -257,6 +315,9 @@ impl Renderer {
             let ty = bar_y - (GLYPH_ROWS as u32 * scale) as i32 - 3 * scale as i32;
             self.draw_text(&text, tx, ty, scale, Color::RGBA(255, 255, 255, 235))?;
         }
+        // Read back before present: after the swap the back buffer is undefined
+        // on double-buffered GL targets such as KMSDRM.
+        self.maybe_dump();
         self.canvas.present();
         Ok(())
     }

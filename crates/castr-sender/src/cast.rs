@@ -215,6 +215,10 @@ fn spawn_capture(
             let interval = Duration::from_micros(1_000_000 / fps as u64);
             let mut last: Option<RawFrame> = None;
             let mut last_sent = Instant::now();
+            // Absolute schedule: advancing by one interval per sent frame keeps the rate
+            // at `fps` regardless of how long capture copies and encoding take.
+            let mut next_due = Instant::now();
+            let mut pending = false;
             loop {
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
@@ -247,10 +251,28 @@ fn spawn_capture(
                     }
                 }
                 let ts = start.elapsed().as_micros() as u64;
-                let frame = match cap.next_frame(interval.as_millis() as u32, ts) {
-                    Ok(Some(f)) => Some(f),
+                // Pace to `fps`: the desktop may update faster (60 Hz) than we want to
+                // send. Capture continuously so `last` is always the newest frame, but
+                // only encode when the next slot is due. While a captured frame is
+                // pending, wait no longer than the time to that slot.
+                let until_due = next_due.saturating_duration_since(Instant::now());
+                let timeout = if pending { until_due } else { interval };
+                let frame = match cap.next_frame(timeout.as_millis() as u32, ts) {
+                    Ok(Some(f)) => {
+                        last = Some(f);
+                        pending = true;
+                        if Instant::now() < next_due {
+                            continue;
+                        }
+                        pending = false;
+                        last.clone()
+                    }
                     Ok(None) => {
-                        if last_sent.elapsed() >= Duration::from_millis(500) {
+                        if pending && Instant::now() >= next_due {
+                            pending = false;
+                            last.clone()
+                        } else if last_sent.elapsed() >= Duration::from_millis(500) {
+                            // Static desktop: keep the stream alive with a repeat.
                             last.clone().map(|mut f| {
                                 f.timestamp_us = ts;
                                 f
@@ -271,7 +293,10 @@ fn spawn_capture(
                     }
                 };
                 let Some(f) = frame else { continue };
-                last = Some(f.clone());
+                last_sent = Instant::now();
+                // Next slot one interval on; if we fell more than a slot behind, resync
+                // rather than bursting to catch up.
+                next_due = (next_due + interval).max(last_sent - interval);
                 let scaled = if (f.width, f.height) != (w, h) {
                     RawFrame {
                         format: PixelFormat::Bgra,
@@ -287,7 +312,6 @@ fn spawn_capture(
                 let input = convert::convert(&scaled, enc.input_format());
                 match enc.encode(&input) {
                     Ok(Some(e)) => {
-                        last_sent = Instant::now();
                         if out.blocking_send(VideoOut { frame: e }).is_err() {
                             return;
                         }
@@ -509,6 +533,9 @@ pub async fn cast(
             mode,
         );
         let mut packetizer = Packetizer::new();
+        // Frame numbers are per stream: the receiver relies on video numbers being
+        // contiguous to spot a missing reference frame.
+        let mut audio_packetizer = Packetizer::new();
         let mut rtx = RetransmitBuffer::new(500_000);
         let frame_interval_us = 1_000_000 / params.fps as u64;
         let mut sent_frames = 0u32;
@@ -541,7 +568,7 @@ pub async fn cast(
                 a = audio_rx.recv(), if audio_alive => {
                     match a {
                         Some(a) => {
-                            for f in packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
+                            for f in audio_packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
                                 let _ = link.send_datagram(f);
                             }
                         }

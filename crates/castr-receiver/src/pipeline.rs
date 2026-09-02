@@ -113,6 +113,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                     }
                 };
                 tracing::info!("decoder: {}", decoder.name());
+                let mut last_decoded: Option<u32> = None;
                 loop {
                     let frame = jitter.lock().unwrap().pop(now_us(start));
                     let Some(f) = frame else {
@@ -121,14 +122,26 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                     };
                     stats.lock().unwrap().decode_queue_depth =
                         jitter.lock().unwrap().depth() as u32;
+                    tracing::debug!("decode frame {} key={}", f.frame_number, f.keyframe);
                     match decoder.decode(&f.data, f.timestamp_us) {
                         Ok(Some(raw)) => {
+                            last_decoded = Some(f.frame_number);
                             if ui.blocking_send(UiEvent::Frame(raw)).is_err() {
                                 return;
                             }
                         }
                         Ok(None) => {}
-                        Err(e) => tracing::warn!("decode error: {e:#}"),
+                        Err(e) => {
+                            tracing::warn!(
+                                "decode error on frame {} (keyframe={}, last decoded {:?}): {e:#}",
+                                f.frame_number,
+                                f.keyframe,
+                                last_decoded
+                            );
+                            // Deltas are useless without a reference: skip them
+                            // until the network loop has fetched a fresh IDR.
+                            jitter.lock().unwrap().require_keyframe();
+                        }
                     }
                 }
             })?;
@@ -433,6 +446,8 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
     let mut stats_tick = tokio::time::interval(Duration::from_millis(100));
     let mut stall_check = tokio::time::interval(Duration::from_millis(250));
     let mut last_video = Instant::now();
+    let mut last_key_req = Instant::now() - Duration::from_secs(1);
+    let mut any_video = false;
     let mut frames_received = 0u32;
     let mut fragments_received = 0u32;
     let mut last_audio_ts: Option<u64> = None;
@@ -451,7 +466,9 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
                 if let Some(f) = reasm.push(&d, now_us(cfg.start))? {
                     match f.stream {
                         STREAM_VIDEO => {
+                            tracing::debug!("video frame {} key={} {} B", f.frame_number, f.keyframe, f.data.len());
                             frames_received += 1;
+                            any_video = true;
                             last_video = Instant::now();
                             cfg.jitter.lock().unwrap().push(f, now_us(cfg.start));
                         }
@@ -524,12 +541,29 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
                 let depth = cfg.stats.lock().unwrap().decode_queue_depth;
                 let s = Stats { frames_received, frames_dropped: dropped, fragments_lost: (video_reasm.fragments_lost() + audio_reasm.fragments_lost()) as u32, fragments_received, decode_queue_depth: depth, interval_ms: 100 };
                 frames_received = 0; fragments_received = 0;
+                if s.fragments_lost > 0 || s.frames_dropped > 0 {
+                    tracing::debug!("stats: {} fragments lost, {} frames dropped, queue {}", s.fragments_lost, s.frames_dropped, s.decode_queue_depth);
+                }
                 link.send_control(&ControlMessage::Stats(s)).await?;
             }
             _ = stall_check.tick() => {
-                if last_video.elapsed() > Duration::from_secs(1) {
-                    link.send_control(&ControlMessage::RequestKeyframe).await?;
-                    last_video = Instant::now();
+                // One RequestKeyframe per 500 ms at most, for a stalled stream or a
+                // jitter buffer waiting on a keyframe (decode error, or too far
+                // behind). The buffer clears its flag when the keyframe arrives, so
+                // the request repeats until it does.
+                if last_key_req.elapsed() >= Duration::from_millis(500) {
+                    let stalled = last_video.elapsed() > Duration::from_secs(1);
+                    // Before the first frame the buffer wants a keyframe too, but the
+                    // sender opens with one; only ask once video has actually flowed.
+                    let lost_ref = any_video && cfg.jitter.lock().unwrap().keyframe_needed();
+                    if stalled || lost_ref {
+                        tracing::info!("requesting keyframe ({})", if stalled { "stall" } else { "reference lost" });
+                        link.send_control(&ControlMessage::RequestKeyframe).await?;
+                        last_key_req = Instant::now();
+                        if stalled {
+                            last_video = Instant::now();
+                        }
+                    }
                 }
             }
             _ = link.closed() => return Err(anyhow!("connection lost")),

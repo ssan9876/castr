@@ -83,23 +83,66 @@ into `sender/` and `receiver/`. Each holds `identity.crt`, `identity.key`, and
   briefly flashes a console window, which the GUI path closes immediately via
   `FreeConsole()`.
 
-## Linux build (not yet verified)
+## Raspberry Pi receiver
 
-The receiver and the platform-independent crates are meant to build on Linux,
-but this has not been run end-to-end yet. From WSL Ubuntu or a Linux host:
+Verified on a Pi 3 Model B running DietPi (Debian 13, 64-bit). Do not build on
+the Pi: its SD card and 1 GB of RAM make that a multi-hour job. Cross-compile
+from Windows or Linux with Docker instead:
 
 ```
-sudo apt update && sudo apt install -y build-essential cmake pkg-config libx11-dev libxext-dev libasound2-dev
-cd /mnt/d/miracast
-source "$HOME/.cargo/env"
-cargo build -p castr-receiver -p castr-proto -p castr-media -p castr-net --target-dir target-linux
-cargo test -p castr-proto -p castr-media -p castr-net --target-dir target-linux
-cargo tree -p castr-receiver --target-dir target-linux | grep -i windows   # expect no output
+bash scripts/pi/build-pi.sh        # -> dist/castr-receiver-aarch64 (~10 MB, needs only glibc/libstdc++)
 ```
+
+Copy the binary to the Pi (DietPi ships dropbear without SFTP, so `scp` fails;
+pipe it over ssh):
+
+```
+cat dist/castr-receiver-aarch64 | ssh dietpi@<pi> 'mkdir -p ~/bin && cat > ~/bin/castr-receiver && chmod +x ~/bin/castr-receiver'
+```
+
+One-time Pi setup, no desktop needed. Bundled SDL2 draws straight to HDMI via
+KMS/DRM, which needs the full KMS driver and device-group membership:
+
+```
+sudo apt install -y libstdc++6 libasound2 libdrm2 libgbm1 libgles2 libegl1
+sudo sed -i 's/^#dtoverlay=vc4-kms-v3d.*/dtoverlay=vc4-kms-v3d/' /boot/firmware/config.txt
+sudo usermod -aG video,render,input,audio $USER
+sudo reboot
+```
+
+Run it from an SSH session or the console (not inside a desktop):
+
+```
+SDL_VIDEODRIVER=kmsdrm ~/bin/castr-receiver --name pi --fullscreen
+```
+
+The receiver asks SDL for its `opengles2` renderer on Linux. SDL's default
+order tries desktop `opengl` first, and on a Pi without libGL that renderer is
+created with shaders disabled and draws a black screen. Debug switches for a
+headless box: `CASTR_DUMP_FRAME=/tmp/f.raw` writes the rendered output every
+2 s (RGB24 with a `CASTRDUMP w h` header), `CASTR_SDL_VERBOSE=1` prints SDL's
+internal log, and `CASTR_SOFTWARE_RENDER=1 SDL_RENDER_DRIVER=software` bypasses
+the GPU entirely.
+
+Use a proper 2.5 A power supply. On a weak one the kernel logs "Undervoltage
+detected", the SD card slows to a crawl (2 MB/s reads instead of 20+), and
+package installs stall for hours.
+
+What to expect: decoding is software (openh264) until the V4L2 sub-project
+lands, so the sender's game-mode ladder settles at 1280x534 or 960x400 for a
+1920-wide desktop within a few seconds, at 30 fps with audio over HDMI.
+
+The generic Linux recipe (untested beyond the Docker image) is the package list
+in `scripts/pi/Dockerfile` plus `LIBOPUS_LIB_DIR=/usr/lib/<triplet>
+OPUS_NO_PKG_CONFIG=1` so Opus links statically; without those the audiopus
+crate links `libopus.so` dynamically or tries to run autotools.
 
 ## Known gaps
 
 - The mouse cursor is not composited into the cast yet.
+- Only keyframes are NACK-repaired. A delta frame that loses a fragment costs
+  a 150 ms hold and a fresh keyframe; on a Pi 3 over Ethernet that happens a
+  few times a minute.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
 - V4L2 hardware decode, DRM/KMS output, and Miracast sink mode are later
   sub-projects.

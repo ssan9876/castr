@@ -28,6 +28,7 @@ hex = "0.4"
 toml = "0.8"
 dirs = "5"
 mdns-sd = "0.11"
+socket2 = "0.5"
 openh264 = { version = "0.6", features = ["source"] }
 audiopus = "0.2"
 sdl2 = { version = "0.36", features = ["bundled", "static-link"] }
