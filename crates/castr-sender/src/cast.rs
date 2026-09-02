@@ -435,231 +435,240 @@ pub async fn cast(
     let set_state = |s: &str| {
         status.send_modify(|st| st.state = s.to_string());
     };
-    set_state("discovering");
-    let target = resolve_target(&opts.target, Duration::from_secs(2)).await?;
-    let (_id, ep) = client_for(&target, &opts.config_dir)?;
-
+    // Owned out here so teardown below runs on every exit path, including the
+    // early `?`/`bail!` returns inside the session: the capture and audio
+    // threads must always be told to stop, and the GUI must always see a
+    // terminal state ("stopped" or "failed") so it clears the active cast.
     let (video_tx, mut video_rx) = mpsc::channel::<VideoOut>(4);
     let (audio_tx, mut audio_rx) = mpsc::channel::<AudioOut>(32);
     let (enc_tx, enc_rx) = std::sync::mpsc::channel::<EncCmd>();
     let (native_tx, native_rx) = std::sync::mpsc::channel::<(u32, u32)>();
     let stop_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut open_link: Option<Link> = None;
 
-    // Connect first so we know caps before opening the encoder.
-    set_state("connecting");
-    let mut token: Option<[u8; 16]> = None;
-    let mut link = connect_with_retry(
-        &ep,
-        target.addr,
-        &opts.sender_name,
-        &mut token,
-        Duration::from_secs(5),
-    )
-    .await?;
-    let caps = match link.recv_control().await? {
-        ControlMessage::HelloAck { caps, .. } => caps,
-        ControlMessage::Error { code: 4, .. } => bail!(
-            "not paired with '{}'; run: castr-sender pair \"{}\"",
-            target.name,
-            target.name
-        ),
-        other => bail!("unexpected {other:?}"),
-    };
+    let result: anyhow::Result<()> = async {
+        set_state("discovering");
+        let target = resolve_target(&opts.target, Duration::from_secs(2)).await?;
+        let (_id, ep) = client_for(&target, &opts.config_dir)?;
 
-    let mode = opts.mode;
-    let ceiling = opts
-        .max_bitrate
-        .unwrap_or(u32::MAX)
-        .min(caps.max_bitrate_bps);
-    // `choose_params` clamps fps the same way; compute it once up front so the
-    // capture/encode thread is started at the fps that will actually be used,
-    // rather than the requested (possibly higher) fps.
-    let fps = opts.fps.min(caps.max_fps).max(1);
-    let _cap_thread = spawn_capture(native_tx, enc_rx, video_tx, fps, mode, ceiling / 2, start)?;
-    let native =
-        tokio::task::spawn_blocking(move || native_rx.recv_timeout(Duration::from_secs(5)))
-            .await?
-            .context("capture did not start")?;
-    let mut params = choose_params(native, opts.fps, opts.max_bitrate, mode, &caps);
-    debug_assert_eq!(params.fps, fps);
-    if (params.width, params.height) != native {
-        enc_tx
-            .send(EncCmd::Resolution(params.width, params.height))
-            .ok();
-    }
-    enc_tx.send(EncCmd::Bitrate(params.bitrate_bps)).ok();
-    link.send_control(&ControlMessage::StartStream(params.clone()))
+        // Connect first so we know caps before opening the encoder.
+        set_state("connecting");
+        let mut token: Option<[u8; 16]> = None;
+        let mut link = connect_with_retry(
+            &ep,
+            target.addr,
+            &opts.sender_name,
+            &mut token,
+            Duration::from_secs(5),
+        )
         .await?;
-    spawn_audio(audio_tx, start, stop_audio.clone());
+        open_link = Some(link.clone());
+        let caps = match link.recv_control().await? {
+            ControlMessage::HelloAck { caps, .. } => caps,
+            ControlMessage::Error { code: 4, .. } => bail!(
+                "not paired with '{}'; run: castr-sender pair \"{}\"",
+                target.name,
+                target.name
+            ),
+            other => bail!("unexpected {other:?}"),
+        };
 
-    let mut ctl = BitrateController::new(
-        ceiling,
-        params.bitrate_bps,
-        Resolution {
-            width: params.width,
-            height: params.height,
-        },
-        mode,
-    );
-    let mut packetizer = Packetizer::new();
-    let mut rtx = RetransmitBuffer::new(500_000);
-    let frame_interval_us = 1_000_000 / params.fps as u64;
-    let mut sent_frames = 0u32;
-    let mut fps_window = Instant::now();
-    let mut nack_rx: Option<NackReceiver> = None;
-    let mut control_errors: u32 = 0;
-    let mut audio_alive = true;
-    set_state("casting");
-    status.send_modify(|st| {
-        st.width = params.width;
-        st.height = params.height;
-        st.bitrate_bps = params.bitrate_bps;
-    });
+        let mode = opts.mode;
+        let ceiling = opts
+            .max_bitrate
+            .unwrap_or(u32::MAX)
+            .min(caps.max_bitrate_bps);
+        // `choose_params` clamps fps the same way; compute it once up front so the
+        // capture/encode thread is started at the fps that will actually be used,
+        // rather than the requested (possibly higher) fps.
+        let fps = opts.fps.min(caps.max_fps).max(1);
+        let _cap_thread = spawn_capture(native_tx, enc_rx, video_tx, fps, mode, ceiling / 2, start)?;
+        let native =
+            tokio::task::spawn_blocking(move || native_rx.recv_timeout(Duration::from_secs(5)))
+                .await?
+                .context("capture did not start")?;
+        let mut params = choose_params(native, opts.fps, opts.max_bitrate, mode, &caps);
+        debug_assert_eq!(params.fps, fps);
+        if (params.width, params.height) != native {
+            enc_tx
+                .send(EncCmd::Resolution(params.width, params.height))
+                .ok();
+        }
+        enc_tx.send(EncCmd::Bitrate(params.bitrate_bps)).ok();
+        link.send_control(&ControlMessage::StartStream(params.clone()))
+            .await?;
+        spawn_audio(audio_tx, start, stop_audio.clone());
 
-    loop {
-        let now = start.elapsed().as_micros() as u64;
-        tokio::select! {
-            v = video_rx.recv() => {
-                let Some(v) = v else {
-                    set_state("failed");
-                    stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
-                    bail!("capture thread exited");
-                };
-                let frags = packetizer.packetize(STREAM_VIDEO, v.frame.keyframe, v.frame.timestamp_us, &v.frame.data, link.max_datagram_size());
-                rtx.record(packetizer.last_frame_number(), v.frame.keyframe, frags.clone(), now);
-                for f in frags { if let Err(e) = link.send_datagram(f) { tracing::debug!("send: {e:#}"); } }
-                sent_frames += 1;
-                if fps_window.elapsed() >= Duration::from_secs(1) {
-                    let fps = sent_frames as f32 / fps_window.elapsed().as_secs_f32();
-                    status.send_modify(|st| { st.fps = fps; st.rtt_ms = link.rtt().as_millis() as u32; });
-                    sent_frames = 0; fps_window = Instant::now();
+        let mut ctl = BitrateController::new(
+            ceiling,
+            params.bitrate_bps,
+            Resolution {
+                width: params.width,
+                height: params.height,
+            },
+            mode,
+        );
+        let mut packetizer = Packetizer::new();
+        let mut rtx = RetransmitBuffer::new(500_000);
+        let frame_interval_us = 1_000_000 / params.fps as u64;
+        let mut sent_frames = 0u32;
+        let mut fps_window = Instant::now();
+        let mut nack_rx: Option<NackReceiver> = None;
+        let mut control_errors: u32 = 0;
+        let mut audio_alive = true;
+        set_state("casting");
+        status.send_modify(|st| {
+            st.width = params.width;
+            st.height = params.height;
+            st.bitrate_bps = params.bitrate_bps;
+        });
+
+        loop {
+            let now = start.elapsed().as_micros() as u64;
+            tokio::select! {
+                v = video_rx.recv() => {
+                    let Some(v) = v else { bail!("capture thread exited") };
+                    let frags = packetizer.packetize(STREAM_VIDEO, v.frame.keyframe, v.frame.timestamp_us, &v.frame.data, link.max_datagram_size());
+                    rtx.record(packetizer.last_frame_number(), v.frame.keyframe, frags.clone(), now);
+                    for f in frags { if let Err(e) = link.send_datagram(f) { tracing::debug!("send: {e:#}"); } }
+                    sent_frames += 1;
+                    if fps_window.elapsed() >= Duration::from_secs(1) {
+                        let fps = sent_frames as f32 / fps_window.elapsed().as_secs_f32();
+                        status.send_modify(|st| { st.fps = fps; st.rtt_ms = link.rtt().as_millis() as u32; });
+                        sent_frames = 0; fps_window = Instant::now();
+                    }
                 }
-            }
-            a = audio_rx.recv(), if audio_alive => {
-                match a {
-                    Some(a) => {
-                        for f in packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
-                            let _ = link.send_datagram(f);
+                a = audio_rx.recv(), if audio_alive => {
+                    match a {
+                        Some(a) => {
+                            for f in packetizer.packetize(STREAM_AUDIO, false, a.ts_us, &a.packet, link.max_datagram_size()) {
+                                let _ = link.send_datagram(f);
+                            }
+                        }
+                        None => {
+                            tracing::warn!("audio thread exited; continuing without audio");
+                            audio_alive = false;
                         }
                     }
-                    None => {
-                        tracing::warn!("audio thread exited; continuing without audio");
-                        audio_alive = false;
-                    }
                 }
-            }
-            m = link.recv_control() => {
-                match m {
-                    Ok(ControlMessage::SessionToken(t)) => { token = Some(t); control_errors = 0; }
-                    Ok(ControlMessage::RequestKeyframe) => { enc_tx.send(EncCmd::Keyframe).ok(); control_errors = 0; }
-                    Ok(ControlMessage::Stats(s)) => {
-                        control_errors = 0;
-                        let total = s.fragments_lost + s.fragments_received;
-                        let loss = if total == 0 { 0.0 } else { s.fragments_lost as f32 * 100.0 / total as f32 };
-                        status.send_modify(|st| st.loss_pct = loss);
-                        if let Some(Decision { bitrate_bps, resolution }) = ctl.on_stats(&s, now) {
-                            if bitrate_bps != params.bitrate_bps {
-                                params.bitrate_bps = bitrate_bps;
-                                enc_tx.send(EncCmd::Bitrate(bitrate_bps)).ok();
-                            }
-                            if (resolution.width, resolution.height) != (params.width, params.height) {
-                                params.width = resolution.width; params.height = resolution.height;
-                                enc_tx.send(EncCmd::Resolution(params.width, params.height)).ok();
-                                link.send_control(&ControlMessage::StartStream(params.clone())).await?;
-                            }
-                            status.send_modify(|st| { st.bitrate_bps = params.bitrate_bps; st.width = params.width; st.height = params.height; });
-                        }
-                    }
-                    Ok(ControlMessage::Error { code, message }) => { control_errors = 0; tracing::warn!("receiver error {code}: {message}"); }
-                    Ok(ControlMessage::Goodbye { reason }) => { tracing::info!("receiver said goodbye: {reason}"); break; }
-                    Ok(_) => { control_errors = 0; }
-                    Err(e) => {
-                        control_errors += 1;
-                        tracing::debug!("control: {e:#} ({control_errors}/20)");
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        if control_errors >= 20 {
-                            tracing::warn!("control stream unresponsive, treating link as lost");
-                            link.close("control stream failed");
+                m = link.recv_control() => {
+                    match m {
+                        Ok(ControlMessage::SessionToken(t)) => { token = Some(t); control_errors = 0; }
+                        Ok(ControlMessage::RequestKeyframe) => { enc_tx.send(EncCmd::Keyframe).ok(); control_errors = 0; }
+                        Ok(ControlMessage::Stats(s)) => {
                             control_errors = 0;
+                            let total = s.fragments_lost + s.fragments_received;
+                            let loss = if total == 0 { 0.0 } else { s.fragments_lost as f32 * 100.0 / total as f32 };
+                            status.send_modify(|st| st.loss_pct = loss);
+                            if let Some(Decision { bitrate_bps, resolution }) = ctl.on_stats(&s, now) {
+                                if bitrate_bps != params.bitrate_bps {
+                                    params.bitrate_bps = bitrate_bps;
+                                    enc_tx.send(EncCmd::Bitrate(bitrate_bps)).ok();
+                                }
+                                if (resolution.width, resolution.height) != (params.width, params.height) {
+                                    params.width = resolution.width; params.height = resolution.height;
+                                    enc_tx.send(EncCmd::Resolution(params.width, params.height)).ok();
+                                    link.send_control(&ControlMessage::StartStream(params.clone())).await?;
+                                }
+                                status.send_modify(|st| { st.bitrate_bps = params.bitrate_bps; st.width = params.width; st.height = params.height; });
+                            }
+                        }
+                        Ok(ControlMessage::Error { code, message }) => { control_errors = 0; tracing::warn!("receiver error {code}: {message}"); }
+                        Ok(ControlMessage::Goodbye { reason }) => { tracing::info!("receiver said goodbye: {reason}"); break; }
+                        Ok(_) => { control_errors = 0; }
+                        Err(e) => {
+                            control_errors += 1;
+                            tracing::debug!("control: {e:#} ({control_errors}/20)");
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            if control_errors >= 20 {
+                                tracing::warn!("control stream unresponsive, treating link as lost");
+                                link.close("control stream failed");
+                                control_errors = 0;
+                            }
                         }
                     }
                 }
-            }
-            ev = async {
-                match nack_rx.as_mut() {
-                    Some(r) => NackEv::Nack(r.recv().await),
-                    None => NackEv::Stream(link.accept_nack_stream().await),
-                }
-            } => {
-                match ev {
-                    NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now, frame_interval_us) { let _ = link.send_datagram(f); },
-                    NackEv::Nack(Err(_)) => nack_rx = None,
-                    NackEv::Stream(Ok(rx)) => nack_rx = Some(rx),
-                    NackEv::Stream(Err(e)) => { tracing::debug!("nack stream: {e:#}"); tokio::time::sleep(Duration::from_millis(100)).await; }
-                }
-            }
-            Some(cmd) = cmds.recv() => {
-                match cmd {
-                    CastCommand::SetMode(m) => {
-                        params.mode = m;
-                        ctl.set_mode(m);
-                        enc_tx.send(EncCmd::Mode(m)).ok();
-                        link.send_control(&ControlMessage::SetMode(m)).await?;
+                ev = async {
+                    match nack_rx.as_mut() {
+                        Some(r) => NackEv::Nack(r.recv().await),
+                        None => NackEv::Stream(link.accept_nack_stream().await),
                     }
-                    CastCommand::Stop => break,
-                }
-            }
-            _ = link.closed() => {
-                set_state("reconnecting");
-                tracing::warn!("connection lost, reconnecting");
-                let mut video_alive = true;
-                let channels = ReconnectChannels {
-                    video_rx: &mut video_rx,
-                    audio_rx: &mut audio_rx,
-                    video_alive: &mut video_alive,
-                    audio_alive: &mut audio_alive,
-                };
-                match reconnect_draining(&ep, target.addr, &opts.sender_name, &mut token, channels).await {
-                    Ok(l) => {
-                        link = l;
-                        if !video_alive {
-                            set_state("failed");
-                            stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
-                            bail!("capture thread exited");
-                        }
-                        match link.recv_control().await? {
-                            ControlMessage::HelloAck { .. } => {}
-                            other => bail!("resume failed: {other:?}"),
-                        }
-                        nack_rx = None;
-                        control_errors = 0;
-                        link.send_control(&ControlMessage::StartStream(params.clone())).await?;
-                        enc_tx.send(EncCmd::Keyframe).ok();
-                        set_state("casting");
+                } => {
+                    match ev {
+                        NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now, frame_interval_us) { let _ = link.send_datagram(f); },
+                        NackEv::Nack(Err(_)) => nack_rx = None,
+                        NackEv::Stream(Ok(rx)) => nack_rx = Some(rx),
+                        NackEv::Stream(Err(e)) => { tracing::debug!("nack stream: {e:#}"); tokio::time::sleep(Duration::from_millis(100)).await; }
                     }
-                    Err(e) => { set_state("failed"); enc_tx.send(EncCmd::Stop).ok(); stop_audio.store(true, std::sync::atomic::Ordering::Relaxed); return Err(e); }
+                }
+                Some(cmd) = cmds.recv() => {
+                    match cmd {
+                        CastCommand::SetMode(m) => {
+                            params.mode = m;
+                            ctl.set_mode(m);
+                            enc_tx.send(EncCmd::Mode(m)).ok();
+                            link.send_control(&ControlMessage::SetMode(m)).await?;
+                        }
+                        CastCommand::Stop => break,
+                    }
+                }
+                _ = link.closed() => {
+                    set_state("reconnecting");
+                    tracing::warn!("connection lost, reconnecting");
+                    let mut video_alive = true;
+                    let channels = ReconnectChannels {
+                        video_rx: &mut video_rx,
+                        audio_rx: &mut audio_rx,
+                        video_alive: &mut video_alive,
+                        audio_alive: &mut audio_alive,
+                    };
+                    match reconnect_draining(&ep, target.addr, &opts.sender_name, &mut token, channels).await {
+                        Ok(l) => {
+                            link = l;
+                            open_link = Some(link.clone());
+                            if !video_alive {
+                                bail!("capture thread exited");
+                            }
+                            match link.recv_control().await? {
+                                ControlMessage::HelloAck { .. } => {}
+                                other => bail!("resume failed: {other:?}"),
+                            }
+                            nack_rx = None;
+                            control_errors = 0;
+                            link.send_control(&ControlMessage::StartStream(params.clone())).await?;
+                            enc_tx.send(EncCmd::Keyframe).ok();
+                            set_state("casting");
+                        }
+                        Err(e) => return Err(e),
+                    }
                 }
             }
         }
+        Ok(())
     }
-    let _ = link
-        .send_control(&ControlMessage::Goodbye {
-            reason: "stopped".into(),
-        })
-        .await;
-    // Closing the connection right after queuing the Goodbye can race the
-    // QUIC stream flush and cut it off before the receiver reads it (seen as
-    // "connection lost" on the receiver instead of "goodbye: stopped"). Give
-    // the receiver a moment to read it and close its end first; only force
-    // the close if it doesn't.
-    tokio::select! {
-        _ = link.closed() => {}
-        _ = tokio::time::sleep(Duration::from_millis(500)) => { link.close("stopped"); }
-    }
+    .await;
+
     enc_tx.send(EncCmd::Stop).ok();
     stop_audio.store(true, std::sync::atomic::Ordering::Relaxed);
-    set_state("stopped");
-    Ok(())
+    let reason = if result.is_ok() { "stopped" } else { "failed" };
+    if let Some(link) = open_link {
+        let _ = link
+            .send_control(&ControlMessage::Goodbye {
+                reason: reason.into(),
+            })
+            .await;
+        // Closing the connection right after queuing the Goodbye can race the
+        // QUIC stream flush and cut it off before the receiver reads it (seen as
+        // "connection lost" on the receiver instead of "goodbye: stopped"). Give
+        // the receiver a moment to read it and close its end first; only force
+        // the close if it doesn't.
+        tokio::select! {
+            _ = link.closed() => {}
+            _ = tokio::time::sleep(Duration::from_millis(500)) => { link.close(reason); }
+        }
+    }
+    set_state(reason);
+    result
 }
 
 /// Bundles the capture/audio drain state `reconnect_draining` needs, so the
