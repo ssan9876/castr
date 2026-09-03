@@ -100,6 +100,20 @@ impl Lifecycle {
         }
     }
 
+    /// A different peer arrived while we were holding the screen for someone
+    /// else. The hold is for the peer that was casting, not the first peer to
+    /// arrive back, so give up the hold outright and let the newcomer go
+    /// through ordinary arbitration. Any phase other than `Holding` is
+    /// unaffected.
+    pub fn abandon_hold(&mut self) -> Vec<Action> {
+        if self.phase != Phase::Holding {
+            return Vec::new();
+        }
+        self.phase = Phase::Advertising;
+        self.holding_since = None;
+        vec![Action::ReleaseDisplay, Action::ClearOverlay]
+    }
+
     pub fn tick(&mut self, now: Instant) -> Vec<Action> {
         let Some(since) = self.holding_since else {
             return Vec::new();
@@ -109,7 +123,10 @@ impl Lifecycle {
         }
         self.phase = Phase::Advertising;
         self.holding_since = None;
-        vec![Action::ReleaseDisplay, Action::ClearOverlay]
+        // No `ClearOverlay`: `ReleaseDisplay` alone puts up the "Waiting for
+        // sender" idle text (`SinkOut::Idle`), and `ClearOverlay` means
+        // "blank the overlay entirely", which would immediately erase it.
+        vec![Action::ReleaseDisplay]
     }
 }
 
@@ -159,7 +176,10 @@ mod tests {
         let expired = l.tick(t0 + Duration::from_secs(31));
         assert_eq!(l.phase(), Phase::Advertising);
         assert!(expired.contains(&Action::ReleaseDisplay), "{expired:?}");
-        assert!(expired.contains(&Action::ClearOverlay), "{expired:?}");
+        assert!(
+            !expired.contains(&Action::ClearOverlay),
+            "ReleaseDisplay alone puts up the idle text; ClearOverlay would blank it: {expired:?}"
+        );
     }
 
     #[test]
@@ -211,5 +231,30 @@ mod tests {
         let out = l.on(Event::Ended, Instant::now());
         assert_eq!(l.phase(), Phase::Advertising);
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn abandoning_the_hold_releases_the_display() {
+        let mut l = Lifecycle::new();
+        let t0 = Instant::now();
+        l.on(Event::Connected, t0);
+        l.on(Event::Ended, t0);
+        assert_eq!(l.phase(), Phase::Holding);
+        let out = l.abandon_hold();
+        assert_eq!(l.phase(), Phase::Advertising);
+        assert!(out.contains(&Action::ReleaseDisplay), "{out:?}");
+        assert!(out.contains(&Action::ClearOverlay), "{out:?}");
+    }
+
+    #[test]
+    fn abandoning_a_hold_that_is_not_happening_does_nothing() {
+        let mut l = Lifecycle::new();
+        assert!(l.abandon_hold().is_empty(), "nothing was held: Advertising");
+
+        let t0 = Instant::now();
+        l.on(Event::Connected, t0);
+        assert_eq!(l.phase(), Phase::Streaming);
+        assert!(l.abandon_hold().is_empty(), "nothing was held: Streaming");
+        assert_eq!(l.phase(), Phase::Streaming);
     }
 }

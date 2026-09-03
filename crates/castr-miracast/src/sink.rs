@@ -87,6 +87,8 @@ pub enum SinkOut {
     Ended(String),
     /// The peer vanished but the group and the screen are still theirs.
     Reconnecting,
+    /// The hold expired: the screen is no longer ours.
+    Idle,
 }
 
 enum Cmd {
@@ -253,6 +255,11 @@ fn serve(
     let mut held = false;
     let mut life = lifecycle::Lifecycle::new();
     let mut buf = vec![0u8; 65536];
+    // The MAC of the peer that owns the current session or hold. A different
+    // station connecting or disconnecting must not steal or end it; see
+    // Lifecycle::abandon_hold and the ClientConnected/ClientDisconnected arms
+    // below.
+    let mut session_peer: Option<String> = None;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -290,10 +297,10 @@ fn serve(
                     let _ = out.send(SinkOut::Pin(pin.clone()));
                     if let Err(e) = say(ctrl, &Command::wps_pin(&pin)) {
                         // A control socket that will not take a command is
-                        // not a socket we can trust the group through.
-                        for a in life.on(lifecycle::Event::RadioError, Instant::now()) {
-                            apply_lifecycle(a, arbiter, out, &mut held);
-                        }
+                        // not a socket we can trust the group through. We are
+                        // about to return, ending `serve`, so `session_peer`
+                        // does not need clearing here.
+                        radio_error_releases(&mut life, arbiter, out, &mut held);
                         return Err(e);
                     }
                 }
@@ -303,21 +310,50 @@ fn serve(
                 }
                 Event::ClientConnected { mac } => {
                     peers.remember(&mac);
+                    let mac_lc = mac.to_ascii_lowercase();
+                    let same_peer = session_peer.as_deref() == Some(mac_lc.as_str());
+                    if life.phase() == lifecycle::Phase::Holding && !same_peer {
+                        // The hold is for the peer that was casting, not the
+                        // first peer to arrive back (spec §5): give up the
+                        // hold so this newcomer goes through ordinary
+                        // arbitration instead of inheriting the screen.
+                        tracing::info!(
+                            "miracast: {mac} connected during the hold for a different peer; abandoning the hold"
+                        );
+                        for a in life.abandon_hold() {
+                            apply_lifecycle(a, arbiter, out, &mut held);
+                        }
+                    }
+                    session_peer = Some(mac_lc);
                 }
-                Event::ClientDisconnected { .. } => {
-                    conn = None;
-                    session = None;
-                    let _ = out.send(SinkOut::Ended("peer disconnected".into()));
-                    for a in life.on(lifecycle::Event::Ended, Instant::now()) {
-                        apply_lifecycle(a, arbiter, out, &mut held);
+                Event::ClientDisconnected { mac } => {
+                    let owns = session_peer.as_deref() == Some(mac.to_ascii_lowercase().as_str());
+                    if !owns {
+                        // A different station leaving the group must not end
+                        // our session (spec §5).
+                        tracing::info!(
+                            "miracast: {mac} disconnected but does not own the current session or hold; ignoring"
+                        );
+                    } else {
+                        conn = None;
+                        session = None;
+                        let actions = life.on(lifecycle::Event::Ended, Instant::now());
+                        if actions.is_empty() {
+                            tracing::debug!(
+                                "miracast: peer disconnected event caused no lifecycle transition; not signalling Ended"
+                            );
+                        } else {
+                            let _ = out.send(SinkOut::Ended("peer disconnected".into()));
+                        }
+                        for a in actions {
+                            apply_lifecycle(a, arbiter, out, &mut held);
+                        }
                     }
                 }
                 Event::GroupRemoved { .. } => {
                     // The group going away under us is the one thing we cannot
                     // hold through: everything about it is now invalid.
-                    for a in life.on(lifecycle::Event::RadioError, Instant::now()) {
-                        apply_lifecycle(a, arbiter, out, &mut held);
-                    }
+                    radio_error_releases(&mut life, arbiter, out, &mut held);
                     return Ok(());
                 }
                 Event::GroupStarted { .. } => {}
@@ -420,21 +456,49 @@ fn serve(
         }
 
         if let Some(reason) = ended {
-            tracing::info!("miracast: session ended: {reason}, holding the group");
-            let _ = out.send(SinkOut::Ended(reason));
             conn = None;
             session = None;
             // The group, its credentials and (for now) the screen stay. A peer
             // that dropped for a moment finds everything as it left it.
-            for a in life.on(lifecycle::Event::Ended, Instant::now()) {
+            let actions = life.on(lifecycle::Event::Ended, Instant::now());
+            if actions.is_empty() {
+                tracing::debug!(
+                    "miracast: session end ({reason}) caused no lifecycle transition; not signalling Ended"
+                );
+            } else {
+                tracing::info!("miracast: session ended: {reason}, holding the group");
+                let _ = out.send(SinkOut::Ended(reason));
+            }
+            for a in actions {
                 apply_lifecycle(a, arbiter, out, &mut held);
             }
         }
 
-        for a in life.tick(Instant::now()) {
+        let tick_actions = life.tick(Instant::now());
+        if tick_actions.contains(&lifecycle::Action::ReleaseDisplay) {
+            session_peer = None;
+        }
+        for a in tick_actions {
             apply_lifecycle(a, arbiter, out, &mut held);
         }
     }
+}
+
+/// Fires `Event::RadioError` and applies whatever the lifecycle returns.
+/// Returns whether the display was released, so a caller holding a
+/// `session_peer` knows to clear it.
+fn radio_error_releases(
+    life: &mut lifecycle::Lifecycle,
+    arbiter: &Arc<dyn DisplayArbiterHandle>,
+    out: &mpsc::Sender<SinkOut>,
+    held: &mut bool,
+) -> bool {
+    let actions = life.on(lifecycle::Event::RadioError, Instant::now());
+    let released = actions.contains(&lifecycle::Action::ReleaseDisplay);
+    for a in actions {
+        apply_lifecycle(a, arbiter, out, held);
+    }
+    released
 }
 
 /// Carries out one lifecycle decision. The state machine decides; this does.
@@ -453,6 +517,7 @@ fn apply_lifecycle(
                 arbiter.release();
                 *held = false;
             }
+            let _ = out.send(SinkOut::Idle);
         }
         lifecycle::Action::ShowReconnecting => {
             let _ = out.send(SinkOut::Reconnecting);
