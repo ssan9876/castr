@@ -1,16 +1,70 @@
 //! The only part of the health check that touches Windows. Each probe is
 //! independent and failure-tolerant: a command that errors or prints
-//! something unexpected records a note and leaves its fact `None`. Commands
-//! are run to completion; nothing here imposes a timeout of its own.
+//! something unexpected records a note and leaves its fact `None`. Every
+//! command is given a 10-second deadline: `run` polls the child rather than
+//! blocking on `wait()`, and a command that has not exited by the deadline is
+//! killed and reported as a timeout, so a hung `netsh` or `powershell` (a
+//! stuck WMI service is the realistic trigger) cannot hang collection.
 
 use crate::diagnose::facts::*;
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a single external command is given to finish before it is killed.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the child is polled for exit while waiting for the deadline.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Polls `try_exited` (an analogue of `Child::try_wait().is_ok_and(|s| s.is_some())`)
+/// until it reports the child has exited or `deadline` (measured against
+/// `now`, both injected so this is testable without spawning a real process)
+/// passes. Sleeps `poll_interval` between polls. Returns `true` if the child
+/// exited in time, `false` if the deadline was reached first.
+fn wait_with_deadline(
+    deadline: Duration,
+    poll_interval: Duration,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
+    mut try_exited: impl FnMut() -> bool,
+) -> bool {
+    let start = now();
+    loop {
+        if try_exited() {
+            return true;
+        }
+        if now().duration_since(start) >= deadline {
+            return false;
+        }
+        sleep(poll_interval);
+    }
+}
 
 fn run(program: &str, args: &[&str]) -> Result<String, String> {
-    let out = Command::new(program)
+    let mut child: Child = Command::new(program)
         .args(args)
-        .output()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("could not run {program}: {e}"))?;
+
+    let exited = wait_with_deadline(
+        COMMAND_TIMEOUT,
+        POLL_INTERVAL,
+        Instant::now,
+        std::thread::sleep,
+        || matches!(child.try_wait(), Ok(Some(_))),
+    );
+
+    if !exited {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("{program}: timed out after 10 s"));
+    }
+
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("could not read output of {program}: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(if stderr.is_empty() {
@@ -164,4 +218,77 @@ fn this_year() -> u32 {
         .as_secs();
     let days = (secs / 86_400) as i64;
     year_from_epoch_days(days).max(0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A fake clock: each call to `now()` advances by one `tick` over the
+    /// previous value, so the deadline logic can be exercised without a real
+    /// process or a real sleep.
+    struct FakeClock {
+        current: Cell<Instant>,
+        tick: Duration,
+    }
+
+    impl FakeClock {
+        fn new(tick: Duration) -> Self {
+            FakeClock {
+                current: Cell::new(Instant::now()),
+                tick,
+            }
+        }
+        fn now(&self) -> Instant {
+            let t = self.current.get();
+            self.current.set(t + self.tick);
+            t
+        }
+    }
+
+    #[test]
+    fn returns_true_as_soon_as_the_child_reports_exited() {
+        let clock = FakeClock::new(Duration::from_millis(1));
+        let mut calls = 0;
+        let exited = wait_with_deadline(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            || clock.now(),
+            |_| {},
+            || {
+                calls += 1;
+                calls >= 3
+            },
+        );
+        assert!(exited);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn returns_false_once_the_deadline_passes_without_exit() {
+        let clock = FakeClock::new(Duration::from_millis(3));
+        let exited = wait_with_deadline(
+            Duration::from_millis(10),
+            Duration::from_millis(1),
+            || clock.now(),
+            |_| {},
+            || false,
+        );
+        assert!(!exited);
+    }
+
+    #[test]
+    fn never_sleeps_once_the_child_has_already_exited() {
+        let mut slept = false;
+        let exited = wait_with_deadline(
+            Duration::from_secs(10),
+            Duration::from_millis(50),
+            Instant::now,
+            |_| slept = true,
+            || true,
+        );
+        assert!(exited);
+        assert!(!slept);
+    }
 }

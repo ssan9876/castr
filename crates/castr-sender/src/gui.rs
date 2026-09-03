@@ -3,9 +3,32 @@ use castr_net::ReceiverInfo;
 use castr_proto::Mode;
 use eframe::egui;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, watch};
+
+/// Clears `wifi_running` when dropped, but only if `generation` still matches
+/// the value captured when the worker started. This is the panic-safety net
+/// for "Check my Wi-Fi": whatever happens inside the worker closure (a normal
+/// return, an early return, or a panic caught by `catch_unwind`), this guard
+/// still runs and the button unlocks. It also makes "Close" safe: "Close"
+/// bumps the shared generation counter, so a worker that is still running
+/// when the user closes the panel finds its captured generation stale by the
+/// time it finishes and does not resurrect `wifi_running`.
+struct WifiRunGuard {
+    running: Arc<AtomicBool>,
+    generation: Arc<AtomicU64>,
+    my_generation: u64,
+}
+
+impl Drop for WifiRunGuard {
+    fn drop(&mut self) {
+        if self.generation.load(Ordering::Relaxed) == self.my_generation {
+            self.running.store(false, Ordering::Relaxed);
+        }
+    }
+}
 
 struct Shared {
     receivers: Vec<ReceiverInfo>,
@@ -31,7 +54,12 @@ struct App {
     active: Option<ActiveCast>,
     /// `None` until the check has been run; `Some(text)` afterwards.
     wifi_report: std::sync::Arc<std::sync::Mutex<Option<String>>>,
-    wifi_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    wifi_running: Arc<AtomicBool>,
+    /// Incremented on every "Check my Wi-Fi" click and on every "Close". A
+    /// worker only writes its result if this still matches the value it was
+    /// spawned with, so a stale (closed, or superseded by a fresh click)
+    /// worker's result is discarded instead of reappearing in the panel.
+    wifi_generation: Arc<AtomicU64>,
 }
 
 impl App {
@@ -137,7 +165,7 @@ impl eframe::App for App {
                 }
                 if ui
                     .add_enabled(
-                        !self.wifi_running.load(std::sync::atomic::Ordering::Relaxed),
+                        !self.wifi_running.load(Ordering::Relaxed),
                         egui::Button::new("Check my Wi-Fi"),
                     )
                     .on_hover_text("Looks for the local causes of Miracast disconnects")
@@ -145,18 +173,40 @@ impl eframe::App for App {
                 {
                     let out = self.wifi_report.clone();
                     let running = self.wifi_running.clone();
-                    running.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let generation = self.wifi_generation.clone();
+                    let my_generation = generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    running.store(true, Ordering::Relaxed);
                     std::thread::spawn(move || {
-                        #[cfg(windows)]
-                        let text = {
-                            let facts = crate::diagnose::collect::facts();
-                            let findings = crate::diagnose::rules::analyse(&facts);
-                            crate::diagnose::render::report(&findings, &facts)
+                        // Constructed first so it runs on every exit path,
+                        // including a panic caught below: the button must
+                        // never stay disabled just because the probe code
+                        // broke.
+                        let guard = WifiRunGuard {
+                            running,
+                            generation: generation.clone(),
+                            my_generation,
                         };
-                        #[cfg(not(windows))]
-                        let text = "The Wi-Fi health check is Windows only.".to_string();
-                        *out.lock().unwrap() = Some(text);
-                        running.store(false, std::sync::atomic::Ordering::Relaxed);
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            #[cfg(windows)]
+                            let text = {
+                                let facts = crate::diagnose::collect::facts();
+                                let findings = crate::diagnose::rules::analyse(&facts);
+                                crate::diagnose::render::report(&findings, &facts)
+                            };
+                            #[cfg(not(windows))]
+                            let text = "The Wi-Fi health check is Windows only.".to_string();
+                            text
+                        }));
+                        let text = match result {
+                            Ok(text) => text,
+                            Err(_) => {
+                                "The check failed unexpectedly. Please report this.".to_string()
+                            }
+                        };
+                        if generation.load(Ordering::Relaxed) == my_generation {
+                            *out.lock().unwrap() = Some(text);
+                        }
+                        drop(guard);
                     });
                 }
             });
@@ -181,6 +231,12 @@ impl eframe::App for App {
                     }
                     if ui.button("Close").clicked() {
                         *self.wifi_report.lock().unwrap() = None;
+                        // Discard any in-flight worker's result (it will see
+                        // a stale generation when it finishes) and clear the
+                        // running flag unconditionally, so a hung or
+                        // abandoned check cannot leave the button locked.
+                        self.wifi_generation.fetch_add(1, Ordering::Relaxed);
+                        self.wifi_running.store(false, Ordering::Relaxed);
                     }
                 });
                 egui::ScrollArea::vertical()
@@ -321,7 +377,8 @@ pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
         pairing_pin_input: String::new(),
         active: None,
         wifi_report: Arc::new(Mutex::new(None)),
-        wifi_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        wifi_running: Arc::new(AtomicBool::new(false)),
+        wifi_generation: Arc::new(AtomicU64::new(0)),
     };
     app.scan();
     let options = eframe::NativeOptions {
