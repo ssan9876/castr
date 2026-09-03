@@ -2,16 +2,20 @@
 //! recovery rules, expressed as bytes in and events out. No sockets here, so
 //! the whole media path can be replayed from a recording in a test.
 
+use crate::quality::BitrateLadder;
 use crate::rtp;
 use crate::rtsp::{self, Action, Negotiation, VideoMode};
 use crate::ts::{self, Unit};
 use crate::wfd::Capabilities;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// RTP payload type for MPEG-TS, which is what Wi-Fi Display carries.
 const PT_MP2T: u8 = 33;
 /// Packets held while waiting for a late one.
 const REORDER_WINDOW: usize = 32;
+/// A playing session that hears no media for this long has lost its peer. TCP
+/// will not tell us for minutes, so this is the fastest signal we have.
+const MEDIA_SILENCE: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum SinkEvent {
@@ -37,6 +41,10 @@ pub struct Session {
     playing: bool,
     /// Loss seen since the last keyframe request, so a gap can trigger one.
     lost_at_last_check: u64,
+    ladder: BitrateLadder,
+    /// When media last arrived. `None` until the first datagram, because the
+    /// gap between PLAY and the first frame is the source starting its encoder.
+    last_media: Option<Instant>,
 }
 
 impl Session {
@@ -48,6 +56,8 @@ impl Session {
             demux: ts::Demux::new(),
             playing: false,
             lost_at_last_check: 0,
+            ladder: BitrateLadder::new(),
+            last_media: None,
         }
     }
 
@@ -94,6 +104,7 @@ impl Session {
         if packet.payload_type != PT_MP2T {
             return Vec::new();
         }
+        self.last_media = Some(now);
         let mut out = Vec::new();
         for p in self.reorder.push(packet) {
             for chunk in p.payload.chunks(ts::PACKET_LEN) {
@@ -113,13 +124,36 @@ impl Session {
             let actions = self.negotiation.request_idr(now);
             self.apply(actions, &mut out);
         }
+        // Sustained loss is a different problem from a damaged frame: the link
+        // cannot carry what the source is sending, so ask it for less.
+        if let Some(kbps) = self.ladder.sample(lost, now) {
+            tracing::info!("miracast: loss is up, asking the source for {kbps} kbps");
+            let actions = self.negotiation.request_bitrate(kbps, now);
+            self.apply(actions, &mut out);
+        }
         out
     }
 
     /// Time-driven work: keep-alives and the silence timeout.
     pub fn tick(&mut self, now: Instant) -> Vec<SinkEvent> {
-        let actions = self.negotiation.tick(now);
         let mut out = Vec::new();
+        if self.playing
+            && self
+                .last_media
+                .is_some_and(|t| now.saturating_duration_since(t) > MEDIA_SILENCE)
+        {
+            self.playing = false;
+            out.push(SinkEvent::Ended("no media for 2 s"));
+            return out;
+        }
+        // The ladder is sampled here too, so a link that goes quiet rather
+        // than lossy still gets a chance to climb back up.
+        let lost = self.reorder.lost() + self.demux.stats().continuity_errors;
+        if let Some(kbps) = self.ladder.sample(lost, now) {
+            let actions = self.negotiation.request_bitrate(kbps, now);
+            self.apply(actions, &mut out);
+        }
+        let actions = self.negotiation.tick(now);
         self.apply(actions, &mut out);
         out
     }
@@ -266,6 +300,61 @@ mod tests {
         let mut rtp = vec![0x80, 33, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0];
         rtp.extend_from_slice(&[0x47; 188]);
         assert!(s.on_rtp_datagram(&rtp).is_empty());
+    }
+
+    #[test]
+    fn sustained_loss_asks_the_source_for_less() {
+        let mut s = sess();
+        drive_to_playing(&mut s);
+        let t0 = Instant::now();
+        // A recorded stream with a third of its datagrams thrown away: the
+        // reorder window counts the gaps as loss.
+        let mut n = 0;
+        for datagram in test_support::recorded_stream(60) {
+            n += 1;
+            if n % 3 == 0 {
+                continue;
+            }
+            s.on_rtp_datagram_at(&datagram, t0);
+        }
+        let out = s.tick(t0 + Duration::from_secs(1));
+        let asked = sent(&out)
+            .iter()
+            .any(|m| m.contains("microsoft_max_bitrate: 2000"));
+        assert!(asked, "{:?}", sent(&out));
+    }
+
+    #[test]
+    fn two_seconds_without_media_ends_the_session() {
+        let mut s = sess();
+        drive_to_playing(&mut s);
+        let t0 = Instant::now();
+        for datagram in test_support::recorded_stream(4) {
+            s.on_rtp_datagram_at(&datagram, t0);
+        }
+        let quiet = s.tick(t0 + Duration::from_millis(1500));
+        assert!(
+            !quiet.iter().any(|e| matches!(e, SinkEvent::Ended(_))),
+            "1.5 s is a hiccup, not a departure: {quiet:?}"
+        );
+        let gone = s.tick(t0 + Duration::from_millis(2500));
+        assert!(
+            gone.iter().any(|e| matches!(e, SinkEvent::Ended(r) if r.contains("no media"))),
+            "{gone:?}"
+        );
+    }
+
+    #[test]
+    fn silence_before_any_media_is_not_a_departure() {
+        // The gap between PLAY and the first datagram is the source starting its
+        // encoder, which takes longer than two seconds on a cold start.
+        let mut s = sess();
+        drive_to_playing(&mut s);
+        let out = s.tick(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !out.iter().any(|e| matches!(e, SinkEvent::Ended(_))),
+            "{out:?}"
+        );
     }
 
     #[test]

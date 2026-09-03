@@ -570,6 +570,22 @@ impl Negotiation {
         out
     }
 
+    /// Asks the source to cap its bitrate. This is a request: the source may
+    /// ignore it, which is why the sink never assumes the rate actually fell.
+    pub fn request_bitrate(&mut self, kbps: u32, _now: Instant) -> Vec<Action> {
+        if !matches!(self.state, NegState::Playing) {
+            return Vec::new();
+        }
+        let c = self.cseq();
+        let uri = self.uri();
+        let body = format!("microsoft_max_bitrate: {kbps}\r\n");
+        let mut m = request("SET_PARAMETER", &uri, c, &body);
+        if let Some(s) = &self.peer_session {
+            m.headers.push(("Session".into(), s.clone()));
+        }
+        vec![Action::Send(m)]
+    }
+
     /// Asks the source for a fresh keyframe, at most once per 500 ms.
     pub fn request_idr(&mut self, now: Instant) -> Vec<Action> {
         if self
@@ -849,6 +865,19 @@ mod negotiation_tests {
             dead.iter().any(|a| matches!(a, Action::Teardown(_))),
             "{dead:?}"
         );
+    }
+
+    #[test]
+    fn a_bitrate_request_names_the_ceiling_and_the_session() {
+        let mut n = playing();
+        let out = n.request_bitrate(2000, Instant::now());
+        let Some(Action::Send(m)) = out.into_iter().next() else {
+            panic!("no message");
+        };
+        let text = m.format();
+        assert!(text.starts_with("SET_PARAMETER "), "{text}");
+        assert!(text.contains("microsoft_max_bitrate: 2000\r\n"), "{text}");
+        assert!(text.contains("Session: "), "the source needs to know which session: {text}");
     }
 
     #[test]
