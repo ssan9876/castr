@@ -29,6 +29,9 @@ struct App {
     mode: Mode,
     pairing_pin_input: String,
     active: Option<ActiveCast>,
+    /// `None` until the check has been run; `Some(text)` afterwards.
+    wifi_report: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    wifi_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl App {
@@ -132,6 +135,30 @@ impl eframe::App for App {
                 if scanning {
                     ui.spinner();
                 }
+                if ui
+                    .add_enabled(
+                        !self.wifi_running.load(std::sync::atomic::Ordering::Relaxed),
+                        egui::Button::new("Check my Wi-Fi"),
+                    )
+                    .on_hover_text("Looks for the local causes of Miracast disconnects")
+                    .clicked()
+                {
+                    let out = self.wifi_report.clone();
+                    let running = self.wifi_running.clone();
+                    running.store(true, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::spawn(move || {
+                        #[cfg(windows)]
+                        let text = {
+                            let facts = crate::diagnose::collect::facts();
+                            let findings = crate::diagnose::rules::analyse(&facts);
+                            crate::diagnose::render::report(&findings, &facts)
+                        };
+                        #[cfg(not(windows))]
+                        let text = "The Wi-Fi health check is Windows only.".to_string();
+                        *out.lock().unwrap() = Some(text);
+                        running.store(false, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
             });
             ui.separator();
             for (i, r) in receivers.iter().enumerate() {
@@ -143,6 +170,24 @@ impl eframe::App for App {
             }
             if receivers.is_empty() && !scanning {
                 ui.label("No receivers found. Is the receiver running on this network?");
+            }
+            let report = self.wifi_report.lock().unwrap().clone();
+            if let Some(text) = report {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.heading("Wi-Fi health");
+                    if ui.button("Copy").clicked() {
+                        ui.output_mut(|o| o.copied_text = text.clone());
+                    }
+                    if ui.button("Close").clicked() {
+                        *self.wifi_report.lock().unwrap() = None;
+                    }
+                });
+                egui::ScrollArea::vertical()
+                    .max_height(260.0)
+                    .show(ui, |ui| {
+                        ui.monospace(text);
+                    });
             }
             ui.separator();
             ui.horizontal(|ui| {
@@ -275,6 +320,8 @@ pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
         mode: Mode::Game,
         pairing_pin_input: String::new(),
         active: None,
+        wifi_report: Arc::new(Mutex::new(None)),
+        wifi_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     app.scan();
     let options = eframe::NativeOptions {

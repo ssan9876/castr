@@ -57,6 +57,26 @@ castr-sender cast "living room" [--mode game|quality] [--fps 30|60] [--max-bitra
 `--duration N` stops the cast automatically after N seconds; it exists mainly
 for testing and smoke runs. Ctrl-C stops a cast cleanly otherwise.
 
+### Wi-Fi health check
+
+Miracast drops are usually caused by the sending machine, not the display.
+
+```
+castr-sender diagnose         # report only
+castr-sender diagnose --fix   # offers each safe fix, prompting for every one
+```
+
+It checks whether the graphics and Wi-Fi drivers support wireless display, how
+old the driver is, whether the adapter shares one antenna with Bluetooth,
+whether the station link is on a different band from the sink, the signal
+strength, and the three power settings that park a radio mid-session. The three
+power settings are the only things it will change, always after a prompt, and
+it prints the command to undo each one before applying it. It never touches
+driver settings and never disables Bluetooth.
+
+It cannot change how Windows implements Miracast, which lives in the operating
+system. For your own machines, castr's own protocol avoids the radio entirely.
+
 ### Where state lives
 
 Certificates, keys, and the paired-peer list live under the platform config
