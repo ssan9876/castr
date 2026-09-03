@@ -6,7 +6,11 @@
 //! real machine. `collect` and `fix` are the only parts that touch Windows.
 
 pub mod facts;
+pub mod rules;
 
-// Later tasks (`rules`, `render`) consume `Facts` through this re-export.
+// Later tasks (`render`) consume `Facts`, `Finding`, and `Severity` through
+// these re-exports.
 #[allow(unused_imports)]
 pub use facts::Facts;
+#[allow(unused_imports)]
+pub use rules::{Finding, Severity};
