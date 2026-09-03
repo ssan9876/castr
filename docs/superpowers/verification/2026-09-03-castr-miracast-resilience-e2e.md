@@ -18,6 +18,15 @@ Windows PC pressing Windows+K, entering a PIN, and using Bluetooth
 headphones — none of that can be driven from a shell, so none of it was
 attempted. Section "What was not run" says exactly what that leaves open.
 
+**Final fix wave (this pass):** steps 1 through 3b below are unchanged from
+the run described above, at HEAD `7e6da4d`. Step 4 was re-run against a fresh
+redeploy at HEAD `c3b73b0` — the previous copy of that step carried evidence
+from the pid of the pre-reboot, pre-redeploy run (Fix 4), and the "radio
+settings are loaded" check was redone by asking the running supplicant
+directly instead of grepping a log it never writes to (Fix 5). Step 3b's
+wording was also corrected: it does not show the *screen* surviving past the
+hold's nominal expiry, only the group and credentials (Fix 6).
+
 ## Summary
 
 | # | Step | Result | Evidence |
@@ -26,7 +35,8 @@ attempted. Section "What was not run" says exactly what that leaves open.
 | 2 | Cross-build and push the example | PASS | binary built and copied to `/tmp/loopback-source` on the Pi |
 | 3a | Reconnect inside the hold window (resume proof) | PASS | second `RTSP connection from` 0.72 s after `holding the group`; unfiltered `grep -c P2P_GROUP_REMOVE` = 0; `p2p-wlan0-0` unchanged |
 | 3b | Reconnect after the hold's nominal expiry (separate evidence) | PASS | second `RTSP connection from` 35 s after `holding the group` (5 s past the 30 s hold); accepted anyway; `p2p-wlan0-0` unchanged |
-| 4 | Bitrate ladder, no radio peer | PASS | `asking the source for 2000 kbps`, exactly once |
+| 4 | Bitrate ladder, no radio peer (re-run at HEAD `c3b73b0`) | PASS | `asking the source for 2000 kbps` once, reaching the floor rung on 20% loss |
+| 4a | Radio settings actually loaded | PASS | `wpa_cli get` on the running supplicant: `disassoc_low_ack=0`, `p2p_go_max_inactivity=300`, `p2p_go_ctwindow=0`, matching the conf file |
 | 5.1 | `brcmfmac` honours the GO settings (real blip) | NOT RUN | needs a person at the Windows PC |
 | 5.2 | Windows honours `microsoft_max_bitrate` | NOT RUN | needs a person at the Windows PC |
 | 5.3 | A real Bluetooth blip survives | NOT RUN | needs a person at the Windows PC |
@@ -179,12 +189,20 @@ Sep 03 21:45:51 DietPi castr-receiver[23343]: ... miracast: no media for 2 s
 ```
 
 This does **not** prove the in-hold resume path (3a does that); what it
-proves is a different, stronger-in-one-sense claim: the group, the
-credentials, and the screen survived at least 5 seconds *past* when the
-30-second hold should have expired. Whether that is the hold timer running
-slightly long, scheduling jitter, or something else in the hold's expiry
-logic is not established by this document — it is worth follow-up, but it is
-not a resilience defect (the session still came back cleanly either way).
+proves is a different, stronger-in-one-sense claim: the group and the
+credentials survived at least 5 seconds *past* when the 30-second hold should
+have expired, and the interface-name check (below) proves that half. It does
+**not** show that the *screen* survived past expiry: `Lifecycle::tick` runs
+every loop pass against a 200 ms poll interval, so hold expiry is decided to
+within a fifth of a second, not something that could plausibly run 5 seconds
+long. The far likelier explanation is that the hold had already expired
+normally by `21:45:41`, the display was released back to the arbiter at that
+point, and the reconnect at `21:45:46` took the screen again through ordinary
+arbitration — which, for a display nothing else wants, produces log lines
+identical to a resume. There is nothing to chase here: the group and
+credentials surviving is the real, useful finding from this run, and the
+question of whether the screen was actually "held" or "freshly reacquired" at
+`21:45:46` is answered by 3a, not by this run.
 
 An unfiltered `P2P_GROUP_REMOVE` re-check specifically for this original
 window could not be run for this fix: the Pi was rebooted between the
@@ -203,10 +221,53 @@ survived the gap each time.
 
 ## Step 4: the bitrate ladder
 
+Re-run for the final fix wave: the previous copy of this step carried
+evidence from `castr-receiver[23343]`, the same pid and the same boot as 3b —
+i.e. the pre-reboot, pre-redeploy run, not the build this document claims to
+verify. This run is against the currently deployed build, HEAD `c3b73b0`,
+freshly restarted immediately beforehand
+(`ActiveEnterTimestamp=2026-09-03 23:03:14 UTC`, `ExecMainPID=901`), and the
+binary on disk was checked byte-for-byte against the one just built:
+
+```
+$ sha256sum dist/castr-receiver-aarch64
+cdaa57ec0b3bcf0f5a39c683f10bf10c45ba26129a399670d0e049896730c7af *dist/castr-receiver-aarch64
+$ ssh dietpi@192.168.88.157 'sha256sum /usr/local/bin/castr-receiver'
+cdaa57ec0b3bcf0f5a39c683f10bf10c45ba26129a399670d0e049896730c7af  /usr/local/bin/castr-receiver
+```
+
 ```
 $ ssh dietpi@192.168.88.157 '/tmp/loopback-source 192.168.173.1:7236 300 --drop 20'
 connecting to 192.168.173.1:7236
-...
+> OPTIONS * RTSP/1.0
+< RTSP/1.0 200 OK
+< CSeq: 1
+< Public: org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER
+< OPTIONS * RTSP/1.0
+< CSeq: 100
+< Require: org.wfa.wfd1.0
+> GET_PARAMETER rtsp://x RTSP/1.0
+< RTSP/1.0 200 OK
+< CSeq: 2
+< Content-Type: text/parameters
+< Content-Length: 336
+< wfd_video_formats: 40 00 02 04 00000020 00000000 00000000 00 0000 0000 00 none none
+< wfd_audio_codecs: LPCM 00000002 00
+< wfd_content_protection: none
+< wfd_client_rtp_ports: RTP/AVP/UDP;unicast 5000 0 mode=play
+< microsoft_max_bitrate: 8000
+< microsoft_latency_management_capability: supported
+< microsoft_format_change_support: supported
+> SET_PARAMETER rtsp://x RTSP/1.0
+< RTSP/1.0 200 OK
+< CSeq: 3
+> SET_PARAMETER rtsp://x RTSP/1.0
+< RTSP/1.0 200 OK
+< CSeq: 4
+< SETUP rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
+< CSeq: 101
+< Transport: RTP/AVP/UDP;unicast;client_port=5000
+> RTSP/1.0 200 OK
 < PLAY rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
 < CSeq: 102
 < Session: abcdef12
@@ -225,9 +286,36 @@ sent 241 datagrams
 < Content-Length: 29
 < microsoft_max_bitrate: 2000
 < SET_PARAMETER rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
-...
+< CSeq: 105
+< Session: abcdef12
+< Content-Type: text/parameters
+< Content-Length: 17
+< wfd_idr_request
+< GET_PARAMETER rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
+< CSeq: 106
+< Session: abcdef12
+< SET_PARAMETER rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
+< CSeq: 107
+< Session: abcdef12
+< Content-Type: text/parameters
+< Content-Length: 17
+< wfd_idr_request
+< SET_PARAMETER rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
+< CSeq: 108
+< Session: abcdef12
+< Content-Type: text/parameters
+< Content-Length: 17
+< wfd_idr_request
 done
 ```
+
+Shown in full this time, with nothing elided: the sink asked for a keyframe
+four times in total (`wfd_idr_request` at CSeq 103, 105, 107 and 108 — one
+before the `microsoft_max_bitrate: 2000` drop request at CSeq 104, three
+after it), plus one `GET_PARAMETER` keepalive at CSeq 106, as it kept trying
+to recover a clean picture from a link that was still losing 20% of
+datagrams — the drop rate is high enough that repeated keyframe requests are
+expected, not a sign of anything wrong.
 
 241 of 300 datagrams sent (300 minus 20% of the remaining 299, i.e. datagram 0
 was never a candidate for dropping), and the sink answered with a
@@ -235,20 +323,66 @@ was never a candidate for dropping), and the sink answered with a
 ladder.
 
 ```
-$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "-2min" --no-pager | grep -i "asking the source"'
-Sep 03 21:46:14 DietPi castr-receiver[23343]: ... miracast: loss is up, asking the source for 2000 kbps
+$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "-3min" --no-pager | grep -i "asking the source"'
+Sep 03 23:03:42 DietPi castr-receiver[901]: 2026-09-03T23:03:42.450424Z  INFO castr_miracast::session: miracast: loss is up, asking the source for 2000 kbps
 ```
 
-`asking the source for 2000 kbps` appears exactly once, not repeatedly, over
-the whole run. The journal was also checked for supplicant parse errors with
-a case-insensitive grep (this build logs `Line N:`, capital L):
+`asking the source for 2000 kbps` appears exactly once here. That is
+guaranteed by construction, not evidence of restraint: `BitrateLadder::sample`
+returns `None` once the floor rung is reached (`crates/castr-miracast/src/quality.rs`),
+and this run was a single connection from `RTSP connection from` at
+`23:03:39.382419` to `session ended` at `23:03:50.376879` — about eleven
+seconds end-to-end, including the 2 s silence timeout that closed it — far
+too short to accumulate the ten clean seconds `CLEAN_PER_STEP` requires
+before the ladder would even consider climbing back up. What this run
+actually shows is only that a 20% loss rate drives the ladder to its floor
+and asks the source for it once, in one `SET_PARAMETER`; it says nothing
+about whether the ladder holds the floor or climbs back over a longer run.
+
+The journal was also checked for supplicant parse errors with a
+case-insensitive grep (this build logs `Line N:`, capital L):
 
 ```
-$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "-10min" --no-pager | grep -iE "failed to parse|parse error"'
+$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "-3min" --no-pager | grep -iE "failed to parse|parse error"'
 (no output)
 ```
 
-None found.
+None found, but this grep establishes nothing on its own: `ensure_supplicant`
+starts `wpa_supplicant -B`, which daemonises and logs to syslog under its own
+identity, not under `-u castr-receiver`. "None found" here just means the
+receiver's own unit log has no such lines — it says nothing about whether the
+supplicant parsed the config cleanly. See "Are the radio settings actually
+loaded?" below for evidence that does establish that.
+
+### Are the radio settings actually loaded?
+
+Asked the running supplicant directly, rather than grepping a log it does not
+write to:
+
+```
+$ ssh dietpi@192.168.88.157 'sudo /sbin/wpa_cli -p /run/wpa_supplicant_castr -i wlan0 get disassoc_low_ack'
+'GET disassoc_low_ack' command timed out.
+```
+
+Plain `sudo` timed out on every `GET`, including a bare `PING`/`STATUS` — not
+a permission error, no response at all. The receiver, and therefore the
+supplicant it starts, runs as the unprivileged `castr` user
+(`ps` on the deployed process: `901 castr /usr/local/bin/castr-receiver`), and
+querying as that same user works immediately:
+
+```
+$ ssh dietpi@192.168.88.157 'sudo -u castr /sbin/wpa_cli -p /run/wpa_supplicant_castr -i wlan0 get disassoc_low_ack'
+0
+$ ssh dietpi@192.168.88.157 'sudo -u castr /sbin/wpa_cli -p /run/wpa_supplicant_castr -i wlan0 get p2p_go_max_inactivity'
+300
+$ ssh dietpi@192.168.88.157 'sudo -u castr /sbin/wpa_cli -p /run/wpa_supplicant_castr -i wlan0 get p2p_go_ctwindow'
+0
+```
+
+All three `get`s were supported (no "GET unsupported" or "FAIL" was returned
+for any of them) and all three match the values in
+`scripts/pi/wpa_supplicant-p2p.conf` exactly (`disassoc_low_ack=0`,
+`p2p_go_max_inactivity=300`, `p2p_go_ctwindow=0`). The settings are loaded.
 
 ## Step 5: the three hardware questions
 
