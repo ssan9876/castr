@@ -306,7 +306,10 @@ fn serve(
                 }
                 Event::WpsSuccess => {}
                 Event::WpsFail => {
-                    let _ = out.send(SinkOut::Ended("pairing failed".into()));
+                    // A failed enrolment is not a session ending: nothing was streaming, and
+                    // telling the receiver otherwise would flush a buffer that may belong to
+                    // the other protocol.
+                    tracing::info!("miracast: pairing failed");
                 }
                 Event::ClientConnected { mac } => {
                     peers.remember(&mac);

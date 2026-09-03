@@ -111,7 +111,10 @@ impl Lifecycle {
         }
         self.phase = Phase::Advertising;
         self.holding_since = None;
-        vec![Action::ReleaseDisplay, Action::ClearOverlay]
+        // No `ClearOverlay`: `ReleaseDisplay` alone puts up the "Waiting for
+        // sender" idle text (`SinkOut::Idle`), and `ClearOverlay` means
+        // "blank the overlay entirely", which would immediately erase it.
+        vec![Action::ReleaseDisplay]
     }
 
     pub fn tick(&mut self, now: Instant) -> Vec<Action> {
@@ -243,7 +246,10 @@ mod tests {
         let out = l.abandon_hold();
         assert_eq!(l.phase(), Phase::Advertising);
         assert!(out.contains(&Action::ReleaseDisplay), "{out:?}");
-        assert!(out.contains(&Action::ClearOverlay), "{out:?}");
+        assert!(
+            !out.contains(&Action::ClearOverlay),
+            "ReleaseDisplay alone puts up the idle text; ClearOverlay would blank it: {out:?}"
+        );
     }
 
     #[test]
