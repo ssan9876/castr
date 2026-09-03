@@ -156,20 +156,25 @@ pub fn analyse(facts: &Facts) -> Vec<Finding> {
             "Adapters that share one antenna with Bluetooth drop Miracast sessions more often.",
         ),
         Some(d) => match (is_single_antenna_combo(&d.name), facts.bluetooth_active) {
-            (true, true) => Finding {
+            (true, Some(true)) => Finding {
                 check: "Shared Wi-Fi and Bluetooth antenna",
                 severity: Severity::Warn,
                 found: "this adapter shares one antenna between Wi-Fi and Bluetooth, and Bluetooth is active".into(),
                 why: "A Miracast session and Bluetooth traffic then take turns on one antenna, which is a leading cause of mid-cast drops. Turning Bluetooth off during a cast is a reliable test.",
                 fix: None,
             },
-            (true, false) => Finding {
+            (true, Some(false)) => Finding {
                 check: "Shared Wi-Fi and Bluetooth antenna",
                 severity: Severity::Info,
                 found: "this adapter shares one antenna with Bluetooth, but no Bluetooth device is active".into(),
                 why: "Nothing is competing for the antenna right now.",
                 fix: None,
             },
+            (true, None) => unknown(
+                "Shared Wi-Fi and Bluetooth antenna",
+                facts,
+                "Adapters that share one antenna with Bluetooth drop Miracast sessions more often.",
+            ),
             (false, _) => Finding {
                 check: "Shared Wi-Fi and Bluetooth antenna",
                 severity: Severity::Ok,
@@ -305,28 +310,33 @@ pub fn analyse(facts: &Facts) -> Vec<Finding> {
     });
 
     out.push(match (facts.adapter_is_usb, facts.usb_suspend) {
-        (false, _) => Finding {
+        (None, _) => unknown(
+            "USB selective suspend",
+            facts,
+            "USB selective suspend only affects adapters on the USB bus, and this machine's probe for that could not tell us which bus the adapter is on.",
+        ),
+        (Some(false), _) => Finding {
             check: "USB selective suspend",
             severity: Severity::Info,
             found: "not a USB adapter".into(),
             why: "USB selective suspend only affects adapters on the USB bus.",
             fix: None,
         },
-        (true, Some(p)) if p.ac == 0 && p.dc == 0 => Finding {
+        (Some(true), Some(p)) if p.ac == 0 && p.dc == 0 => Finding {
             check: "USB selective suspend",
             severity: Severity::Ok,
             found: "disabled on mains and on battery".into(),
             why: "Suspending a USB Wi-Fi adapter mid-cast drops the session.",
             fix: None,
         },
-        (true, Some(_)) => Finding {
+        (Some(true), Some(_)) => Finding {
             check: "USB selective suspend",
             severity: Severity::Warn,
             found: "enabled for USB devices".into(),
             why: "Suspending a USB Wi-Fi adapter mid-cast drops the session.",
             fix: Some(FixId::UsbSelectiveSuspend),
         },
-        (true, None) => unknown(
+        (Some(true), None) => unknown(
             "USB selective suspend",
             facts,
             "Suspending a USB Wi-Fi adapter mid-cast drops the session.",
@@ -376,8 +386,8 @@ mod tests {
             wifi_power: Some(PowerSetting { ac: 0, dc: 0 }),
             usb_suspend: Some(PowerSetting { ac: 1, dc: 1 }),
             allow_power_off: Some(false),
-            bluetooth_active: false,
-            adapter_is_usb: false,
+            bluetooth_active: Some(false),
+            adapter_is_usb: Some(false),
             elevated: false,
             this_year: 2026,
             sink_band_ghz: 2.4,
@@ -453,11 +463,23 @@ mod tests {
             find(&analyse(&f), "Shared Wi-Fi and Bluetooth antenna").severity,
             Severity::Info
         );
-        f.bluetooth_active = true;
+        f.bluetooth_active = Some(true);
         let fs = analyse(&f);
         assert_eq!(
             find(&fs, "Shared Wi-Fi and Bluetooth antenna").severity,
             Severity::Warn
+        );
+    }
+
+    #[test]
+    fn a_combo_chip_with_an_unreadable_bluetooth_probe_is_unknown() {
+        let mut f = base();
+        f.driver.as_mut().unwrap().name = "Realtek 8821CE Wireless LAN 802.11ac PCI-E NIC".into();
+        f.bluetooth_active = None;
+        let fs = analyse(&f);
+        assert_eq!(
+            find(&fs, "Shared Wi-Fi and Bluetooth antenna").severity,
+            Severity::Unknown
         );
     }
 
@@ -572,11 +594,22 @@ mod tests {
             find(&analyse(&f), "USB selective suspend").severity,
             Severity::Info
         );
-        f.adapter_is_usb = true;
+        f.adapter_is_usb = Some(true);
         let fs = analyse(&f);
         let w = find(&fs, "USB selective suspend");
         assert_eq!(w.severity, Severity::Warn);
         assert_eq!(w.fix, Some(FixId::UsbSelectiveSuspend));
+    }
+
+    #[test]
+    fn an_unreadable_usb_bus_probe_is_unknown_not_a_confident_no() {
+        let mut f = base();
+        f.adapter_is_usb = None;
+        let fs = analyse(&f);
+        assert_eq!(
+            find(&fs, "USB selective suspend").severity,
+            Severity::Unknown
+        );
     }
 
     #[test]

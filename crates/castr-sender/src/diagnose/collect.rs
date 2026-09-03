@@ -1,6 +1,7 @@
 //! The only part of the health check that touches Windows. Each probe is
-//! independent and failure-tolerant: a command that errors, times out or
-//! prints something unexpected records a note and leaves its fact `None`.
+//! independent and failure-tolerant: a command that errors or prints
+//! something unexpected records a note and leaves its fact `None`. Commands
+//! are run to completion; nothing here imposes a timeout of its own.
 
 use crate::diagnose::facts::*;
 use std::process::Command;
@@ -10,8 +11,13 @@ fn run(program: &str, args: &[&str]) -> Result<String, String> {
         .args(args)
         .output()
         .map_err(|e| format!("could not run {program}: {e}"))?;
-    if !out.status.success() && out.stdout.is_empty() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            stderr
+        });
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -22,6 +28,15 @@ fn powershell(script: &str) -> Result<String, String> {
         &["-NoProfile", "-NonInteractive", "-Command", script],
     )
     .map(|s| s.trim().to_string())
+    .map_err(|e| clean_powershell_error(&e))
+}
+
+/// PowerShell errors print the message, then `At line:1 char:N`, the offending
+/// line, a caret block and a `CategoryInfo`/`FullyQualifiedErrorId` footer.
+/// Only the first line is fit to show inline in a report; the rest is noise
+/// once we already know which command produced it.
+fn clean_powershell_error(e: &str) -> String {
+    e.lines().next().unwrap_or(e).trim().to_string()
 }
 
 pub fn facts() -> Facts {
@@ -32,23 +47,42 @@ pub fn facts() -> Facts {
     };
 
     match run("netsh", &["wlan", "show", "driver"]) {
-        Ok(text) => f.driver = parse_wlan_driver(&text),
+        Ok(text) => {
+            f.driver = parse_wlan_driver(&text);
+            if f.driver.is_none() {
+                f.notes.push((
+                    "Driver age".into(),
+                    "no wireless adapter was reported by netsh".into(),
+                ));
+            }
+        }
         Err(e) => {
             f.notes.push(("Wireless display support".into(), e.clone()));
+            f.notes.push(("Driver age".into(), e.clone()));
             f.notes
                 .push(("Shared Wi-Fi and Bluetooth antenna".into(), e));
         }
     }
-    if f.driver.is_none() {
-        f.notes.push((
-            "Driver age".into(),
-            "no wireless adapter was reported by netsh".into(),
-        ));
-    }
 
     match run("netsh", &["wlan", "show", "interfaces"]) {
-        Ok(text) => f.interface = parse_wlan_interface(&text),
-        Err(e) => f.notes.push(("Station band vs sink band".into(), e)),
+        Ok(text) => {
+            f.interface = parse_wlan_interface(&text);
+            if f.interface.is_none() {
+                f.notes.push((
+                    "Station band vs sink band".into(),
+                    "no wireless interface was reported by netsh".into(),
+                ));
+                f.notes.push((
+                    "Signal strength".into(),
+                    "no wireless interface was reported by netsh".into(),
+                ));
+            }
+        }
+        Err(e) => {
+            f.notes
+                .push(("Station band vs sink band".into(), e.clone()));
+            f.notes.push(("Signal strength".into(), e));
+        }
     }
 
     f.wifi_power = powercfg_query(SUB_WIFI);
@@ -65,9 +99,10 @@ pub fn facts() -> Facts {
         .map(|i| i.name.clone())
         .or_else(|| f.driver.as_ref().map(|d| d.interface.clone()))
         .unwrap_or_else(|| "Wi-Fi".into());
+    let quoted_name = ps_quote(&name);
 
     match powershell(&format!(
-        "(Get-NetAdapterPowerManagement -Name '{name}' -ErrorAction Stop).AllowComputerToTurnOffDevice"
+        "(Get-NetAdapterPowerManagement -Name {quoted_name} -ErrorAction Stop).AllowComputerToTurnOffDevice"
     )) {
         Ok(s) => match s.to_ascii_lowercase().as_str() {
             "enabled" => f.allow_power_off = Some(true),
@@ -80,22 +115,28 @@ pub fn facts() -> Facts {
         Err(e) => f.notes.push(("Adapter power-off permission".into(), e)),
     }
 
-    f.adapter_is_usb = powershell(&format!(
-        "(Get-NetAdapter -Name '{name}' -ErrorAction SilentlyContinue).PnPDeviceID"
-    ))
-    .map(|id| id.to_ascii_uppercase().starts_with("USB"))
-    .unwrap_or(false);
-    if f.adapter_is_usb {
+    match powershell(&format!(
+        "(Get-NetAdapter -Name {quoted_name} -ErrorAction Stop).PnPDeviceID"
+    )) {
+        Ok(id) => f.adapter_is_usb = Some(id.to_ascii_uppercase().starts_with("USB")),
+        Err(e) => f.notes.push(("USB selective suspend".into(), e)),
+    }
+    if f.adapter_is_usb == Some(true) {
         f.usb_suspend = powercfg_query(SUB_USB);
     }
 
-    f.bluetooth_active = powershell(
-        "@(Get-PnpDevice -Class Bluetooth -Status OK -ErrorAction SilentlyContinue).Count",
-    )
-    .ok()
-    .and_then(|s| s.trim().parse::<u32>().ok())
-    .map(|n| n > 0)
-    .unwrap_or(false);
+    match powershell("@(Get-PnpDevice -Class Bluetooth -Status OK -ErrorAction Stop).Count") {
+        Ok(s) => match s.trim().parse::<u32>() {
+            Ok(n) => f.bluetooth_active = Some(n > 0),
+            Err(_) => f.notes.push((
+                "Shared Wi-Fi and Bluetooth antenna".into(),
+                format!("unexpected value from the Bluetooth device count: {s:?}"),
+            )),
+        },
+        Err(e) => f
+            .notes
+            .push(("Shared Wi-Fi and Bluetooth antenna".into(), e)),
+    }
 
     f.elevated = powershell(
         "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
@@ -113,10 +154,14 @@ fn powercfg_query(subgroup: &str) -> Option<PowerSetting> {
         .and_then(parse_powercfg_indices)
 }
 
-/// Year from the system clock, without pulling in a date crate.
+/// Current year, computed from the system clock without launching a process
+/// or a date crate: days since the Unix epoch, converted to a civil date.
 fn this_year() -> u32 {
-    powershell("(Get-Date).Year")
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(2026)
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86_400) as i64;
+    year_from_epoch_days(days).max(0) as u32
 }

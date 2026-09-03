@@ -5,6 +5,22 @@
 use crate::diagnose::facts::Facts;
 use crate::diagnose::rules::{Finding, Severity};
 
+/// Renders `text` as one or more seven-space-indented lines, so a value that
+/// happens to contain a newline (a probe's error text, for instance) never
+/// spills unindented text into the report.
+fn indented(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        out.push_str("       ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    if out.is_empty() {
+        out.push_str("       \n");
+    }
+    out
+}
+
 pub fn report(findings: &[Finding], facts: &Facts) -> String {
     let mut s = String::new();
     s.push_str("castr Wi-Fi health check\n\n");
@@ -13,8 +29,8 @@ pub fn report(findings: &[Finding], facts: &Facts) -> String {
     }
     for f in findings {
         s.push_str(&format!("[{}] {}\n", f.severity.marker(), f.check));
-        s.push_str(&format!("       {}\n", f.found));
-        s.push_str(&format!("       {}\n", f.why));
+        s.push_str(&indented(&f.found));
+        s.push_str(&indented(f.why));
     }
     let fixable = findings.iter().filter(|f| f.fix.is_some()).count();
     s.push('\n');

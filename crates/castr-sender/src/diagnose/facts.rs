@@ -72,8 +72,11 @@ pub struct Facts {
     pub usb_suspend: Option<PowerSetting>,
     /// `None` when the query failed; the reason is in `notes`.
     pub allow_power_off: Option<bool>,
-    pub bluetooth_active: bool,
-    pub adapter_is_usb: bool,
+    /// `None` when the probe could not tell us; the reason is in `notes`.
+    pub bluetooth_active: Option<bool>,
+    /// `None` when the probe could not tell us which bus the adapter is on;
+    /// the reason is in `notes`.
+    pub adapter_is_usb: Option<bool>,
     pub elevated: bool,
     /// Current year, injected so the driver-age rule is testable.
     pub this_year: u32,
@@ -82,6 +85,38 @@ pub struct Facts {
     pub sink_band_ghz: f32,
     /// Probe failures, keyed by check name, shown verbatim in the report.
     pub notes: Vec<(String, String)>,
+}
+
+/// Quotes `s` for interpolation into a PowerShell single-quoted string:
+/// doubles every embedded single quote and wraps the result in single quotes.
+/// Windows allows apostrophes (and worse) in adapter names, so every name
+/// that reaches a PowerShell command line must go through this first.
+pub fn ps_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push('\'');
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+/// Current year from the system clock, computed without a date crate or a
+/// process launch: days since the Unix epoch, converted to a civil date by
+/// Howard Hinnant's `civil_from_days` algorithm.
+pub fn year_from_epoch_days(days: i64) -> i32 {
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }) as i32
 }
 
 /// Value after the first colon on a line whose text before the colon contains
@@ -320,6 +355,19 @@ Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)
     #[test]
     fn powercfg_without_indices_is_none() {
         assert!(parse_powercfg_indices("Invalid Parameters").is_none());
+    }
+
+    #[test]
+    fn ps_quote_escapes_embedded_single_quotes() {
+        assert_eq!(ps_quote("Bob's Wi-Fi"), "'Bob''s Wi-Fi'");
+        assert_eq!(ps_quote("Wi-Fi"), "'Wi-Fi'");
+    }
+
+    #[test]
+    fn epoch_days_for_2026_01_01_is_2026() {
+        assert_eq!(year_from_epoch_days(20454), 2026);
+        // A day earlier is still the previous year.
+        assert_eq!(year_from_epoch_days(20453), 2025);
     }
 
     #[test]
