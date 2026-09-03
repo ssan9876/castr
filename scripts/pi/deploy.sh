@@ -43,6 +43,13 @@ ssh "$PI" '
   sudo install -m 0644 /tmp/castr-wpa-p2p.conf /etc/castr/wpa_supplicant-p2p.conf
   echo "d /run/wpa_supplicant_castr 0770 castr castr -" | sudo tee /etc/tmpfiles.d/castr.conf >/dev/null
   sudo systemd-tmpfiles --create /etc/tmpfiles.d/castr.conf || true
+  # ensure_supplicant() in the sink only starts wpa_supplicant when its control
+  # socket is missing, so a config change installed above would otherwise sit
+  # unread until the next reboot: the old supplicant process keeps running
+  # with the old settings, and its socket keeps the sink from starting a new
+  # one. Kill it here; the sink starts a fresh instance, with the config just
+  # installed, on its next pass.
+  sudo pkill -f "wpa_supplicant .*-c /etc/castr/wpa_supplicant-p2p.conf" || true
   rm -f /tmp/castr-receiver /tmp/castr-receiver.service /tmp/castr-wait-devices.sh /tmp/castr-wpa-p2p.conf
   sudo systemctl daemon-reload
   sudo systemctl restart castr-receiver
