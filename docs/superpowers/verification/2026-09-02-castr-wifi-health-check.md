@@ -184,6 +184,88 @@ Unchanged: AC `0x00000000`, DC `0x00000002`, identical to the "before"
 readback. The unelevated `--fix` run left the powercfg indices exactly where
 they were, as expected.
 
+## Post-review hardening (2026-09-02, fix wave)
+
+Whole-branch review found three related lockout risks in the GUI worker path
+and had the spec's power-off row corrected to name the cmdlet the code
+actually uses. All three code items landed in `crates/castr-sender/src/gui.rs`
+and `crates/castr-sender/src/diagnose/collect.rs`:
+
+- **Panic safety (item A).** The "Check my Wi-Fi" worker closure now
+  constructs a `WifiRunGuard` (an RAII guard holding the `Arc<AtomicBool>`) as
+  its first statement, so `wifi_running` is cleared on every exit path,
+  including a panic. The probe itself runs inside
+  `std::panic::catch_unwind(AssertUnwindSafe(...))`; a caught panic writes
+  "The check failed unexpectedly. Please report this." into `wifi_report`
+  instead of leaving the panel empty.
+- **Collection timeout (item B).** `collect::run` now spawns each external
+  command and polls `try_wait()` every 50 ms against a 10-second deadline
+  (`wait_with_deadline`, unit-tested with a fake clock and a fake child so no
+  real process is spawned in the tests) instead of blocking on `output()`. A
+  command that has not exited by the deadline is killed, reaped, and reported
+  as `Err("<program>: timed out after 10 s")`, which the existing note
+  mechanism turns into an `Unknown` finding — a hung `netsh` or `powershell`
+  (a stuck WMI service is the realistic trigger) can no longer hang the
+  button forever.
+- **Close discards in-flight results (item C).** `App` now carries a
+  `wifi_generation: Arc<AtomicU64>` counter. Each click captures the current
+  generation; the worker only writes into `wifi_report` if the generation is
+  still current when it finishes, and `WifiRunGuard` only clears
+  `wifi_running` under the same condition. "Close" increments the counter
+  (so a late result from an abandoned worker is discarded) and clears
+  `wifi_running` unconditionally (so a hung or abandoned check cannot lock
+  the button even if its worker never returns).
+
+Verification commands (unelevated shell, same machine and adapter as above):
+
+```
+$ cargo fmt -p castr-sender
+$ cargo build -q -p castr-sender
+$ cargo test -q --workspace
+$ cargo clippy --workspace --tests
+$ cargo run -q -p castr-sender -- diagnose
+```
+
+- `cargo build -q -p castr-sender`: clean; the only "warning:" lines are
+  pre-existing linker `LNK4099`/`LNK4098`/`LNK4217`/`LNK4286` noise from the
+  bundled `libaudiopus_sys` build, unrelated to this crate's source.
+- `cargo test -q --workspace`: all suites green, including three new tests in
+  `diagnose::collect::tests` for `wait_with_deadline`
+  (`returns_true_as_soon_as_the_child_reports_exited`,
+  `returns_false_once_the_deadline_passes_without_exit`,
+  `never_sleeps_once_the_child_has_already_exited`).
+- `cargo clippy --workspace --tests`: only the four pre-existing warnings
+  (`crates/castr-media/src/clock.rs`, `crates/castr-proto/src/reassemble.rs`,
+  `crates/castr-proto/src/session.rs`, `crates/castr-proto/src/packetize.rs`).
+- `cargo run -q -p castr-sender -- diagnose`: byte-for-byte the same report
+  and exit code `1` recorded above — this wave changed no check's behavior.
+
+### GUI check, driven end-to-end via UI Automation
+
+Launched `target/debug/castr-sender.exe`, found the window by process id, and
+drove it with `System.Windows.Automation` (`InvokePattern`) rather than by
+hand, so the sequence below is exact and repeatable:
+
+```
+Window found: castr
+Initial Check-my-Wifi enabled: True
+Clicked Check my Wi-Fi
+Immediately after click, enabled: False
+Report panel appeared (Close button found)
+After report appeared, Check-my-Wifi enabled: True
+Clicked Close
+Close button still present after closing: False
+After Close, Check-my-Wifi enabled: True
+Clicked Check my Wi-Fi (2nd time)
+Second report panel appeared: True
+```
+
+Observed: the button disables the instant it is clicked and re-enables the
+moment the report lands (item A/B's normal-path behavior); "Close" removes
+the panel and the button reads enabled with no report showing; a second click
+immediately after "Close" produces a fresh report panel rather than a stale
+or resurrected one (item C). The process was then terminated.
+
 ## GUI check
 
 `cargo run -q -p castr-sender` opened the window with a new "Check my Wi-Fi"

@@ -84,7 +84,7 @@ what was found, and a one-line statement of why it matters.
 | Station band vs sink band | `netsh wlan show interfaces` | connected on 5 GHz while the sink is 2.4 GHz (warn: the radio must time-slice) |
 | Signal strength and channel | `netsh wlan show interfaces` | signal below 60 percent (warn) |
 | Adapter power saving in the active power plan | `powercfg /q SCHEME_CURRENT SUB_WIFI` | any setting other than maximum performance (warn, fixable) |
-| "Allow the computer to turn off this device" | the adapter's `PnPCapabilities` registry value | power-off permitted (warn, fixable) |
+| "Allow the computer to turn off this device" | `Get-NetAdapterPowerManagement` | power-off permitted (warn, fixable) |
 | USB selective suspend | `powercfg /q SCHEME_CURRENT SUB_USB`, only for USB adapters | enabled (warn, fixable) |
 
 ### 4.3 Fixes
