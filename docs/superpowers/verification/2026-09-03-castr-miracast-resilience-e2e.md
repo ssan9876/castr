@@ -6,11 +6,17 @@ deployed fresh for this run. Windows host: `DESKTOP-C6QHH2A`, Realtek 8821CE
 adapter. Every step below was run by an automated agent over SSH except where
 it says otherwise.
 
-**Status: the hold, the resume, and the bitrate ladder are all verified on
-real hardware, with no radio peer.** The three hardware questions in step 5
-need a person at the Windows PC pressing Windows+K, entering a PIN, and using
-Bluetooth headphones — none of that can be driven from a shell, so none of it
-was attempted. Section "What was not run" says exactly what that leaves open.
+**Status: the hold, the in-hold resume, and the bitrate ladder are all
+verified on real hardware, with no radio peer.** Step 3 has two parts: a
+fresh run (3a) where the reconnect lands about 1 second into the 30-second
+hold — the direct proof of the resume path — and the original run from this
+task's first pass (3b), kept separately, where the reconnect landed 5 seconds
+*past* the hold's nominal 30-second expiry and was still accepted. Both are
+real and both are described for what they actually show; see Step 3 for the
+exact arithmetic. The three hardware questions in step 5 need a person at the
+Windows PC pressing Windows+K, entering a PIN, and using Bluetooth
+headphones — none of that can be driven from a shell, so none of it was
+attempted. Section "What was not run" says exactly what that leaves open.
 
 ## Summary
 
@@ -18,7 +24,8 @@ was attempted. Section "What was not run" says exactly what that leaves open.
 |---|------|--------|----------|
 | 1 | Add `--drop` and `--vanish` to the loopback source | PASS | builds and cross-compiles clean |
 | 2 | Cross-build and push the example | PASS | binary built and copied to `/tmp/loopback-source` on the Pi |
-| 3 | Hold and resume, no radio peer | PASS | `no media for 2 s`, `holding the group`, no `P2P_GROUP_REMOVE`, second `RTSP connection from` — all on `p2p-wlan0-0` |
+| 3a | Reconnect inside the hold window (resume proof) | PASS | second `RTSP connection from` 0.72 s after `holding the group`; unfiltered `grep -c P2P_GROUP_REMOVE` = 0; `p2p-wlan0-0` unchanged |
+| 3b | Reconnect after the hold's nominal expiry (separate evidence) | PASS | second `RTSP connection from` 35 s after `holding the group` (5 s past the 30 s hold); accepted anyway; `p2p-wlan0-0` unchanged |
 | 4 | Bitrate ladder, no radio peer | PASS | `asking the source for 2000 kbps`, exactly once |
 | 5.1 | `brcmfmac` honours the GO settings (real blip) | NOT RUN | needs a person at the Windows PC |
 | 5.2 | Windows honours `microsoft_max_bitrate` | NOT RUN | needs a person at the Windows PC |
@@ -58,32 +65,33 @@ deployed to dietpi@192.168.88.157
 
 ## Step 3: the hold and the resume
 
-The group was already up as `p2p-wlan0-0` before the test began.
+This step was re-run for the fix round below because the first pass conflated
+two different claims: a reconnect that lands *inside* the 30-second hold
+(proving the resume path) and one that lands *after* it (proving only that
+the group outlives an expired hold). The original run, worked out from its
+own timestamps, was actually the second kind. Both are kept, each described
+as what it actually shows.
+
+### 3a. Fresh run: reconnect inside the hold window (the resume proof)
+
+The Pi was rebuilt and the example redeployed before this run (see Step 2).
+The group was already up as `p2p-wlan0-0`:
 
 ```
 $ ssh dietpi@192.168.88.157 'ip -br link | grep p2p'
 p2p-wlan0-0      UP             ba:27:eb:05:9c:c1 <BROADCAST,MULTICAST,UP,LOWER_UP>
 ```
 
-First connection, sent with `--vanish` at 60 of 120 units, then the source
-stops sending and stops answering without closing the socket:
+The first connection was started with `--vanish`, and the journal was polled
+every 0.5 s for `holding the group` so the second connection could be fired
+the instant the hold began:
 
 ```
-$ ssh dietpi@192.168.88.157 '/tmp/loopback-source 192.168.173.1:7236 120 --vanish'
-connecting to 192.168.173.1:7236
-> OPTIONS * RTSP/1.0
-< RTSP/1.0 200 OK
-...
-< PLAY rtsp://192.168.173.1/wfd1.0/streamid=0 RTSP/1.0
-< CSeq: 102
-< Session: abcdef12
-sending 120 access units to 192.168.173.1:5000
-vanishing after 60 datagrams
-```
-
-Second connection, run within 30 seconds of the vanish, in a second shell:
-
-```
+$ ssh dietpi@192.168.88.157 '/tmp/loopback-source 192.168.173.1:7236 120 --vanish' &
+$ # poll loop: journalctl --since "-30s" | grep "holding the group", every 0.5s
+FOUND at poll 8: Sep 03 22:40:12 DietPi castr-receiver[520]: ... miracast: session ended: no media for 2 s, holding the group
+$ date  # immediately before firing the second connection
+Thu Sep  3 15:40:13 PDT 2026
 $ ssh dietpi@192.168.88.157 '/tmp/loopback-source 192.168.173.1:7236 60'
 connecting to 192.168.173.1:7236
 > OPTIONS * RTSP/1.0
@@ -101,9 +109,61 @@ sent 61 datagrams
 < Content-Length: 17
 < wfd_idr_request
 done
+$ date  # immediately after
+Thu Sep  3 15:40:18 PDT 2026
 ```
 
+(The PDT wall-clock lines are the local shell's `date`; the journal below is
+authoritative and in UTC, `+7` hours from PDT.)
+
 The journal for the whole window, in order:
+
+```
+$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "22:39:50" --no-pager | grep -i miracast'
+Sep 03 22:40:07 DietPi castr-receiver[520]: ... RTSP connection from 192.168.173.1:41974
+Sep 03 22:40:08 DietPi castr-receiver[520]: ... playing 1280x720@30
+Sep 03 22:40:12 DietPi castr-receiver[520]: 2026-09-03T22:40:12.522339Z  INFO ... miracast: session ended: no media for 2 s, holding the group
+Sep 03 22:40:12 DietPi castr-receiver[520]: 2026-09-03T22:40:12.522501Z  INFO ... miracast: no media for 2 s
+Sep 03 22:40:13 DietPi castr-receiver[520]: 2026-09-03T22:40:13.240924Z  INFO ... miracast: RTSP connection from 192.168.173.1:58354
+Sep 03 22:40:14 DietPi castr-receiver[520]: ... playing 1280x720@30
+Sep 03 22:40:18 DietPi castr-receiver[520]: ... session ended: no media for 2 s, holding the group
+Sep 03 22:40:18 DietPi castr-receiver[520]: ... miracast: no media for 2 s
+```
+
+The math, from these timestamps alone: `holding the group` was logged at
+`22:40:12.522339`. The second `RTSP connection from` was logged at
+`22:40:13.240924` — **0.72 seconds later**, about 1 second into the
+30-second hold, nowhere near its edge. It reached `playing 1280x720@30`
+again one second after that, with no re-pairing. This is the run that proves
+the resume path: a peer that returns promptly during the hold gets its
+session back.
+
+An unfiltered check for `P2P_GROUP_REMOVE` over this same window, not
+filtered through the `miracast:`-prefixed grep used elsewhere:
+
+```
+$ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "22:39:50" --no-pager | grep -c P2P_GROUP_REMOVE'
+0
+```
+
+Zero, over the full unfiltered journal text for the window — the group was
+never removed. The interface was checked again afterward and is still
+`p2p-wlan0-0`:
+
+```
+$ ssh dietpi@192.168.88.157 'ip -br link | grep p2p'
+p2p-wlan0-0      UP             ba:27:eb:05:9c:c1 <BROADCAST,MULTICAST,UP,LOWER_UP>
+```
+
+### 3b. Original run, kept as separate evidence: reconnect after the hold's nominal expiry
+
+This is the run from the first pass through this task, timestamps unchanged
+from that run. Worked out precisely: `holding the group` was logged at
+`21:45:11`; the hold is 30 seconds, so it should nominally have expired by
+`21:45:41`. The second `RTSP connection from` arrived at `21:45:46` — **35
+seconds after the hold began**, i.e. **5 seconds past its nominal
+expiry** — and was still accepted, reaching `playing 1280x720@30` again with
+no re-pairing and no interface change.
 
 ```
 $ ssh dietpi@192.168.88.157 'sudo journalctl -u castr-receiver --since "-3min" --no-pager | grep -i miracast'
@@ -118,22 +178,28 @@ Sep 03 21:45:51 DietPi castr-receiver[23343]: ... session ended: no media for 2 
 Sep 03 21:45:51 DietPi castr-receiver[23343]: ... miracast: no media for 2 s
 ```
 
-`no media for 2 s` fired at `21:45:11`, four seconds after the source went
-silent (a 2-second stall timer plus turnaround), and logged `holding the
-group` rather than removing it. The second `RTSP connection from` at
-`21:45:46` — 35 seconds after the first session started and about 25 seconds
-into the 30-second hold — was accepted and reached `playing 1280x720@30`
-again. No `P2P_GROUP_REMOVE` appears anywhere in this window. The interface
-was checked again afterward and is still `p2p-wlan0-0`:
+This does **not** prove the in-hold resume path (3a does that); what it
+proves is a different, stronger-in-one-sense claim: the group, the
+credentials, and the screen survived at least 5 seconds *past* when the
+30-second hold should have expired. Whether that is the hold timer running
+slightly long, scheduling jitter, or something else in the hold's expiry
+logic is not established by this document — it is worth follow-up, but it is
+not a resilience defect (the session still came back cleanly either way).
 
-```
-$ ssh dietpi@192.168.88.157 'ip -br link | grep p2p'
-p2p-wlan0-0      UP             ba:27:eb:05:9c:c1 <BROADCAST,MULTICAST,UP,LOWER_UP>
-```
+An unfiltered `P2P_GROUP_REMOVE` re-check specifically for this original
+window could not be run for this fix: the Pi was rebooted between the
+original run and this fix round (see Step 2 of the fix — `/tmp/loopback-source`
+had to be rebuilt because the earlier copy was gone after a restart), and
+`sudo journalctl -u castr-receiver --since "2026-09-03 21:44:50" --until
+"2026-09-03 21:46:00"` now returns `-- No entries --`: that boot's journal is
+gone. The unfiltered check in 3a, against the fresh run's own window,
+substitutes for it — same binary, same code path, same `P2P_GROUP_REMOVE`
+helper — but it is evidence about the fresh run, not a re-verification of
+this original one.
 
-The interface number never incremented across the two sessions — the proof
-that the group, its credentials, and the television screen all survived the
-gap between them.
+The interface number never incremented across either pair of sessions — the
+proof that the group, its credentials, and the television screen all
+survived the gap each time.
 
 ## Step 4: the bitrate ladder
 
@@ -208,9 +274,9 @@ proved.
 
 All three of step 5's hardware questions, and only those. Everything in steps
 1 through 4 — the two loopback-source flags, the cross-build and push, the
-hold, the resume with the group surviving, and the bitrate ladder — was run
-against real hardware (the Pi's own radio and group interface) with no
-simulation and no workaround, and all four passed.
+in-hold resume (3a), the group surviving past an expired hold (3b), and the
+bitrate ladder — was run against real hardware (the Pi's own radio and group
+interface) with no simulation and no workaround, and all of it passed.
 
 The three open questions above are the actual point of this sub-project: this
 document proves the sink-side mechanics work, but whether `brcmfmac` actually

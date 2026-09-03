@@ -206,9 +206,9 @@ Three limits, stated plainly:
   connects first owns it until it disconnects; the other is refused with
   "display busy" rather than taking the screen from someone mid-presentation.
 
-If the link wobbles, the Pi holds your session: the picture drops to a lower
-quality rather than stopping, and if the connection does break, the Pi keeps
-the group and your screen for thirty seconds so you come straight back with no
+If the link wobbles, the Pi asks your PC to send less data rather than ending
+the session, and if the connection does break outright, the Pi keeps the
+group and your screen for thirty seconds so you come straight back with no
 PIN. A drop that lasts longer than that returns the Pi to its idle screen, and
 you can reconnect from Windows+K without re-pairing.
 
