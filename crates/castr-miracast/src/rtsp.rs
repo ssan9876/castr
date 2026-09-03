@@ -313,9 +313,13 @@ wfd_video_formats\r\nwfd_audio_codecs\r\nwfd_client_rtp_ports\r\n";
 use crate::wfd::{capabilities_body, parse_parameter_body, Capabilities};
 use std::time::{Duration, Instant};
 
-/// How often we send a keep-alive, and how long we tolerate silence.
-const KEEPALIVE_EVERY: Duration = Duration::from_secs(30);
-const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A dead radio is invisible to TCP for minutes, so the keep-alive is the
+/// fastest signal the control channel has. Five seconds costs nothing on a
+/// link carrying 8 Mbps of video.
+const KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
+/// Two missed keep-alives, not one: a single loss on a busy link must not end
+/// a healthy session.
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// One IDR request per this interval, however often the decoder asks.
 const IDR_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -546,7 +550,7 @@ impl Negotiation {
         let since_heard = self.last_heard.map(|t| now.saturating_duration_since(t));
         if since_heard.is_some_and(|d| d > KEEPALIVE_TIMEOUT) {
             self.state = NegState::Done;
-            out.push(Action::Teardown("no keep-alive reply for 60 s"));
+            out.push(Action::Teardown("no keep-alive reply for 10 s"));
             return out;
         }
         let due = match self.last_keepalive {
@@ -764,19 +768,19 @@ mod negotiation_tests {
     }
 
     #[test]
-    fn keep_alive_goes_out_every_thirty_seconds_and_silence_ends_the_session() {
+    fn keep_alive_goes_out_every_five_seconds_and_silence_ends_the_session() {
         let mut n = neg();
         let t0 = Instant::now();
         n.on_message_at(&req("OPTIONS", 1, ""), t0);
-        assert!(sent(&n.tick(t0 + Duration::from_secs(29))).is_empty());
-        let out = n.tick(t0 + Duration::from_secs(31));
+        assert!(sent(&n.tick(t0 + Duration::from_secs(3))).is_empty());
+        let out = n.tick(t0 + Duration::from_secs(6));
         assert!(
             sent(&out)[0].starts_with("GET_PARAMETER "),
             "{:?}",
             sent(&out)
         );
-        // No reply for 60 s after the last one heard: tear down.
-        let out = n.tick(t0 + Duration::from_secs(95));
+        // No reply for 10 s after the last one heard: tear down.
+        let out = n.tick(t0 + Duration::from_secs(11));
         assert!(
             out.iter().any(|a| matches!(a, Action::Teardown(_))),
             "{out:?}"
@@ -816,5 +820,44 @@ mod negotiation_tests {
         let out = n.on_message(&req("ANNOUNCE", 5, ""));
         assert!(sent(&out)[0].starts_with("RTSP/1.0 400"));
         assert!(!out.iter().any(|a| matches!(a, Action::Teardown(_))));
+    }
+
+    /// A negotiation driven to Playing. Named for the state, not the fixture, so it
+    /// does not read as a recursive call to `test_support::negotiation_to_playing`.
+    fn playing() -> Negotiation {
+        let mut n = Negotiation::new(caps(), "01234567".into());
+        for msg in crate::test_support::negotiation_to_playing() {
+            let (m, _) = parse(msg.as_bytes()).unwrap().unwrap();
+            n.on_message_at(&m, Instant::now());
+        }
+        n
+    }
+
+    #[test]
+    fn a_dead_peer_is_noticed_within_ten_seconds() {
+        let mut n = playing();
+        let t0 = Instant::now();
+        // Nine seconds of silence is not yet a dead peer: a single lost keep-alive
+        // on a busy link must not end a healthy session.
+        let quiet = n.tick(t0 + Duration::from_secs(9));
+        assert!(
+            !quiet.iter().any(|a| matches!(a, Action::Teardown(_))),
+            "{quiet:?}"
+        );
+        let dead = n.tick(t0 + Duration::from_secs(11));
+        assert!(
+            dead.iter().any(|a| matches!(a, Action::Teardown(_))),
+            "{dead:?}"
+        );
+    }
+
+    #[test]
+    fn keep_alives_go_out_every_five_seconds() {
+        let mut n = playing();
+        let t0 = Instant::now();
+        let early = n.tick(t0 + Duration::from_secs(3));
+        assert!(early.is_empty(), "too soon: {early:?}");
+        let due = n.tick(t0 + Duration::from_secs(6));
+        assert_eq!(due.len(), 1, "one keep-alive: {due:?}");
     }
 }
