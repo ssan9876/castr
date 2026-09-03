@@ -763,6 +763,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "castr-miracast"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "castr-media",
+ "castr-proto",
+ "libc",
+ "tracing",
+]
+
+[[package]]
 name = "castr-net"
 version = "0.1.0"
 dependencies = [
@@ -807,6 +818,7 @@ dependencies = [
  "castr-codec-v4l2",
  "castr-codec-win",
  "castr-media",
+ "castr-miracast",
  "castr-net",
  "castr-proto",
  "clap",
