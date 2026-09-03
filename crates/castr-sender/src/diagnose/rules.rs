@@ -59,11 +59,12 @@ pub struct Finding {
     pub fix: Option<FixId>,
 }
 
-/// Adapters known to put Wi-Fi and Bluetooth on one antenna. Not exhaustive:
-/// an adapter that is not listed produces no finding rather than a wrong one.
+/// Adapters known to put Wi-Fi and Bluetooth on one antenna: the Realtek
+/// 8723/8821/8822 combo families and the Intel 3165/3168/9461/9462 combo
+/// parts. Not exhaustive: an adapter that is not listed produces no finding
+/// rather than a wrong one.
 const SINGLE_ANTENNA_COMBOS: &[&str] = &[
-    "8821ce", "8821ae", "8723be", "8723de", "8723ae", "8822be", "8188", "8192", "3165", "3168",
-    "9461", "9462",
+    "8821ce", "8821ae", "8723be", "8723de", "8723ae", "8822be", "3165", "3168", "9461", "9462",
 ];
 
 pub fn is_single_antenna_combo(adapter: &str) -> bool {
@@ -121,19 +122,28 @@ pub fn analyse(facts: &Facts) -> Vec<Finding> {
 
     // Adapter identity and driver age.
     match facts.driver.as_ref() {
-        Some(d) => {
-            let age_ok = d.year.is_none_or(|y| y + 3 >= facts.this_year);
-            out.push(Finding {
+        Some(d) => match d.year {
+            Some(y) => {
+                let age_ok = y + 3 >= facts.this_year;
+                out.push(Finding {
+                    check: "Driver age",
+                    severity: if age_ok { Severity::Ok } else { Severity::Warn },
+                    found: format!("{}, version {}, dated {}", d.name, d.version, y),
+                    why: "Wi-Fi Direct fixes land in vendor drivers; a driver several years old is a common cause of drops.",
+                    fix: None,
+                });
+            }
+            None => out.push(Finding {
                 check: "Driver age",
-                severity: if age_ok { Severity::Ok } else { Severity::Warn },
-                found: match d.year {
-                    Some(y) => format!("{}, version {}, dated {}", d.name, d.version, y),
-                    None => format!("{}, version {}", d.name, d.version),
-                },
-                why: "Wi-Fi Direct fixes land in vendor drivers; a driver several years old is a common cause of drops.",
+                severity: Severity::Unknown,
+                found: format!(
+                    "{}, version {}, but the driver date could not be read",
+                    d.name, d.version
+                ),
+                why: "Wi-Fi Direct fixes land in vendor drivers; without a date we cannot tell whether this driver is current.",
                 fix: None,
-            });
-        }
+            }),
+        },
         None => out.push(unknown(
             "Driver age",
             facts,
@@ -142,104 +152,111 @@ pub fn analyse(facts: &Facts) -> Vec<Finding> {
     }
 
     // Shared antenna.
-    let combo = facts
-        .driver
-        .as_ref()
-        .map(|d| is_single_antenna_combo(&d.name))
-        .unwrap_or(false);
-    out.push(match (combo, facts.bluetooth_active) {
-        (true, true) => Finding {
-            check: "Shared Wi-Fi and Bluetooth antenna",
-            severity: Severity::Warn,
-            found: "this adapter shares one antenna between Wi-Fi and Bluetooth, and Bluetooth is active".into(),
-            why: "A Miracast session and Bluetooth traffic then take turns on one antenna, which is a leading cause of mid-cast drops. Turning Bluetooth off during a cast is a reliable test.",
-            fix: None,
-        },
-        (true, false) => Finding {
-            check: "Shared Wi-Fi and Bluetooth antenna",
-            severity: Severity::Info,
-            found: "this adapter shares one antenna with Bluetooth, but no Bluetooth device is active".into(),
-            why: "Nothing is competing for the antenna right now.",
-            fix: None,
-        },
-        (false, _) => Finding {
-            check: "Shared Wi-Fi and Bluetooth antenna",
-            severity: Severity::Ok,
-            found: "not a known single-antenna combination adapter".into(),
-            why: "Adapters that share one antenna with Bluetooth drop Miracast sessions more often.",
-            fix: None,
+    out.push(match facts.driver.as_ref() {
+        None => unknown(
+            "Shared Wi-Fi and Bluetooth antenna",
+            facts,
+            "Adapters that share one antenna with Bluetooth drop Miracast sessions more often.",
+        ),
+        Some(d) => match (is_single_antenna_combo(&d.name), facts.bluetooth_active) {
+            (true, true) => Finding {
+                check: "Shared Wi-Fi and Bluetooth antenna",
+                severity: Severity::Warn,
+                found: "this adapter shares one antenna between Wi-Fi and Bluetooth, and Bluetooth is active".into(),
+                why: "A Miracast session and Bluetooth traffic then take turns on one antenna, which is a leading cause of mid-cast drops. Turning Bluetooth off during a cast is a reliable test.",
+                fix: None,
+            },
+            (true, false) => Finding {
+                check: "Shared Wi-Fi and Bluetooth antenna",
+                severity: Severity::Info,
+                found: "this adapter shares one antenna with Bluetooth, but no Bluetooth device is active".into(),
+                why: "Nothing is competing for the antenna right now.",
+                fix: None,
+            },
+            (false, _) => Finding {
+                check: "Shared Wi-Fi and Bluetooth antenna",
+                severity: Severity::Ok,
+                found: "not a known single-antenna combination adapter".into(),
+                why: "Adapters that share one antenna with Bluetooth drop Miracast sessions more often.",
+                fix: None,
+            },
         },
     });
 
-    // Band and signal, only meaningful while connected.
-    let connected = facts
-        .interface
-        .as_ref()
-        .map(|i| i.connected)
-        .unwrap_or(false);
-    let band = facts.interface.as_ref().and_then(|i| i.band.clone());
-    out.push(match (connected, band.as_deref()) {
-        (true, Some(b)) if b.starts_with('5') && facts.sink_band_ghz < 5.0 => Finding {
-            check: "Station band vs sink band",
-            severity: Severity::Warn,
-            found: format!("connected on {b}, while the sink is on 2.4 GHz"),
-            why: "One radio then has to alternate between two bands, and the cast is what starves. Moving this machine to the 2.4 GHz network for the duration removes the split.",
-            fix: None,
-        },
-        (true, Some(b)) => Finding {
-            check: "Station band vs sink band",
-            severity: Severity::Ok,
-            found: format!("connected on {b}, the same band as the sink"),
-            why: "One radio serving two bands has to alternate, which starves the cast.",
-            fix: None,
-        },
-        (true, None) => unknown(
+    // Band and signal, only meaningful while connected. An absent interface
+    // means the probe itself failed, not that the radio is idle, so it reads
+    // Unknown rather than the confident "not connected" Info.
+    out.push(match facts.interface.as_ref() {
+        None => unknown(
             "Station band vs sink band",
             facts,
             "A station link on a different band from the sink makes the radio alternate.",
         ),
-        (false, _) => Finding {
+        Some(i) if !i.connected => Finding {
             check: "Station band vs sink band",
             severity: Severity::Info,
             found: "the Wi-Fi radio is not connected to a network".into(),
             why: "With no station link there is no band to alternate with, which is the best case for casting.",
             fix: None,
         },
+        Some(i) => match i.band.as_deref() {
+            Some(b) if b.starts_with('5') && facts.sink_band_ghz < 5.0 => Finding {
+                check: "Station band vs sink band",
+                severity: Severity::Warn,
+                found: format!("connected on {b}, while the sink is on 2.4 GHz"),
+                why: "One radio then has to alternate between two bands, and the cast is what starves. Moving this machine to the 2.4 GHz network for the duration removes the split.",
+                fix: None,
+            },
+            Some(b) => Finding {
+                check: "Station band vs sink band",
+                severity: Severity::Ok,
+                found: format!("connected on {b}, the same band as the sink"),
+                why: "One radio serving two bands has to alternate, which starves the cast.",
+                fix: None,
+            },
+            None => unknown(
+                "Station band vs sink band",
+                facts,
+                "A station link on a different band from the sink makes the radio alternate.",
+            ),
+        },
     });
 
-    out.push(
-        match (
-            connected,
-            facts.interface.as_ref().and_then(|i| i.signal_pct),
-        ) {
-            (true, Some(s)) if s < 60 => Finding {
+    out.push(match facts.interface.as_ref() {
+        None => unknown(
+            "Signal strength",
+            facts,
+            "A weak link means a noisy radio environment.",
+        ),
+        Some(i) if !i.connected => Finding {
+            check: "Signal strength",
+            severity: Severity::Info,
+            found: "the Wi-Fi radio is not connected to a network".into(),
+            why: "Signal strength only means something while connected.",
+            fix: None,
+        },
+        Some(i) => match i.signal_pct {
+            Some(s) if s < 60 => Finding {
                 check: "Signal strength",
                 severity: Severity::Warn,
                 found: format!("{s}% on the current network"),
                 why: "A weak station link means a noisy radio environment, and the cast shares it.",
                 fix: None,
             },
-            (true, Some(s)) => Finding {
+            Some(s) => Finding {
                 check: "Signal strength",
                 severity: Severity::Ok,
                 found: format!("{s}% on the current network"),
                 why: "A weak link means a noisy environment that the cast also has to live in.",
                 fix: None,
             },
-            (true, None) => unknown(
+            None => unknown(
                 "Signal strength",
                 facts,
                 "A weak link means a noisy radio environment.",
             ),
-            (false, _) => Finding {
-                check: "Signal strength",
-                severity: Severity::Info,
-                found: "the Wi-Fi radio is not connected to a network".into(),
-                why: "Signal strength only means something while connected.",
-                fix: None,
-            },
         },
-    );
+    });
 
     // Power saving.
     out.push(match facts.wifi_power {
@@ -456,6 +473,53 @@ mod tests {
             "Realtek RTL8723BE Wireless LAN 802.11n PCIe NIC"
         ));
         assert!(!is_single_antenna_combo("Intel(R) Wi-Fi 6E AX211 160MHz"));
+        assert!(!is_single_antenna_combo(
+            "Realtek RTL8188EU Wireless LAN 802.11n USB NIC"
+        ));
+    }
+
+    #[test]
+    fn a_missing_driver_leaves_the_shared_antenna_check_unknown() {
+        let mut f = base();
+        f.driver = None;
+        let fs = analyse(&f);
+        assert_eq!(
+            find(&fs, "Shared Wi-Fi and Bluetooth antenna").severity,
+            Severity::Unknown
+        );
+    }
+
+    #[test]
+    fn a_missing_interface_leaves_band_and_signal_unknown() {
+        let mut f = base();
+        f.interface = None;
+        f.notes.push((
+            "Station band vs sink band".into(),
+            "The wireless interface query returned nothing.".into(),
+        ));
+        let fs = analyse(&f);
+        let band = find(&fs, "Station band vs sink band");
+        assert_eq!(band.severity, Severity::Unknown);
+        assert!(
+            band.found.contains("returned nothing"),
+            "the reason is shown: {}",
+            band.found
+        );
+        assert_eq!(find(&fs, "Signal strength").severity, Severity::Unknown);
+    }
+
+    #[test]
+    fn a_driver_with_no_readable_year_is_unknown() {
+        let mut f = base();
+        f.driver.as_mut().unwrap().year = None;
+        let fs = analyse(&f);
+        let age = find(&fs, "Driver age");
+        assert_eq!(age.severity, Severity::Unknown);
+        assert!(
+            age.found.contains(&f.driver.as_ref().unwrap().name),
+            "names the adapter: {}",
+            age.found
+        );
     }
 
     #[test]
