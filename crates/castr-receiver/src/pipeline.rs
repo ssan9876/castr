@@ -1,4 +1,5 @@
 use crate::audio_out::AudioOut;
+use crate::display;
 use crate::render::Renderer;
 use anyhow::anyhow;
 use castr_media::clock::AvClock;
@@ -20,6 +21,17 @@ pub enum DecoderChoice {
     Mf,
     V4l2,
     Sw,
+}
+
+/// Whether to accept Miracast sources alongside castr's own protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MiracastChoice {
+    /// Always run the sink; report loudly if the radio is unavailable.
+    On,
+    /// Never run it.
+    Off,
+    /// Run it when a wireless interface exists, logging the reason if not.
+    Auto,
 }
 
 /// Counts decoder errors and trips when `limit` occur within `within`.
@@ -202,6 +214,15 @@ pub struct ReceiverConfig {
     pub decoder: DecoderChoice,
     pub bind: SocketAddr,
     pub config_dir: PathBuf,
+    // Read by the sink lifecycle, which lands in the next task.
+    #[allow(dead_code)]
+    pub miracast: MiracastChoice,
+    /// Name shown in the Windows cast list; defaults to the hostname.
+    #[allow(dead_code)]
+    pub miracast_name: Option<String>,
+    /// 2.4 GHz channel for the Wi-Fi Direct group; `None` picks one.
+    #[allow(dead_code)]
+    pub miracast_channel: Option<u32>,
 }
 
 /// Messages from the network side to the SDL main thread.
@@ -289,6 +310,9 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let perf = Arc::new(Mutex::new(PerfStats::default()));
     let dropped_since_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // One screen, two protocols: the arbiter decides who has it. Shared with
+    // the Miracast sink when that is running.
+    let display = Arc::new(display::DisplayArbiter::new());
     // Microseconds-since-`start` of the last `decode` call, so the SDL loop's
     // idle detection (below) can key off decoding as well as presenting: a
     // receiver whose decoder is running but whose presenter is stuck (e.g.
@@ -427,6 +451,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         ui: ui_tx,
         start,
         pairing_guard: Mutex::new(PairingGuard::new()),
+        display: display.clone(),
         dropped: dropped_since_report.clone(),
     };
     rt.spawn(async move {
@@ -601,6 +626,8 @@ struct NetConfig {
     ui: mpsc::Sender<UiEvent>,
     start: Instant,
     pairing_guard: Mutex<PairingGuard>,
+    /// Which protocol owns the screen; shared with the Miracast sink.
+    display: Arc<display::DisplayArbiter>,
     dropped: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -632,6 +659,10 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
             Ok(()) => tracing::info!("session ended"),
             Err(e) => tracing::warn!("connection error: {e:#}"),
         }
+        // Every exit from the handler frees the screen, including the error
+        // paths; a release from a protocol that does not hold it is a no-op,
+        // so a refused connection cannot free the owner's display.
+        cfg.display.release(display::Owner::Castr);
         if should_mark_disconnected(session.state()) {
             session.on_disconnect(now_us(cfg.start));
         }
@@ -727,6 +758,22 @@ async fn handle_connection(
                     }
                 }
                 if matches!(session.state(), ReceiverState::Streaming { .. }) {
+                    // One display, two protocols: whoever is already casting
+                    // keeps it. Refuse rather than steal the screen from a
+                    // guest mid-presentation.
+                    if !cfg.display.try_acquire(display::Owner::Castr) {
+                        tracing::info!(
+                            "refusing castr sender: display owned by {:?}",
+                            cfg.display.owner()
+                        );
+                        link.send_control(&ControlMessage::Error {
+                            code: 5,
+                            message: "display busy".into(),
+                        })
+                        .await?;
+                        link.close("display busy");
+                        return Ok(());
+                    }
                     if was_disconnected {
                         tracing::info!("resuming stream");
                     }
