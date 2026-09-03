@@ -126,10 +126,12 @@ pub fn device_info_subelement(d: &DeviceInfo) -> String {
     if d.session_available {
         info |= 0x0010;
     }
-    // Lowercase hex: that is what `wpa_cli` prints and what the supplicant's
-    // own examples use, so a logged command can be pasted back verbatim.
+    // One unbroken lowercase hex string: the supplicant parses this as a
+    // hexdump and answers FAIL if it contains spaces, which the hardware
+    // bring-up confirmed. Lowercase because that is what `wpa_cli` prints
+    // back, so a logged command can be pasted in verbatim.
     format!(
-        "0006{:04x} {:04x} {:04x}",
+        "0006{:04x}{:04x}{:04x}",
         info, d.rtsp_port, d.max_throughput_mbps
     )
 }
@@ -238,7 +240,7 @@ mod tests {
         });
         // 6 bytes: device info (2), control port (2), throughput (2).
         // 0x0011 = primary sink (bits 0-1) with session available (bits 4-5).
-        assert_eq!(s, "00060011 1c44 000a");
+        assert_eq!(s, "000600111c44000a");
     }
 
     #[test]
@@ -248,6 +250,6 @@ mod tests {
             rtsp_port: 7236,
             max_throughput_mbps: 10,
         });
-        assert_eq!(s, "00060001 1c44 000a");
+        assert_eq!(s, "000600011c44000a");
     }
 }

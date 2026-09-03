@@ -78,8 +78,10 @@ install -d -m 0755 /etc/castr
 install -m 0644 "$HERE/wpa_supplicant-p2p.conf" /etc/castr/wpa_supplicant-p2p.conf
 # The control socket directory has to exist before the supplicant starts, and
 # again after every reboot, so it is a tmpfiles.d entry rather than a mkdir.
+# Owned by castr, not root: the supplicant runs as castr and chowns the
+# directory to its own group on startup, which only its owner may do.
 cat > /etc/tmpfiles.d/castr.conf <<'TMPFILES'
-d /run/wpa_supplicant_castr 0770 root castr -
+d /run/wpa_supplicant_castr 0770 castr castr -
 TMPFILES
 systemd-tmpfiles --create /etc/tmpfiles.d/castr.conf >/dev/null 2>&1 || true
 echo "   /etc/castr/wpa_supplicant-p2p.conf, /run/wpa_supplicant_castr"
