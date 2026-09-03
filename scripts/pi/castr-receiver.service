@@ -16,6 +16,11 @@ Environment=XDG_CONFIG_HOME=/var/lib/castr/config
 # starting; the script itself exits 0 regardless of what it finds.
 ExecStartPre=-/usr/local/lib/castr/wait-devices.sh
 TimeoutStartSec=30
+# The Miracast sink starts a supplicant, addresses the group interface, binds
+# DHCP on port 67 and binds that socket to the group device. Those need
+# NET_ADMIN, NET_BIND_SERVICE and NET_RAW respectively; nothing else here does.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
 ExecStart=/usr/local/bin/castr-receiver --fullscreen
 Restart=always
 RestartSec=2

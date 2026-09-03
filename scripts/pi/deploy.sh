@@ -26,6 +26,10 @@ fi
 # unit content.
 push scripts/pi/castr-receiver.service /tmp/castr-receiver.service
 push scripts/pi/wait-devices.sh /tmp/castr-wait-devices.sh
+# The Miracast supplicant configuration travels the same way and for the same
+# reason: a Pi provisioned before the sink existed has neither the file nor the
+# control-socket directory.
+push scripts/pi/wpa_supplicant-p2p.conf /tmp/castr-wpa-p2p.conf
 # sudo, not plain systemctl/journalctl: these Pis have no dbus daemon, and
 # without it an unprivileged user can't talk to systemd's system bus at all
 # (root bypasses dbus via /run/systemd/private).
@@ -35,7 +39,11 @@ ssh "$PI" '
   sudo install -d -m 0755 /usr/local/lib/castr
   sudo install -m 0755 /tmp/castr-wait-devices.sh /usr/local/lib/castr/wait-devices.sh
   sudo install -m 0644 /tmp/castr-receiver.service /etc/systemd/system/castr-receiver.service
-  rm -f /tmp/castr-receiver /tmp/castr-receiver.service /tmp/castr-wait-devices.sh
+  sudo install -d -m 0755 /etc/castr
+  sudo install -m 0644 /tmp/castr-wpa-p2p.conf /etc/castr/wpa_supplicant-p2p.conf
+  echo "d /run/wpa_supplicant_castr 0770 castr castr -" | sudo tee /etc/tmpfiles.d/castr.conf >/dev/null
+  sudo systemd-tmpfiles --create /etc/tmpfiles.d/castr.conf || true
+  rm -f /tmp/castr-receiver /tmp/castr-receiver.service /tmp/castr-wait-devices.sh /tmp/castr-wpa-p2p.conf
   sudo systemctl daemon-reload
   sudo systemctl restart castr-receiver
   sleep 5

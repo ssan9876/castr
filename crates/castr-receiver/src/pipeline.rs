@@ -1,4 +1,5 @@
 use crate::audio_out::AudioOut;
+use crate::display;
 use crate::render::Renderer;
 use anyhow::anyhow;
 use castr_media::clock::AvClock;
@@ -20,6 +21,17 @@ pub enum DecoderChoice {
     Mf,
     V4l2,
     Sw,
+}
+
+/// Whether to accept Miracast sources alongside castr's own protocol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum MiracastChoice {
+    /// Always run the sink; report loudly if the radio is unavailable.
+    On,
+    /// Never run it.
+    Off,
+    /// Run it when a wireless interface exists, logging the reason if not.
+    Auto,
 }
 
 /// Counts decoder errors and trips when `limit` occur within `within`.
@@ -202,6 +214,15 @@ pub struct ReceiverConfig {
     pub decoder: DecoderChoice,
     pub bind: SocketAddr,
     pub config_dir: PathBuf,
+    // Read by the sink lifecycle, which lands in the next task.
+    #[allow(dead_code)]
+    pub miracast: MiracastChoice,
+    /// Name shown in the Windows cast list; defaults to the hostname.
+    #[allow(dead_code)]
+    pub miracast_name: Option<String>,
+    /// 2.4 GHz channel for the Wi-Fi Direct group; `None` picks one.
+    #[allow(dead_code)]
+    pub miracast_channel: Option<u32>,
 }
 
 /// Messages from the network side to the SDL main thread.
@@ -209,6 +230,9 @@ pub enum UiEvent {
     Overlay(Option<String>),
     Frame(RawFrame),
     AudioPacket { ts_us: u64, data: Vec<u8> },
+    /// Ready-to-play samples. Miracast carries uncompressed audio, so it
+    /// bypasses the Opus decoder the castr path uses.
+    AudioPcm(Vec<i16>),
     Mode(Mode),
     Quit,
 }
@@ -289,6 +313,9 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     let stats = Arc::new(Mutex::new(Stats::default()));
     let perf = Arc::new(Mutex::new(PerfStats::default()));
     let dropped_since_report = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // One screen, two protocols: the arbiter decides who has it. Shared with
+    // the Miracast sink when that is running.
+    let display = Arc::new(display::DisplayArbiter::new());
     // Microseconds-since-`start` of the last `decode` call, so the SDL loop's
     // idle detection (below) can key off decoding as well as presenting: a
     // receiver whose decoder is running but whose presenter is stuck (e.g.
@@ -298,6 +325,12 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
     // call per frame and this must not add a lock to it.
     let last_decode_us = Arc::new(AtomicU64::new(0));
 
+    // The Miracast sink, when this build and this machine can run one. It
+    // feeds the same jitter buffer and the same decoder as the castr path;
+    // the arbiter guarantees only one of them is feeding at a time.
+    #[cfg(target_os = "linux")]
+    let miracast = start_miracast(&cfg, display.clone(), jitter.clone(), ui_tx.clone(), start);
+
     // Decode thread: jitter buffer -> decoder -> UI.
     {
         let jitter = jitter.clone();
@@ -306,6 +339,8 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         let perf = perf.clone();
         let last_decode_us = last_decode_us.clone();
         let choice = cfg.decoder;
+        #[cfg(target_os = "linux")]
+        let miracast = miracast.clone();
         std::thread::Builder::new()
             .name("decode".into())
             .spawn(move || {
@@ -362,8 +397,15 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                                 f.keyframe,
                                 last_decoded
                             );
-                            // Deltas are useless without a reference: skip them
-                            // until the network loop has fetched a fresh IDR.
+                            // Deltas are useless without a reference: skip
+                            // them until a fresh IDR arrives. The castr path
+                            // asks for one over its control channel; the
+                            // Miracast path asks over RTSP, and the sink
+                            // rate-limits the request.
+                            #[cfg(target_os = "linux")]
+                            if let Some(s) = &miracast {
+                                s.note_decode_error();
+                            }
                             jitter.lock().unwrap().require_keyframe();
                             if errors.record(Instant::now()) {
                                 // Three failures in ten seconds: rebuild, then
@@ -427,6 +469,7 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
         ui: ui_tx,
         start,
         pairing_guard: Mutex::new(PairingGuard::new()),
+        display: display.clone(),
         dropped: dropped_since_report.clone(),
     };
     rt.spawn(async move {
@@ -476,6 +519,12 @@ pub fn run(cfg: ReceiverConfig) -> anyhow::Result<()> {
                             &mut streaming_seen,
                             &mut last_perf,
                         )?;
+                    }
+                }
+                UiEvent::AudioPcm(samples) => {
+                    let ratio = clock.drift_ratio(audio.buffered_us(), audio.target_us);
+                    if let Err(e) = audio.push_pcm(&samples, ratio) {
+                        tracing::warn!("miracast audio: {e:#}");
                     }
                 }
                 UiEvent::AudioPacket { ts_us, data } if data.is_empty() => {
@@ -601,6 +650,8 @@ struct NetConfig {
     ui: mpsc::Sender<UiEvent>,
     start: Instant,
     pairing_guard: Mutex<PairingGuard>,
+    /// Which protocol owns the screen; shared with the Miracast sink.
+    display: Arc<display::DisplayArbiter>,
     dropped: Arc<std::sync::atomic::AtomicU32>,
 }
 
@@ -632,6 +683,10 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
             Ok(()) => tracing::info!("session ended"),
             Err(e) => tracing::warn!("connection error: {e:#}"),
         }
+        // Every exit from the handler frees the screen, including the error
+        // paths; a release from a protocol that does not hold it is a no-op,
+        // so a refused connection cannot free the owner's display.
+        cfg.display.release(display::Owner::Castr);
         if should_mark_disconnected(session.state()) {
             session.on_disconnect(now_us(cfg.start));
         }
@@ -727,6 +782,22 @@ async fn handle_connection(
                     }
                 }
                 if matches!(session.state(), ReceiverState::Streaming { .. }) {
+                    // One display, two protocols: whoever is already casting
+                    // keeps it. Refuse rather than steal the screen from a
+                    // guest mid-presentation.
+                    if !cfg.display.try_acquire(display::Owner::Castr) {
+                        tracing::info!(
+                            "refusing castr sender: display owned by {:?}",
+                            cfg.display.owner()
+                        );
+                        link.send_control(&ControlMessage::Error {
+                            code: 5,
+                            message: "display busy".into(),
+                        })
+                        .await?;
+                        link.close("display busy");
+                        return Ok(());
+                    }
                     if was_disconnected {
                         tracing::info!("resuming stream");
                     }
@@ -1012,4 +1083,128 @@ mod tests {
         // Taking resets the counters.
         assert!(p.take_report(0, 0).contains("pictures 0"));
     }
+}
+
+/// Starts the Miracast sink and the thread that drains its events into the
+/// pipeline. `None` when this machine has no wireless interface and the choice
+/// was `Auto`, or when the sink cannot start at all.
+#[cfg(target_os = "linux")]
+fn start_miracast(
+    cfg: &ReceiverConfig,
+    display: Arc<display::DisplayArbiter>,
+    jitter: Arc<Mutex<JitterBuffer>>,
+    ui: mpsc::Sender<UiEvent>,
+    start: Instant,
+) -> Option<Arc<castr_miracast::sink::Sink>> {
+    use castr_miracast::sink::{Sink, SinkConfig, SinkOut};
+
+    match cfg.miracast {
+        MiracastChoice::Off => return None,
+        MiracastChoice::Auto => {
+            let iface = std::path::Path::new("/sys/class/net").join(castr_miracast::sink::WLAN);
+            if !iface.exists() {
+                tracing::info!(
+                    "miracast: not starting, {} does not exist (pass --miracast on to force it)",
+                    iface.display()
+                );
+                return None;
+            }
+        }
+        MiracastChoice::On => {}
+    }
+
+    struct Arbiter(Arc<display::DisplayArbiter>);
+    impl castr_miracast::sink::DisplayArbiterHandle for Arbiter {
+        fn try_acquire(&self) -> bool {
+            self.0.try_acquire(display::Owner::Miracast)
+        }
+        fn release(&self) {
+            self.0.release(display::Owner::Miracast);
+        }
+    }
+
+    let sink_cfg = SinkConfig {
+        name: cfg.miracast_name.clone().unwrap_or_else(|| cfg.name.clone()),
+        channel: cfg.miracast_channel,
+        paired_path: cfg.config_dir.join("miracast-peers.txt"),
+        ..SinkConfig::default()
+    };
+    let sink = match Sink::start(sink_cfg, Arc::new(Arbiter(display))) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::error!("miracast: sink did not start: {e:#}");
+            return None;
+        }
+    };
+    let Some(events) = sink.events() else {
+        return Some(sink);
+    };
+
+    std::thread::Builder::new()
+        .name("miracast-events".into())
+        .spawn(move || {
+            // The jitter buffer orders by frame number, which Miracast does not
+            // carry, so we number the access units as they arrive. RTP
+            // reordering has already happened inside the sink.
+            let mut frame_number: u32 = 0;
+            while let Ok(ev) = events.recv() {
+                match ev {
+                    SinkOut::Pin(pin) => {
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(format!(
+                            "Miracast PIN: {pin}"
+                        ))));
+                    }
+                    SinkOut::Started => {
+                        let _ = ui.blocking_send(UiEvent::Overlay(None));
+                    }
+                    SinkOut::Video { data, pts_us } => {
+                        let keyframe = has_keyframe(&data);
+                        let frame = CompleteFrame {
+                            stream: 0,
+                            frame_number,
+                            timestamp_us: pts_us.unwrap_or_else(|| now_us(start)),
+                            keyframe,
+                            data,
+                        };
+                        frame_number = frame_number.wrapping_add(1);
+                        jitter.lock().unwrap().push(frame, now_us(start));
+                    }
+                    SinkOut::Audio { data, .. } => {
+                        // LPCM, 16-bit big-endian stereo at 48 kHz, which is
+                        // the only audio format we offer the source.
+                        let samples: Vec<i16> = data
+                            .chunks_exact(2)
+                            .map(|b| i16::from_be_bytes([b[0], b[1]]))
+                            .collect();
+                        let _ = ui.blocking_send(UiEvent::AudioPcm(samples));
+                    }
+                    SinkOut::Ended(reason) => {
+                        tracing::info!("miracast: {reason}");
+                        let _ = ui.blocking_send(UiEvent::Overlay(None));
+                        jitter.lock().unwrap().flush();
+                    }
+                }
+            }
+        })
+        .ok()?;
+    Some(sink)
+}
+
+/// True when an Annex B access unit contains an IDR slice or a parameter set,
+/// which is what the decoder needs to start or to recover.
+#[cfg(target_os = "linux")]
+fn has_keyframe(data: &[u8]) -> bool {
+    let mut i = 0;
+    while i + 4 <= data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            let nal = data[i + 3] & 0x1f;
+            if nal == 5 || nal == 7 {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }

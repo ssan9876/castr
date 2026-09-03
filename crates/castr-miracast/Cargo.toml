@@ -1,0 +1,14 @@
+[package]
+name = "castr-miracast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+castr-media = { path = "../castr-media" }
+castr-proto = { path = "../castr-proto" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

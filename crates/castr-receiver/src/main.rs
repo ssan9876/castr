@@ -1,9 +1,10 @@
 mod audio_out;
+mod display;
 mod pipeline;
 mod render;
 
 use clap::Parser;
-use pipeline::{DecoderChoice, ReceiverConfig};
+use pipeline::{DecoderChoice, MiracastChoice, ReceiverConfig};
 
 #[derive(Parser)]
 #[command(name = "castr-receiver", about = "castr screen receiver")]
@@ -21,6 +22,15 @@ struct Cli {
     /// UDP address to bind for QUIC
     #[arg(long, default_value = "0.0.0.0:7332")]
     bind: std::net::SocketAddr,
+    /// Accept Miracast sources as well (Linux only)
+    #[arg(long, value_enum, default_value_t = MiracastChoice::Auto)]
+    miracast: MiracastChoice,
+    /// Name shown in the Windows cast list (defaults to the hostname)
+    #[arg(long)]
+    miracast_name: Option<String>,
+    /// 2.4 GHz channel for the Wi-Fi Direct group
+    #[arg(long, value_parser = ["1", "6", "11", "auto"], default_value = "auto")]
+    miracast_channel: String,
 }
 
 fn default_name() -> String {
@@ -63,6 +73,10 @@ fn main() -> anyhow::Result<()> {
         max_bitrate: cli.max_bitrate,
         decoder: cli.decoder,
         bind: cli.bind,
+        miracast: cli.miracast,
+        miracast_name: cli.miracast_name,
+        // "auto" means we pick the least busy channel at group creation.
+        miracast_channel: cli.miracast_channel.parse().ok(),
         config_dir: castr_net::config_dir().join("receiver"),
     })
 }

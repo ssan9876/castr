@@ -184,6 +184,36 @@ in `scripts/pi/Dockerfile` plus `LIBOPUS_LIB_DIR=/usr/lib/<triplet>
 OPUS_NO_PKG_CONFIG=1` so Opus links statically; without those the audiopus
 crate links `libopus.so` dynamically or tries to run autotools.
 
+## Casting from Windows without installing anything
+
+The Pi receiver also answers Miracast, so a Windows PC can cast to it with no
+castr software installed at all.
+
+1. Press **Windows+K** on the PC and pick the Pi from the list. It appears
+   under the receiver's name (`--miracast-name` overrides it, and it defaults
+   to the hostname).
+2. The television shows an eight-digit PIN. Type it on the PC.
+3. The desktop appears. The PC remembers the Pi, so later casts skip the PIN.
+
+Three limits, stated plainly:
+
+- **720p30.** The Pi's radio is 2.4 GHz only, and 1080p over it drops frames
+  rather than degrading gracefully. The sink offers 720p30 and nothing else.
+- **No HDCP.** Protected video — Netflix, Amazon, most streaming apps — shows
+  as a black rectangle. That needs licensed keys, which castr does not have.
+  Everything else mirrors normally.
+- **One protocol at a time.** The Pi has one screen. Whichever protocol
+  connects first owns it until it disconnects; the other is refused with
+  "display busy" rather than taking the screen from someone mid-presentation.
+
+The sink runs by default when a wireless interface exists. `--miracast off`
+turns it off, `--miracast on` forces it on, and `--miracast-channel 1|6|11`
+pins the Wi-Fi Direct channel instead of picking the least busy one.
+
+If Windows drops the cast repeatedly, run `castr-sender diagnose` on the PC: it
+checks the local causes — a shared Wi-Fi/Bluetooth antenna, adapter power
+saving, driver age — and offers to fix the safe ones.
+
 ## Known gaps
 
 - The mouse cursor is not composited into the cast yet.
@@ -191,8 +221,11 @@ crate links `libopus.so` dynamically or tries to run autotools.
   a 150 ms hold and a fresh keyframe; on a Pi 3 over Ethernet that happens a
   few times a minute.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
-- V4L2 hardware decode, DRM/KMS output, and Miracast sink mode are later
-  sub-projects.
+- V4L2 hardware decode and DRM/KMS output landed in sub-project 2; Miracast
+  over Infrastructure (casting without forming a Wi-Fi Direct group) is a later
+  sub-project.
+- Miracast audio is carried as uncompressed LPCM and is not yet measured
+  against video for lip sync.
 
 ## Testing
 
