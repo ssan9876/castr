@@ -11,8 +11,8 @@
 // layers end up ungated so their tests run everywhere; only `sink`, which owns
 // the supplicant and the sockets, is Linux-only.
 pub mod rtsp;
+pub mod ts;
 pub mod wfd;
-// Task 4: pub mod ts;
 // Task 5: pub mod rtp;
 // Task 6: pub mod dhcp;
 // Task 7: pub mod p2p;
