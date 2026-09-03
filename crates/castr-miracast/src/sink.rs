@@ -10,6 +10,7 @@
 //! only when there is work.
 
 use crate::dhcp;
+use crate::lifecycle;
 use crate::p2p::{Command, Control, Event};
 use crate::session::{Session, SinkEvent};
 use crate::wfd::{AudioCodecs, Capabilities, ClientPorts, DeviceInfo, VideoFormats};
@@ -84,6 +85,8 @@ pub enum SinkOut {
     },
     Started,
     Ended(String),
+    /// The peer vanished but the group and the screen are still theirs.
+    Reconnecting,
 }
 
 enum Cmd {
@@ -248,6 +251,7 @@ fn serve(
     let mut conn: Option<TcpStream> = None;
     let mut session: Option<Session> = None;
     let mut held = false;
+    let mut life = lifecycle::Lifecycle::new();
     let mut buf = vec![0u8; 65536];
 
     loop {
@@ -293,11 +297,20 @@ fn serve(
                 Event::ClientConnected { mac } => {
                     peers.remember(&mac);
                 }
-                Event::ClientDisconnected { .. } | Event::GroupRemoved { .. } => {
-                    if held {
-                        arbiter.release();
-                    }
+                Event::ClientDisconnected { .. } => {
+                    conn = None;
+                    session = None;
                     let _ = out.send(SinkOut::Ended("peer disconnected".into()));
+                    for a in life.on(lifecycle::Event::Ended, Instant::now()) {
+                        apply_lifecycle(a, arbiter, out, &mut held);
+                    }
+                }
+                Event::GroupRemoved { .. } => {
+                    // The group going away under us is the one thing we cannot
+                    // hold through: everything about it is now invalid.
+                    for a in life.on(lifecycle::Event::RadioError, Instant::now()) {
+                        apply_lifecycle(a, arbiter, out, &mut held);
+                    }
                     return Ok(());
                 }
                 Event::GroupStarted { .. } => {}
@@ -326,7 +339,8 @@ fn serve(
         if conn.is_none() {
             match listener.accept() {
                 Ok((s, from)) => {
-                    if !arbiter.try_acquire() {
+                    let resuming = life.phase() == lifecycle::Phase::Holding;
+                    if !resuming && !arbiter.try_acquire() {
                         tracing::info!("miracast: refusing {from}: the display is busy");
                         drop(s);
                     } else {
@@ -336,6 +350,9 @@ fn serve(
                         s.set_nodelay(true)?;
                         conn = Some(s);
                         session = Some(Session::new(capabilities(cfg), session_id()));
+                        for a in life.on(lifecycle::Event::Connected, Instant::now()) {
+                            apply_lifecycle(a, arbiter, out, &mut held);
+                        }
                     }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {}
@@ -387,14 +404,48 @@ fn serve(
         }
 
         if let Some(reason) = ended {
-            tracing::info!("miracast: session ended: {reason}");
+            tracing::info!("miracast: session ended: {reason}, holding the group");
             let _ = out.send(SinkOut::Ended(reason));
-            if held {
-                arbiter.release();
+            conn = None;
+            session = None;
+            // The group, its credentials and (for now) the screen stay. A peer
+            // that dropped for a moment finds everything as it left it.
+            for a in life.on(lifecycle::Event::Ended, Instant::now()) {
+                apply_lifecycle(a, arbiter, out, &mut held);
             }
-            // A new group for the next connection: the source expects a fresh
-            // advertisement, and this clears any half-open radio state.
-            return Ok(());
+        }
+
+        for a in life.tick(Instant::now()) {
+            apply_lifecycle(a, arbiter, out, &mut held);
+        }
+    }
+}
+
+/// Carries out one lifecycle decision. The state machine decides; this does.
+fn apply_lifecycle(
+    a: lifecycle::Action,
+    arbiter: &Arc<dyn DisplayArbiterHandle>,
+    out: &mpsc::Sender<SinkOut>,
+    held: &mut bool,
+) {
+    match a {
+        lifecycle::Action::AcquireDisplay => {
+            *held = arbiter.try_acquire();
+        }
+        lifecycle::Action::ReleaseDisplay => {
+            if *held {
+                arbiter.release();
+                *held = false;
+            }
+        }
+        lifecycle::Action::ShowReconnecting => {
+            let _ = out.send(SinkOut::Reconnecting);
+        }
+        lifecycle::Action::ClearOverlay => {
+            let _ = out.send(SinkOut::Started);
+        }
+        lifecycle::Action::RebuildGroup => {
+            tracing::warn!("miracast: the group failed; rebuilding it");
         }
     }
 }

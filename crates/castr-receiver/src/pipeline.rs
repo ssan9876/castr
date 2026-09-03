@@ -1157,6 +1157,11 @@ fn start_miracast(
                     SinkOut::Started => {
                         let _ = ui.blocking_send(UiEvent::Overlay(None));
                     }
+                    SinkOut::Reconnecting => {
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(
+                            "Reconnecting…".into(),
+                        )));
+                    }
                     SinkOut::Video { data, pts_us } => {
                         let keyframe = has_keyframe(&data);
                         let frame = CompleteFrame {
