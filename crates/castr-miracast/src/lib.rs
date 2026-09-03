@@ -18,4 +18,5 @@ pub mod session;
 pub mod test_support;
 pub mod ts;
 pub mod wfd;
-// Task 10: #[cfg(target_os = "linux")] pub mod sink;
+#[cfg(target_os = "linux")]
+pub mod sink;

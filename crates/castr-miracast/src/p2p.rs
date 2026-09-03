@@ -10,6 +10,10 @@
 pub struct Command;
 
 impl Command {
+    /// The name Windows shows in its cast list.
+    pub fn device_name(name: &str) -> String {
+        format!("SET device_name {name}")
+    }
     pub fn wifi_display_enable() -> String {
         "SET wifi_display 1".into()
     }
@@ -175,6 +179,12 @@ mod control {
             } else {
                 Err(io::Error::other(format!("ATTACH: {reply}")))
             }
+        }
+
+        /// The raw descriptor, so a caller can poll it alongside its own
+        /// sockets instead of spinning on short timeouts.
+        pub fn as_raw_fd(&self) -> std::os::fd::RawFd {
+            self.fd.as_raw_fd()
         }
 
         pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {

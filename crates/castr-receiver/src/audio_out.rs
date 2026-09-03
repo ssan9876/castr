@@ -67,6 +67,19 @@ impl AudioOut {
         Ok(true)
     }
 
+    /// Queue samples that arrived uncompressed, as Miracast's LPCM does.
+    /// Same drift correction as the Opus path, no decoder in the way.
+    pub fn push_pcm(&mut self, pcm: &[i16], drift_ratio: f64) -> anyhow::Result<bool> {
+        if self.buffered_us() > self.target_us * 4 {
+            return Ok(false);
+        }
+        let pcm = resample_linear(pcm, drift_ratio);
+        self.queue
+            .queue_audio(&pcm)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        Ok(true)
+    }
+
     pub fn conceal_one(&mut self) -> anyhow::Result<()> {
         let pcm = self.decoder.decode(None)?;
         self.queue
