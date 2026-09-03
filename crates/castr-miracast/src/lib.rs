@@ -11,6 +11,7 @@
 // layers end up ungated so their tests run everywhere; only `sink`, which owns
 // the supplicant and the sockets, is Linux-only.
 pub mod dhcp;
+pub mod lifecycle;
 pub mod p2p;
 pub mod quality;
 pub mod rtp;
