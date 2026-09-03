@@ -288,7 +288,14 @@ fn serve(
                         }
                     );
                     let _ = out.send(SinkOut::Pin(pin.clone()));
-                    say(ctrl, &Command::wps_pin(&pin))?;
+                    if let Err(e) = say(ctrl, &Command::wps_pin(&pin)) {
+                        // A control socket that will not take a command is
+                        // not a socket we can trust the group through.
+                        for a in life.on(lifecycle::Event::RadioError, Instant::now()) {
+                            apply_lifecycle(a, arbiter, out, &mut held);
+                        }
+                        return Err(e);
+                    }
                 }
                 Event::WpsSuccess => {}
                 Event::WpsFail => {
@@ -339,19 +346,28 @@ fn serve(
         if conn.is_none() {
             match listener.accept() {
                 Ok((s, from)) => {
-                    let resuming = life.phase() == lifecycle::Phase::Holding;
-                    if !resuming && !arbiter.try_acquire() {
-                        tracing::info!("miracast: refusing {from}: the display is busy");
+                    // Configure the socket before deciding anything about the
+                    // display: a socket we could not configure is a
+                    // connection that never happened, and must not touch the
+                    // arbiter at all (acquiring it first and only then
+                    // failing here would leak it, since nothing downstream
+                    // would ever release an acquisition `held` never saw).
+                    if let Err(e) = s.set_nonblocking(true).and_then(|_| s.set_nodelay(true)) {
+                        tracing::warn!("miracast: refusing {from}: {e}");
                         drop(s);
                     } else {
-                        tracing::info!("miracast: RTSP connection from {from}");
-                        held = true;
-                        s.set_nonblocking(true)?;
-                        s.set_nodelay(true)?;
-                        conn = Some(s);
-                        session = Some(Session::new(capabilities(cfg), session_id()));
-                        for a in life.on(lifecycle::Event::Connected, Instant::now()) {
-                            apply_lifecycle(a, arbiter, out, &mut held);
+                        let resuming = life.phase() == lifecycle::Phase::Holding;
+                        if !resuming && !arbiter.try_acquire() {
+                            tracing::info!("miracast: refusing {from}: the display is busy");
+                            drop(s);
+                        } else {
+                            tracing::info!("miracast: RTSP connection from {from}");
+                            held = true;
+                            conn = Some(s);
+                            session = Some(Session::new(capabilities(cfg), session_id()));
+                            for a in life.on(lifecycle::Event::Connected, Instant::now()) {
+                                apply_lifecycle(a, arbiter, out, &mut held);
+                            }
                         }
                     }
                 }
