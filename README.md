@@ -199,20 +199,26 @@ Three limits, stated plainly:
 
 - **720p30.** The Pi's radio is 2.4 GHz only, and 1080p over it drops frames
   rather than degrading gracefully. The sink offers 720p30 and nothing else.
-- **No HDCP.** Protected video — Netflix, Amazon, most streaming apps — shows
+- **No HDCP.** Protected video ï¿½ Netflix, Amazon, most streaming apps ï¿½ shows
   as a black rectangle. That needs licensed keys, which castr does not have.
   Everything else mirrors normally.
 - **One protocol at a time.** The Pi has one screen. Whichever protocol
   connects first owns it until it disconnects; the other is refused with
   "display busy" rather than taking the screen from someone mid-presentation.
 
+If the link wobbles, the Pi asks your PC to send less data rather than ending
+the session, and if the connection does break outright, the Pi keeps the
+group and your screen for thirty seconds so you come straight back with no
+PIN. A drop that lasts longer than that returns the Pi to its idle screen, and
+you can reconnect from Windows+K without re-pairing.
+
 The sink runs by default when a wireless interface exists. `--miracast off`
 turns it off, `--miracast on` forces it on, and `--miracast-channel 1|6|11`
 pins the Wi-Fi Direct channel instead of picking the least busy one.
 
 If Windows drops the cast repeatedly, run `castr-sender diagnose` on the PC: it
-checks the local causes — a shared Wi-Fi/Bluetooth antenna, adapter power
-saving, driver age — and offers to fix the safe ones.
+checks the local causes ï¿½ a shared Wi-Fi/Bluetooth antenna, adapter power
+saving, driver age ï¿½ and offers to fix the safe ones.
 
 ## Known gaps
 

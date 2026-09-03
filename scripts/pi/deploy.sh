@@ -33,7 +33,19 @@ push scripts/pi/wpa_supplicant-p2p.conf /tmp/castr-wpa-p2p.conf
 # sudo, not plain systemctl/journalctl: these Pis have no dbus daemon, and
 # without it an unprivileged user can't talk to systemd's system bus at all
 # (root bypasses dbus via /run/systemd/private).
-ssh "$PI" '
+# Piped over stdin (bash -s), not passed as a `ssh "$PI" '...'` command-line
+# argument: when the whole block is an argv string, the remote shell's own
+# cmdline *is* that string, and `pkill -f`'s pattern is matched with `.` free
+# to cross newlines - so an earlier, unrelated, unbracketed "wpa_supplicant"
+# anywhere above (e.g. the install line's own
+# /etc/castr/wpa_supplicant-p2p.conf destination path, which cannot itself be
+# bracketed - it is a real filename) still anchors a match that runs all the
+# way down to this line's own "-c ...wpa_supplicant-p2p.conf" text, SIGTERMing
+# the sudo parent and the deploying shell before anything after it runs. Over
+# stdin the remote process's cmdline is just "bash -s": nothing here is ever
+# visible to `pkill -f` as text to match against, so the self-match is closed
+# for good rather than one occurrence at a time.
+ssh "$PI" bash -s <<'REMOTE' || { echo "service not active after restart:"; ssh "$PI" 'sudo journalctl -u castr-receiver -n 20 --no-pager'; exit 1; }
   set -e
   sudo install -m 0755 /tmp/castr-receiver /usr/local/bin/castr-receiver
   sudo install -d -m 0755 /usr/local/lib/castr
@@ -43,10 +55,19 @@ ssh "$PI" '
   sudo install -m 0644 /tmp/castr-wpa-p2p.conf /etc/castr/wpa_supplicant-p2p.conf
   echo "d /run/wpa_supplicant_castr 0770 castr castr -" | sudo tee /etc/tmpfiles.d/castr.conf >/dev/null
   sudo systemd-tmpfiles --create /etc/tmpfiles.d/castr.conf || true
+  # ensure_supplicant() in the sink only starts the supplicant when its
+  # control socket is missing, so a config change installed above would
+  # otherwise sit unread until the next reboot: the old supplicant process
+  # keeps running with the old settings, and its socket keeps the sink from
+  # starting a new one. Kill it here; the sink starts a fresh instance, with
+  # the config just installed, on its next pass. [w] keeps this pkill's own
+  # argument text from matching its own pattern (see the stdin note above for
+  # why that alone is not sufficient, and why this block is piped instead).
+  sudo pkill -f "[w]pa_supplicant .*-c /etc/castr/wpa_supplicant-p2p.conf" || true
   rm -f /tmp/castr-receiver /tmp/castr-receiver.service /tmp/castr-wait-devices.sh /tmp/castr-wpa-p2p.conf
   sudo systemctl daemon-reload
   sudo systemctl restart castr-receiver
   sleep 5
   sudo systemctl is-active castr-receiver
-' || { echo "service not active after restart:"; ssh "$PI" 'sudo journalctl -u castr-receiver -n 20 --no-pager'; exit 1; }
+REMOTE
 echo "deployed to $PI"

@@ -1157,6 +1157,20 @@ fn start_miracast(
                     SinkOut::Started => {
                         let _ = ui.blocking_send(UiEvent::Overlay(None));
                     }
+                    SinkOut::Reconnecting => {
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(
+                            "Reconnecting…".into(),
+                        )));
+                    }
+                    SinkOut::Idle => {
+                        // The hold expired: same text the castr path restores
+                        // when it releases the screen (pipeline.rs:694-697),
+                        // so the two protocols leave the screen in the same
+                        // state.
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(
+                            "Waiting for sender".into(),
+                        )));
+                    }
                     SinkOut::Video { data, pts_us } => {
                         let keyframe = has_keyframe(&data);
                         let frame = CompleteFrame {
@@ -1179,8 +1193,10 @@ fn start_miracast(
                         let _ = ui.blocking_send(UiEvent::AudioPcm(samples));
                     }
                     SinkOut::Ended(reason) => {
+                        // No overlay update here: whatever the lifecycle sends
+                        // next (Reconnecting or Idle) sets the right text, and
+                        // blanking first only creates a flicker.
                         tracing::info!("miracast: {reason}");
-                        let _ = ui.blocking_send(UiEvent::Overlay(None));
                         jitter.lock().unwrap().flush();
                     }
                 }
