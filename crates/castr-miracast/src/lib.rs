@@ -10,11 +10,11 @@
 // Declared as each task creates its file. The parsing and state-machine
 // layers end up ungated so their tests run everywhere; only `sink`, which owns
 // the supplicant and the sockets, is Linux-only.
+pub mod dhcp;
 pub mod rtp;
 pub mod rtsp;
 pub mod ts;
 pub mod wfd;
-// Task 6: pub mod dhcp;
 // Task 7: pub mod p2p;
 // Task 8: pub mod session;
 // Task 10: #[cfg(target_os = "linux")] pub mod sink;
