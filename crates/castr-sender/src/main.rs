@@ -1,4 +1,5 @@
 mod cast;
+mod diagnose;
 mod gui;
 
 use cast::*;
