@@ -3,10 +3,6 @@
 //! missing input yields `None` for that field rather than an error, because a
 //! probe that cannot answer must not become a false verdict.
 
-// `SETTING_WIFI_POWER` and `SETTING_USB_SUSPEND` are only consumed by
-// `fix.rs`, which Task 4 adds; the rest of this file is now in use.
-#![allow(dead_code)]
-
 /// Which halves of the wireless-display stack Windows reports as present.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WirelessDisplay {

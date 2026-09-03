@@ -8,6 +8,7 @@
 #[cfg(windows)]
 pub mod collect;
 pub mod facts;
+pub mod fix;
 pub mod render;
 pub mod rules;
 
@@ -37,14 +38,4 @@ pub fn run(apply_fixes: bool) -> anyhow::Result<i32> {
         rules::Severity::Ok | rules::Severity::Info => 0,
         _ => 1,
     })
-}
-
-/// Interim: replaced wholesale by `fix.rs` in Task 4.
-#[cfg(windows)]
-mod fix {
-    use super::{facts::Facts, rules::Finding};
-    pub fn prompt_and_apply(_f: &[Finding], _facts: &Facts) -> anyhow::Result<()> {
-        println!("(fixes are not implemented yet)");
-        Ok(())
-    }
 }
