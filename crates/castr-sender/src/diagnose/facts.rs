@@ -200,8 +200,7 @@ Interface name: Wi-Fi
     Wireless Display Supported: Yes (Graphics Driver: Yes, Wi-Fi Driver: Yes)
 ";
 
-    const IDLE_IFACE: &str = "\
-
+    const IDLE_IFACE: &str = "\n\
 There is 1 interface on the system:
 
     Name                   : Wi-Fi
@@ -211,8 +210,7 @@ There is 1 interface on the system:
     State                  : disconnected
 ";
 
-    const CONNECTED_IFACE: &str = "\
-
+    const CONNECTED_IFACE: &str = "\n\
 There is 1 interface on the system:
 
     Name                   : Wi-Fi
