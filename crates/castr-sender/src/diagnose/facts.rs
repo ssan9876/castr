@@ -3,8 +3,8 @@
 //! missing input yields `None` for that field rather than an error, because a
 //! probe that cannot answer must not become a false verdict.
 
-// `rules`, `collect`, and `fix` (later tasks) consume `Facts`, `WirelessDisplay::both`,
-// and the power-scheme id constants defined here; this task only needs the parsers.
+// `SETTING_WIFI_POWER` and `SETTING_USB_SUSPEND` are only consumed by
+// `fix.rs`, which Task 4 adds; the rest of this file is now in use.
 #![allow(dead_code)]
 
 /// Which halves of the wireless-display stack Windows reports as present.

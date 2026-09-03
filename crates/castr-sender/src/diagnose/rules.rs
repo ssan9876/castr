@@ -8,9 +8,6 @@
 //! say nothing while the radio is idle, USB suspend says nothing about a PCIe
 //! adapter.
 
-// Task 3 (`render`) is the first caller of `analyse`.
-#![allow(dead_code)]
-
 use crate::diagnose::facts::Facts;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

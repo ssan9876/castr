@@ -20,6 +20,12 @@ enum Cmd {
     List,
     /// Pair with a receiver (shows a PIN on the receiver)
     Pair { target: String },
+    /// Check this machine's Wi-Fi for the known causes of Miracast drops
+    Diagnose {
+        /// Offer to apply the safe fixes, prompting for each
+        #[arg(long)]
+        fix: bool,
+    },
     /// Cast the screen to a receiver
     Cast {
         target: String,
@@ -95,6 +101,10 @@ fn main() -> anyhow::Result<()> {
             println!("paired with {}", info.name);
             Ok(())
         }),
+        Some(Cmd::Diagnose { fix }) => {
+            let code = diagnose::run(fix)?;
+            std::process::exit(code);
+        }
         Some(Cmd::Cast {
             target,
             mode,
