@@ -12,6 +12,7 @@
 // the supplicant and the sockets, is Linux-only.
 pub mod dhcp;
 pub mod p2p;
+pub mod quality;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
