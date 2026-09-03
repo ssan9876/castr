@@ -54,6 +54,9 @@ impl BitrateLadder {
                 return None;
             }
         }
+        // The very first call has no `last_sample` to compare against, so it
+        // always bypasses the rate limit above. Intentional: there is nothing
+        // to rate-limit against yet.
         self.last_sample = Some(now);
         let delta = cumulative_loss.saturating_sub(self.last_loss);
         self.last_loss = cumulative_loss;
@@ -144,7 +147,11 @@ mod tests {
     fn samples_closer_than_a_second_are_ignored() {
         let mut l = BitrateLadder::new();
         let t0 = Instant::now();
+        // Seed `last_sample`; the first-ever call bypasses the rate limit
+        // itself, so this one proves nothing about the gate.
         assert_eq!(l.sample(0, t0 + Duration::from_millis(100)), None);
+        // A loss well above the bad-second threshold would trigger a drop on
+        // its own, so only the time gate can explain a `None` here.
         assert_eq!(l.sample(99, t0 + Duration::from_millis(200)), None,
                    "a burst inside one second is still one second");
     }
