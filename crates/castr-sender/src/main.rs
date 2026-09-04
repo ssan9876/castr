@@ -38,6 +38,10 @@ enum Cmd {
         duration: Option<u64>,
         #[arg(long, default_value_t = 30)]
         fps: u32,
+        /// Which way to lean when the display offers several picture modes:
+        /// quality takes the bigger picture, game the faster one
+        #[arg(long, value_enum, default_value_t = ModeArg::Quality)]
+        mode: ModeArg,
     },
     /// Cast the screen to a receiver
     Cast {
@@ -137,6 +141,7 @@ fn main() -> anyhow::Result<()> {
             target,
             duration,
             fps,
+            mode,
         }) => {
             // A name is the ordinary case; an address skips the radio entirely,
             // which is how this was tested before the radio existed and how a
@@ -150,10 +155,14 @@ fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
-            let opts = miracast_cast::MiracastOptions {
+            let mut opts = miracast_cast::MiracastOptions {
                 duration: duration.map(Duration::from_secs),
                 output,
                 fps,
+                mode: mode.into(),
+                // Filled in below when the radio has read the display's own
+                // advertisement; an address alone tells us nothing about it.
+                ceiling_mbps: None,
             };
             match addr {
                 Some(addr) => miracast_cast::cast_to(addr, opts),
@@ -172,6 +181,7 @@ fn main() -> anyhow::Result<()> {
                         connection.remote_ip(),
                         connection.rtsp_port(),
                     );
+                    opts.ceiling_mbps = connection.max_throughput_mbps();
                     let result = miracast_cast::cast_to(addr, opts);
                     // The group goes when this does, which is the teardown.
                     drop(connection);

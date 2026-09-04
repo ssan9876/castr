@@ -93,6 +93,7 @@ pub struct Connection {
     remote: IpAddr,
     rtsp_port: u16,
     name: String,
+    caps: Option<castr_miracast::wfd::DeviceCaps>,
     up: Arc<AtomicBool>,
 }
 
@@ -107,6 +108,12 @@ impl Connection {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// What the display's own advertisement said it can carry. Worth more than
+    /// a guess: it is the display's own number, read before connecting.
+    pub fn max_throughput_mbps(&self) -> Option<u16> {
+        self.caps.map(|c| c.max_throughput_mbps)
     }
 
     /// False once the radio has seen the display go away. A cast watching this
@@ -239,6 +246,7 @@ fn bring_up(
         remote,
         rtsp_port,
         name: target.name.clone(),
+        caps: target.caps,
         up,
     })
 }
