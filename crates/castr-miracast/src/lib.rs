@@ -1,7 +1,10 @@
-//! A Miracast (Wi-Fi Display) sink: Wi-Fi Direct group owner, RTSP session,
-//! MPEG-TS over RTP, decoded by the same pipeline castr's own protocol uses.
-//! Linux only in its radio layer; on other targets the pure layers still build
-//! so the workspace compiles everywhere.
+//! Miracast (Wi-Fi Display), both roles.
+//!
+//! The sink is a Wi-Fi Direct group owner with an RTSP session and MPEG-TS over
+//! RTP, decoded by the same pipeline castr's own protocol uses. The `source`
+//! modules mirror it in the other direction, for casting to an ordinary
+//! Miracast display. Linux only in its radio layer; on other targets the pure
+//! layers still build so the workspace compiles everywhere.
 //!
 //! The parsing layers (`wfd`, `rtsp`, `ts`, `rtp`, `dhcp`, `pairing`,
 //! `supplicant_conf`) are pure and are
@@ -19,6 +22,7 @@ pub mod quality;
 pub mod rtp;
 pub mod rtsp;
 pub mod session;
+pub mod source;
 pub mod supplicant_conf;
 pub mod test_support;
 pub mod ts;
