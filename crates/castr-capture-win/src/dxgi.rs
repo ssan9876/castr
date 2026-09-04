@@ -155,12 +155,18 @@ impl DesktopCapture {
         } else {
             None
         };
-        self.cursor.update(
-            info.PointerPosition.Position.x,
-            info.PointerPosition.Position.y,
-            info.PointerPosition.Visible.as_bool(),
-            shape,
-        );
+        // PointerPosition is filled in only on a frame that carries a mouse
+        // update; on every other frame it is zeroed. Reading it regardless
+        // would park a still cursor at the origin and call it hidden, which is
+        // most of the time - the pointer is stationary far more often than not.
+        let position = (info.LastMouseUpdateTime != 0).then(|| {
+            (
+                info.PointerPosition.Position.x,
+                info.PointerPosition.Position.y,
+                info.PointerPosition.Visible.as_bool(),
+            )
+        });
+        self.cursor.update(position, shape);
         let result = (|| -> anyhow::Result<RawFrame> {
             let tex: ID3D11Texture2D = resource
                 .as_ref()

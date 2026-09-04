@@ -131,8 +131,9 @@ pub fn blend(
 
 /// The last shape, position and visibility reported by the duplication API.
 ///
-/// A shape arrives only when it changes, so it is held until replaced;
-/// everything else is refreshed per frame.
+/// Neither half arrives every frame: a shape comes only when it changes, and a
+/// position only on a frame that carries a mouse update. Both are therefore
+/// held until something replaces them.
 #[derive(Default)]
 pub struct CursorCache {
     shape: Option<CursorShape>,
@@ -146,16 +147,26 @@ impl CursorCache {
         Self::default()
     }
 
-    pub fn update(&mut self, x: i32, y: i32, visible: bool, shape: Option<CursorShape>) {
-        self.x = x;
-        self.y = y;
-        self.visible = visible;
+    /// `position` is `Some((x, y, visible))` only for a frame that reported a
+    /// mouse update; `None` means "nothing new", not "no cursor".
+    pub fn update(&mut self, position: Option<(i32, i32, bool)>, shape: Option<CursorShape>) {
+        if let Some((x, y, visible)) = position {
+            self.x = x;
+            self.y = y;
+            self.visible = visible;
+        }
         if let Some(s) = shape {
             self.shape = Some(s);
         }
     }
 
-    /// Draws the cursor into a BGRA frame, hotspot already accounted for.
+    /// Draws the cursor into a BGRA frame.
+    ///
+    /// The position is used as it arrived. The duplication API reports where
+    /// the pointer bitmap's top-left corner sits, not where its hotspot does,
+    /// so subtracting the hotspot here would shift the cursor up and left by
+    /// it - measured on hardware as (392,211) reported for an I-beam whose
+    /// hotspot is (8,9) parked at (400,220).
     pub fn draw(&self, dst: &mut [u8], width: u32, height: u32, stride: u32) {
         if !self.visible {
             return;
@@ -163,15 +174,7 @@ impl CursorCache {
         let Some(s) = &self.shape else {
             return;
         };
-        blend(
-            s,
-            self.x - s.hotspot_x,
-            self.y - s.hotspot_y,
-            dst,
-            width,
-            height,
-            stride,
-        );
+        blend(s, self.x, self.y, dst, width, height, stride);
     }
 }
 
@@ -359,8 +362,8 @@ mod tests {
         // Windows sends a shape only when it changes, which is rarely. A cache
         // that forgets makes the cursor flicker out on almost every frame.
         let mut c = CursorCache::new();
-        c.update(0, 0, true, Some(one_red_pixel()));
-        c.update(2, 2, true, None);
+        c.update(Some((0, 0, true)), Some(one_red_pixel()));
+        c.update(Some((2, 2, true)), None);
         let mut dst = canvas(0, 0, 0);
         c.draw(&mut dst, 4, 4, 16);
         assert_eq!(px(&dst, 2, 2), (0, 0, 255), "moved, same shape");
@@ -369,7 +372,7 @@ mod tests {
     #[test]
     fn the_cache_draws_nothing_before_the_first_shape_arrives() {
         let mut c = CursorCache::new();
-        c.update(1, 1, true, None);
+        c.update(Some((1, 1, true)), None);
         let mut dst = canvas(9, 9, 9);
         c.draw(&mut dst, 4, 4, 16);
         assert_eq!(px(&dst, 1, 1), (9, 9, 9));
@@ -380,24 +383,53 @@ mod tests {
         // Full-screen games and video players hide the cursor; drawing it
         // anyway would be conspicuous.
         let mut c = CursorCache::new();
-        c.update(1, 1, true, Some(one_red_pixel()));
-        c.update(1, 1, false, None);
+        c.update(Some((1, 1, true)), Some(one_red_pixel()));
+        c.update(Some((1, 1, false)), None);
         let mut dst = canvas(9, 9, 9);
         c.draw(&mut dst, 4, 4, 16);
         assert_eq!(px(&dst, 1, 1), (9, 9, 9));
     }
 
     #[test]
-    fn the_hotspot_is_subtracted_so_the_tip_lands_where_reported() {
+    fn a_frame_with_no_mouse_update_keeps_the_last_position() {
+        // The duplication API fills in a pointer position only on a frame that
+        // carries a mouse update. Treating the empty field on every other frame
+        // as real would put the cursor at the origin and mark it hidden, so a
+        // still cursor would vanish a frame after it stopped moving.
+        let mut c = CursorCache::new();
+        c.update(Some((2, 2, true)), Some(one_red_pixel()));
+        c.update(None, None);
+        let mut dst = canvas(0, 0, 0);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 2, 2), (0, 0, 255), "still there, still visible");
+    }
+
+    #[test]
+    fn a_shape_still_lands_on_a_frame_with_no_mouse_update() {
+        // Shape and position arrive independently: a shape change with no
+        // movement must not be dropped along with the absent position.
+        let mut c = CursorCache::new();
+        c.update(Some((2, 2, true)), None);
+        c.update(None, Some(one_red_pixel()));
+        let mut dst = canvas(0, 0, 0);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 2, 2), (0, 0, 255), "shape cached without a move");
+    }
+
+    #[test]
+    fn the_reported_position_is_the_bitmap_corner_not_the_hotspot() {
+        // The duplication API has already applied the hotspot: it reports
+        // where the bitmap goes. Applying it a second time here would drag
+        // every cursor up and to the left by its own hotspot.
         let mut c = CursorCache::new();
         let shape = CursorShape {
             hotspot_x: 1,
             hotspot_y: 1,
             ..one_red_pixel()
         };
-        c.update(2, 2, true, Some(shape));
+        c.update(Some((2, 2, true)), Some(shape));
         let mut dst = canvas(0, 0, 0);
         c.draw(&mut dst, 4, 4, 16);
-        assert_eq!(px(&dst, 1, 1), (0, 0, 255), "drawn one up and one left");
+        assert_eq!(px(&dst, 2, 2), (0, 0, 255), "drawn where it was reported");
     }
 }
