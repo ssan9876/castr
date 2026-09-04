@@ -178,10 +178,16 @@ fn spawn_capture(
     start: Instant,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     use castr_capture_win::DesktopCapture;
+    // Which monitor to cast. Only output 0 has a UI today, so this is the one
+    // way to point a multi-monitor sender at a screen other than the first.
+    let output = std::env::var("CASTR_OUTPUT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
     let handle = std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let mut cap = match DesktopCapture::new(0) {
+            let mut cap = match DesktopCapture::new(output) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("capture init: {e:#}");
@@ -537,7 +543,6 @@ pub async fn cast(
         // contiguous to spot a missing reference frame.
         let mut audio_packetizer = Packetizer::new();
         let mut rtx = RetransmitBuffer::new(500_000);
-        let frame_interval_us = 1_000_000 / params.fps as u64;
         let mut sent_frames = 0u32;
         let mut fps_window = Instant::now();
         let mut nack_rx: Option<NackReceiver> = None;
@@ -622,7 +627,7 @@ pub async fn cast(
                     }
                 } => {
                     match ev {
-                        NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now, frame_interval_us) { let _ = link.send_datagram(f); },
+                        NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now) { let _ = link.send_datagram(f); },
                         NackEv::Nack(Err(_)) => nack_rx = None,
                         NackEv::Stream(Ok(rx)) => nack_rx = Some(rx),
                         NackEv::Stream(Err(e)) => { tracing::debug!("nack stream: {e:#}"); tokio::time::sleep(Duration::from_millis(100)).await; }

@@ -11,7 +11,11 @@ const GAME_MAX_DEPTH: usize = 30;
 const QUALITY_MAX_LATE_US: u64 = 500_000;
 /// How long to hold frames behind a missing predecessor before treating it as
 /// lost. NACK repair of a keyframe takes one RTT plus the 20 ms NACK tick.
-const GAP_WAIT_US: u64 = 150_000;
+///
+/// It is also the window inside which a repair is still useful, so the
+/// receiver passes it to the reassembler to decide whether asking for a
+/// missing delta fragment can still pay off before this deadline hits.
+pub const GAP_WAIT_US: u64 = 150_000;
 /// Frames held while waiting for a keyframe or a gap, before the oldest go.
 const WAIT_MAX_DEPTH: usize = 120;
 

@@ -4,6 +4,10 @@ use std::collections::VecDeque;
 
 struct Sent {
     frame_number: u32,
+    // No longer read by `lookup` now that the sender has no delta-repair
+    // rule of its own, but `record`'s callers still supply it, and it costs
+    // nothing to keep for the log and for any future policy.
+    #[allow(dead_code)]
     keyframe: bool,
     sent_at_us: u64,
     fragments: Vec<Bytes>,
@@ -54,8 +58,14 @@ impl RetransmitBuffer {
         self.prune(sent_at_us);
     }
 
-    /// Fragments to resend for this NACK, or empty if the frame is unknown, expired, or a delta older than one interval.
-    pub fn lookup(&mut self, nack: &Nack, now_us: u64, frame_interval_us: u64) -> Vec<Bytes> {
+    /// Fragments to resend for this NACK, or empty if the frame is unknown or
+    /// has aged out.
+    ///
+    /// There is deliberately no rule here about deltas: the receiver decides
+    /// whether a repair can still arrive in time, because it is the only side
+    /// that knows its own playout deadline, its mode and the round trip. A
+    /// second opinion here could only ever contradict it.
+    pub fn lookup(&mut self, nack: &Nack, now_us: u64) -> Vec<Bytes> {
         self.prune(now_us);
         let Some(sent) = self
             .frames
@@ -64,10 +74,6 @@ impl RetransmitBuffer {
         else {
             return Vec::new();
         };
-        let young = now_us.saturating_sub(sent.sent_at_us) <= frame_interval_us;
-        if !sent.keyframe && !young {
-            return Vec::new();
-        }
         nack.missing
             .iter()
             .filter_map(|&i| sent.fragments.get(i as usize).cloned())
@@ -94,7 +100,6 @@ mod tests {
                 missing: vec![1, 3],
             },
             400_000,
-            33_333,
         );
         assert_eq!(out.len(), 2);
         assert_eq!(out[0][0], 1);
@@ -102,32 +107,29 @@ mod tests {
     }
 
     #[test]
-    fn delta_is_resent_only_within_one_interval() {
+    fn delta_fragments_are_resent_for_as_long_as_they_are_held() {
+        // The receiver decides whether a repair is worth having: it is the
+        // only side that knows its playout deadline. The sender's job is to
+        // still have the fragment.
         let mut b = RetransmitBuffer::new(500_000);
-        b.record(11, false, frags(2), 0);
-        assert_eq!(
-            b.lookup(
-                &Nack {
-                    frame_number: 11,
-                    missing: vec![0]
-                },
-                33_333,
-                33_333
-            )
-            .len(),
-            1
-        );
-        b.record(12, false, frags(2), 100_000);
-        assert!(b
-            .lookup(
-                &Nack {
-                    frame_number: 12,
-                    missing: vec![0]
-                },
-                133_334,
-                33_333
-            )
-            .is_empty());
+        b.record(10, false, frags(4), 0);
+        let nack = Nack {
+            frame_number: 10,
+            missing: vec![2],
+        };
+        let out = b.lookup(&nack, 100_000);
+        assert_eq!(out.len(), 1, "a 100 ms old delta is still resent");
+    }
+
+    #[test]
+    fn fragments_are_dropped_once_they_age_out() {
+        let mut b = RetransmitBuffer::new(500_000);
+        b.record(10, false, frags(4), 0);
+        let nack = Nack {
+            frame_number: 10,
+            missing: vec![2],
+        };
+        assert!(b.lookup(&nack, 600_000).is_empty(), "past the retention window");
     }
 
     #[test]
@@ -142,7 +144,6 @@ mod tests {
                     missing: vec![0]
                 },
                 500_001,
-                33_333
             )
             .is_empty());
         assert_eq!(b.len(), 1);
@@ -159,7 +160,6 @@ mod tests {
                     missing: vec![0]
                 },
                 0,
-                33_333
             )
             .is_empty());
         assert!(b
@@ -169,7 +169,6 @@ mod tests {
                     missing: vec![5]
                 },
                 0,
-                33_333
             )
             .is_empty());
     }

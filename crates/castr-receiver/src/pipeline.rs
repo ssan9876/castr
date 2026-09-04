@@ -913,8 +913,13 @@ async fn stream(cfg: &NetConfig, link: &Link, session: &mut ReceiverSession) -> 
             _ = tick.tick() => {
                 // Audio frames are never fragmented, so its reassembler is only
                 // ticked to expire partials; its NACKs are meaningless.
-                let _ = audio_reasm.tick(now_us(cfg.start));
-                let nacks = video_reasm.tick(now_us(cfg.start));
+                let rtt_us = link.rtt().as_micros() as u64;
+                let _ = audio_reasm.tick(now_us(cfg.start), rtt_us, 0);
+                let nacks = video_reasm.tick(
+                    now_us(cfg.start),
+                    rtt_us,
+                    castr_media::jitter::GAP_WAIT_US,
+                );
                 // Re-NACKing the same frame every 20 ms floods the sender with
                 // requests for retransmits still in flight. Wait at least one
                 // RTT (floor 20 ms) before asking for the same frame again.

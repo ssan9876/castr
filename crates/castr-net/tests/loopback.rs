@@ -250,7 +250,11 @@ async fn nack_recovers_dropped_keyframe_fragment() {
                     }
                 }
                 _ => {
-                    for n in reasm.tick(100_000) {
+                    // This test drops a keyframe fragment, which is NACKed
+                    // unconditionally regardless of the repair window, so the
+                    // added rtt/window arguments don't change this test's
+                    // outcome.
+                    for n in reasm.tick(100_000, 5_000, 150_000) {
                         nack_tx.send(&n).await.unwrap();
                     }
                 }
@@ -267,7 +271,10 @@ async fn nack_recovers_dropped_keyframe_fragment() {
                 missing: vec![1]
             }
         );
-        for f in rtx.lookup(&n, 10_000, 33_333) {
+        // Dropped fragment belongs to a keyframe, so the now-removed
+        // one-interval delta rule never gated this test; dropping the
+        // argument here changes nothing about what it asserts.
+        for f in rtx.lookup(&n, 10_000) {
             s.send_datagram(f).unwrap();
         }
     };
