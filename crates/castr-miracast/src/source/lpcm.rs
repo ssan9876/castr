@@ -90,7 +90,8 @@ mod tests {
         let samples = [1i16, -1, 32767, -32768, 0];
         let f = frame(&samples);
         let got: Vec<i16> = payload(&f)
-            .chunks_exact(2)
+            .chunks(2)
+            .filter(|c| c.len() == 2)
             .map(|b| i16::from_be_bytes([b[0], b[1]]))
             .collect();
         assert_eq!(got, samples);
