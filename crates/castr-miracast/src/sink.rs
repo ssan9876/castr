@@ -12,7 +12,7 @@
 use crate::dhcp;
 use crate::lifecycle;
 use crate::p2p::{Command, Control, Event};
-use crate::pairing::{Pairing, Show};
+use crate::pairing::{Pairing, Show, WpsWindow};
 use crate::supplicant_conf;
 use crate::session::{Session, SinkEvent};
 use crate::wfd::{AudioCodecs, Capabilities, ClientPorts, DeviceInfo, VideoFormats};
@@ -324,6 +324,9 @@ fn serve(
     // Lifecycle::abandon_hold and the ClientConnected/ClientDisconnected arms
     // below.
     let mut session_peer: Option<String> = None;
+    // The registrar's window, which lapses long before a viewer gets round to
+    // typing the PIN.
+    let mut wps = WpsWindow::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -341,6 +344,25 @@ fn serve(
             conn.as_ref().map(|c| c.as_raw_fd()).unwrap_or(-1),
         ];
         poll_readable(&fds, POLL_INTERVAL);
+
+        // A `WPS_PIN` opens a registration window of about two minutes. Armed
+        // once when the group came up, it was already shut by the time anyone
+        // read the PIN off the television and typed it: the sink stayed
+        // discoverable, so a source offered to connect and then failed to find
+        // any network it could enrol with, reporting only that it could not
+        // connect. Nothing reached the sink to explain it, because nothing
+        // reached the sink at all.
+        //
+        // So it is re-armed for as long as the PIN is on the screen.
+        let now = Instant::now();
+        if session.is_none() && wps.due(now) {
+            if let Some(pin) = pairing.current() {
+                match say(group_ctrl, &Command::wps_pin(pin)) {
+                    Ok(()) => wps.armed(now),
+                    Err(e) => tracing::warn!("miracast: could not re-arm the registrar: {e:#}"),
+                }
+            }
+        }
 
         // Supplicant events: pairing, and the peer going away. Drained from
         // both attachments - the group's events never appear on wlan0's.
