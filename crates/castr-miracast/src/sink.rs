@@ -224,15 +224,37 @@ fn one_group(
         cfg.rtp_port
     );
 
+    // A second control connection, on the group interface. The supplicant
+    // routes an event to the interface it happened on, and everything that
+    // matters from here - a station joining, WPS succeeding or failing, a
+    // source asking to provision - happens on the group, not on wlan0. With
+    // only the wlan0 attachment the sink hears P2P-GROUP-STARTED and then
+    // nothing ever again, which is why pairing could never complete.
+    let mut group_ctrl = Control::open(Path::new(CTRL_DIR), &iface)?;
+    group_ctrl.attach()?;
+
     // The PIN goes up now, not when a source starts provisioning. Windows asks
     // the viewer for it the moment the sink is picked from the list, and sends
     // nothing until it has been typed, so a PIN minted on the provisioning
     // event is one nobody could ever have read.
+    //
+    // Armed on the group control for the same reason: WPS on a group owner
+    // belongs to the group, and a PIN set on wlan0 is set on the wrong radio.
     let mut pairing = Pairing::new();
-    apply_pin(pairing.group_up(random_entropy()), out, &mut ctrl)?;
+    apply_pin(pairing.group_up(random_entropy()), out, &mut group_ctrl)?;
 
     serve(
-        cfg, arbiter, out, cmds, stop, &mut ctrl, &dhcp_sock, &rtp, &listener, &mut pairing,
+        cfg,
+        arbiter,
+        out,
+        cmds,
+        stop,
+        &mut ctrl,
+        &mut group_ctrl,
+        &dhcp_sock,
+        &rtp,
+        &listener,
+        &mut pairing,
     )
 }
 
@@ -259,6 +281,7 @@ fn serve(
     cmds: &mpsc::Receiver<Cmd>,
     stop: &Arc<AtomicBool>,
     ctrl: &mut Control,
+    group_ctrl: &mut Control,
     dhcp_sock: &UdpSocket,
     rtp: &UdpSocket,
     listener: &TcpListener,
@@ -285,6 +308,7 @@ fn serve(
         }
         let fds = [
             ctrl.as_raw_fd(),
+            group_ctrl.as_raw_fd(),
             dhcp_sock.as_raw_fd(),
             rtp.as_raw_fd(),
             listener.as_raw_fd(),
@@ -292,8 +316,21 @@ fn serve(
         ];
         poll_readable(&fds, POLL_INTERVAL);
 
-        // Supplicant events: pairing, and the peer going away.
+        // Supplicant events: pairing, and the peer going away. Drained from
+        // both attachments - the group's events never appear on wlan0's.
+        let mut events = Vec::new();
         while let Ok(Some(ev)) = ctrl.poll_event(Duration::from_millis(0)) {
+            events.push(ev);
+        }
+        while let Ok(Some(ev)) = group_ctrl.poll_event(Duration::from_millis(0)) {
+            events.push(ev);
+        }
+        // The supplicant reports a station joining on both attachments, so the
+        // same event arrives twice. Acting on it twice is at best noise and at
+        // worst a second pass at the arbitration a join triggers, so identical
+        // neighbours in one drain collapse to one.
+        events.dedup();
+        for ev in events {
             tracing::info!("miracast: event {ev:?}");
             match ev {
                 Event::ProvisionRequest { peer } => {
@@ -310,7 +347,9 @@ fn serve(
                         if peers.contains(&peer) { " again" } else { "" },
                         pairing.current().unwrap_or("(none)")
                     );
-                    if let Err(e) = apply_pin(pairing.provisioning(random_entropy()), out, ctrl) {
+                    if let Err(e) =
+                        apply_pin(pairing.provisioning(random_entropy()), out, group_ctrl)
+                    {
                         // A control socket that will not take a command is
                         // not a socket we can trust the group through. We are
                         // about to return, ending `serve`, so `session_peer`
@@ -328,7 +367,7 @@ fn serve(
                     // Fresh digits, though: the rejected ones are worth nothing,
                     // and a viewer who mistyped needs to see something change.
                     tracing::info!("miracast: pairing failed");
-                    if let Err(e) = apply_pin(pairing.failed(random_entropy()), out, ctrl) {
+                    if let Err(e) = apply_pin(pairing.failed(random_entropy()), out, group_ctrl) {
                         radio_error_releases(&mut life, arbiter, out, &mut held);
                         return Err(e);
                     }
@@ -337,7 +376,7 @@ fn serve(
                     peers.remember(&mac);
                     // Nobody has to type anything now; take the PIN down so a
                     // stale one is not left sitting over the picture.
-                    let _ = apply_pin(pairing.joined(), out, ctrl);
+                    let _ = apply_pin(pairing.joined(), out, group_ctrl);
                     let mac_lc = mac.to_ascii_lowercase();
                     let same_peer = session_peer.as_deref() == Some(mac_lc.as_str());
                     if life.phase() == lifecycle::Phase::Holding && !same_peer {

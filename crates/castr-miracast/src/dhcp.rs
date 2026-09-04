@@ -14,9 +14,12 @@ const OPT_LEASE_TIME: u8 = 51;
 const OPT_MESSAGE_TYPE: u8 = 53;
 const OPT_SERVER_ID: u8 = 54;
 const OPT_REQUESTED_IP: u8 = 50;
+const OPT_CLIENT_ID: u8 = 61;
 const OPT_END: u8 = 255;
 /// Offset of the fixed header's `yiaddr`, `siaddr` and `chaddr` fields, and of
 /// the option area that follows the magic cookie.
+/// BOOTP's minimum message length, which some clients still require.
+const MIN_MESSAGE: usize = 300;
 const OFF_YIADDR: usize = 16;
 const OFF_SIADDR: usize = 20;
 const OFF_CHADDR: usize = 28;
@@ -36,6 +39,11 @@ pub struct Request {
     pub xid: u32,
     pub mac: [u8; 6],
     pub requested_ip: Option<Ipv4Addr>,
+    /// The client identifier the client sent, if it sent one, kept verbatim.
+    /// A reply has to hand it straight back (RFC 6842): Windows sends one in
+    /// every message and silently discards any reply that does not echo it,
+    /// which reads exactly like a server that is not there.
+    pub client_id: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +71,7 @@ pub fn parse(buf: &[u8]) -> Option<Request> {
     mac.copy_from_slice(&buf[OFF_CHADDR..OFF_CHADDR + 6]);
     let mut kind = Kind::Other;
     let mut requested_ip = None;
+    let mut client_id = None;
     let mut i = OFF_OPTIONS;
     while i + 2 <= buf.len() {
         let code = buf[i];
@@ -86,6 +95,7 @@ pub fn parse(buf: &[u8]) -> Option<Request> {
             OPT_REQUESTED_IP if len == 4 => {
                 requested_ip = Some(Ipv4Addr::new(value[0], value[1], value[2], value[3]))
             }
+            OPT_CLIENT_ID if len > 0 => client_id = Some(value.to_vec()),
             _ => {}
         }
         i += 2 + len;
@@ -95,6 +105,7 @@ pub fn parse(buf: &[u8]) -> Option<Request> {
         xid,
         mac,
         requested_ip,
+        client_id,
     })
 }
 
@@ -123,12 +134,22 @@ pub fn reply(r: &Request, lease: &Lease) -> Option<Vec<u8>> {
     p[OFF_MAGIC..OFF_OPTIONS].copy_from_slice(&MAGIC);
     push_option(&mut p, OPT_MESSAGE_TYPE, &[message_type]);
     push_option(&mut p, OPT_SERVER_ID, &lease.server.octets());
+    // Echoed unchanged, and on every message type including a NAK: a client
+    // that sent one uses it to recognise the reply as its own.
+    if let Some(id) = &r.client_id {
+        push_option(&mut p, OPT_CLIENT_ID, id);
+    }
     if message_type != 6 {
         push_option(&mut p, OPT_SUBNET, &lease.netmask.octets());
         push_option(&mut p, OPT_ROUTER, &lease.server.octets());
         push_option(&mut p, OPT_LEASE_TIME, &lease.lease_secs.to_be_bytes());
     }
     p.push(OPT_END);
+    // BOOTP's minimum message is 300 octets and some clients still enforce it.
+    // Padding after the end option costs nothing and cannot be misread.
+    if p.len() < MIN_MESSAGE {
+        p.resize(MIN_MESSAGE, 0);
+    }
     Some(p)
 }
 
@@ -146,6 +167,22 @@ mod tests {
     const MAC: [u8; 6] = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
 
     fn packet(msg_type: u8, xid: u32, requested: Option<[u8; 4]>) -> Vec<u8> {
+        packet_with_id(msg_type, xid, requested, None)
+    }
+
+    /// The client identifier Windows sends: option 61, type 1 then the MAC.
+    fn windows_client_id() -> Vec<u8> {
+        let mut v = vec![1u8];
+        v.extend_from_slice(&MAC);
+        v
+    }
+
+    fn packet_with_id(
+        msg_type: u8,
+        xid: u32,
+        requested: Option<[u8; 4]>,
+        client_id: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut p = vec![0u8; 240];
         p[0] = 1; // BOOTREQUEST
         p[1] = 1; // ethernet
@@ -158,6 +195,11 @@ mod tests {
             p.push(50);
             p.push(4);
             p.extend_from_slice(&ip);
+        }
+        if let Some(id) = client_id {
+            p.push(61);
+            p.push(id.len() as u8);
+            p.extend_from_slice(id);
         }
         p.push(255);
         p
@@ -178,6 +220,56 @@ mod tests {
             i += 2 + len;
         }
         false
+    }
+
+    #[test]
+    fn a_reply_echoes_the_client_identifier_the_request_carried() {
+        // RFC 6842: a server that received a client identifier must return it
+        // unchanged. Windows sends one in every message and silently drops any
+        // reply without it - which looks exactly like no server at all, and is
+        // why a cast got its address offered and then fell back to APIPA.
+        let id = windows_client_id();
+        for msg_type in [1u8, 3u8] {
+            let req = parse(&packet_with_id(
+                msg_type,
+                7,
+                Some([192, 168, 173, 2]),
+                Some(&id),
+            ))
+            .expect("parse");
+            assert_eq!(req.client_id.as_deref(), Some(id.as_slice()));
+            let reply = reply(&req, &DEFAULT_LEASE).expect("reply");
+            assert!(
+                has_option(&reply, 61, &id),
+                "message type {msg_type} did not echo the client identifier"
+            );
+        }
+    }
+
+    #[test]
+    fn a_nak_echoes_the_client_identifier_too() {
+        // The client has to recognise a refusal as its own just as much.
+        let id = windows_client_id();
+        let req = parse(&packet_with_id(3, 7, Some([10, 0, 0, 9]), Some(&id))).expect("parse");
+        let reply = reply(&req, &DEFAULT_LEASE).expect("reply");
+        assert!(has_option(&reply, 53, &[6]), "expected a NAK");
+        assert!(has_option(&reply, 61, &id));
+    }
+
+    #[test]
+    fn a_request_without_a_client_identifier_gets_a_reply_without_one() {
+        // Nothing is invented: only what the client sent comes back.
+        let req = parse(&packet(1, 7, None)).expect("parse");
+        assert_eq!(req.client_id, None);
+        let reply = reply(&req, &DEFAULT_LEASE).expect("reply");
+        assert!(!has_option(&reply, 61, &windows_client_id()));
+    }
+
+    #[test]
+    fn a_reply_meets_the_minimum_message_length() {
+        let req = parse(&packet(1, 7, None)).expect("parse");
+        let reply = reply(&req, &DEFAULT_LEASE).expect("reply");
+        assert!(reply.len() >= MIN_MESSAGE, "{} octets", reply.len());
     }
 
     #[test]

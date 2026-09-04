@@ -102,12 +102,86 @@ pub fn parse_event(line: &str) -> Option<Event> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod control_tests {
+    use super::control::{local_socket_name, Control};
+    use super::Event;
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    /// A connected pair of Unix datagram sockets: one stands in for the
+    /// supplicant, the other for our control connection.
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0i32; 2];
+        // SAFETY: writing two fds into an array we own.
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        assert_eq!(r, 0, "socketpair: {}", std::io::Error::last_os_error());
+        // SAFETY: both are fresh fds we own from here on.
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    }
+
+    fn write(fd: &OwnedFd, line: &str) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: sending from a live buffer on a socket we own.
+        let n = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                line.as_ptr() as *const libc::c_void,
+                line.len(),
+                0,
+            )
+        };
+        assert_eq!(n as usize, line.len());
+    }
+
+    #[test]
+    fn a_zero_timeout_still_reads_an_event_that_is_already_waiting() {
+        // The sink polls every socket itself and then drains the ready ones
+        // with a zero timeout. Treating zero as "do not look" made the whole
+        // event loop deaf: no station connecting, no WPS result, ever.
+        let (supplicant, ours) = pair();
+        write(&supplicant, "<3>AP-STA-CONNECTED aa:bb:cc:dd:ee:ff");
+        let mut ctrl = Control::from_fd(ours);
+        let ev = ctrl
+            .poll_event(Duration::from_millis(0))
+            .expect("read")
+            .expect("an event that was already waiting");
+        assert_eq!(
+            ev,
+            Event::ClientConnected {
+                mac: "aa:bb:cc:dd:ee:ff".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_zero_timeout_returns_nothing_when_nothing_is_waiting() {
+        // It must still not block: an empty socket returns immediately.
+        let (_supplicant, ours) = pair();
+        let mut ctrl = Control::from_fd(ours);
+        assert_eq!(ctrl.poll_event(Duration::from_millis(0)).expect("read"), None);
+    }
+
+    #[test]
+    fn every_control_binds_its_own_local_socket() {
+        // The sink holds one control for wlan0 and one for the group. A
+        // shared name meant the second bind unlinked the first's address, and
+        // the supplicant's events for it went nowhere.
+        let a = local_socket_name("wlan0");
+        let b = local_socket_name("p2p-wlan0-0");
+        let c = local_socket_name("wlan0");
+        assert_ne!(a, b);
+        assert_ne!(a, c, "two controls on one interface still differ");
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod control {
     use super::{parse_event, Event};
     use std::io;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::path::Path;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
     /// How long a command waits for its reply before giving up.
@@ -120,6 +194,20 @@ mod control {
         fd: OwnedFd,
         local_path: Option<std::path::PathBuf>,
         pending: Vec<Event>,
+    }
+
+    /// The name of the local socket a control binds. Distinct per interface
+    /// and per open, because the supplicant addresses its replies and its
+    /// events to whatever address the client bound: two controls sharing a
+    /// name means one of them silently stops receiving.
+    pub(super) fn local_socket_name(iface: &str) -> String {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "castr-miracast-{}-{}-{}",
+            std::process::id(),
+            iface.replace('/', "_"),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
     }
 
     impl Control {
@@ -137,8 +225,11 @@ mod control {
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
             // A filesystem path rather than an abstract one: the supplicant
             // may run in its own network namespace, where abstract names do
-            // not cross the boundary.
-            let local = std::env::temp_dir().join(format!("castr-miracast-{}", std::process::id()));
+            // not cross the boundary. Unique per control, not per process: the
+            // sink holds one for wlan0 and one for the group, and a shared
+            // name meant the second bind unlinked the first's address and took
+            // its events with it.
+            let local = std::env::temp_dir().join(local_socket_name(iface));
             let _ = std::fs::remove_file(&local);
             bind_unix(&fd, local.as_os_str())?;
             connect_unix(&fd, path.as_os_str())?;
@@ -147,6 +238,17 @@ mod control {
                 local_path: Some(local),
                 pending: Vec::new(),
             })
+        }
+
+        /// Wraps an already-connected socket. Only for tests: it is the one
+        /// way to exercise the read path without a supplicant.
+        #[cfg(test)]
+        pub fn from_fd(fd: OwnedFd) -> Self {
+            Self {
+                fd,
+                local_path: None,
+                pending: Vec::new(),
+            }
         }
 
         /// Sends a command and returns its reply, queueing any event lines
@@ -280,10 +382,13 @@ mod control {
             events: libc::POLLIN,
             revents: 0,
         };
+        // A zero or elapsed deadline means "take what is already there and do
+        // not wait", not "do not look". The caller polls every socket itself
+        // and then drains the ready ones with a zero timeout, so returning
+        // early here made that drain read nothing, ever: the sink's whole
+        // event loop was deaf, and only `wait_for_group`, which passes a real
+        // timeout, ever saw an event.
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
         // SAFETY: one valid pollfd for the socket we own.
         let r = unsafe {
             libc::poll(
