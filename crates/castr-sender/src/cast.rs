@@ -178,10 +178,16 @@ fn spawn_capture(
     start: Instant,
 ) -> anyhow::Result<std::thread::JoinHandle<()>> {
     use castr_capture_win::DesktopCapture;
+    // Which monitor to cast. Only output 0 has a UI today, so this is the one
+    // way to point a multi-monitor sender at a screen other than the first.
+    let output = std::env::var("CASTR_OUTPUT")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
     let handle = std::thread::Builder::new()
         .name("capture".into())
         .spawn(move || {
-            let mut cap = match DesktopCapture::new(0) {
+            let mut cap = match DesktopCapture::new(output) {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::error!("capture init: {e:#}");
