@@ -839,6 +839,7 @@ dependencies = [
  "castr-capture-win",
  "castr-codec-win",
  "castr-media",
+ "castr-miracast",
  "castr-net",
  "castr-proto",
  "clap",

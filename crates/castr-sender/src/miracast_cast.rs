@@ -1,0 +1,311 @@
+//! Casting to an ordinary Miracast display over IP.
+//!
+//! The impure half of the source role: this owns the RTSP connection, the RTP
+//! socket, the encoder, the capture and the clock. Everything it decides is
+//! decided in `castr_miracast::source`, which is pure and tested; what happens
+//! here is sockets and threads.
+//!
+//! No radio. The address is given, which over Ethernet is Miracast over
+//! Infrastructure and over a Wi-Fi Direct group is ordinary Miracast - the
+//! media path does not care which.
+
+use anyhow::Context;
+use castr_media::codec::{EncoderConfig, Mode, PixelFormat, VideoEncoder};
+use castr_miracast::rtsp::{self, Action};
+use castr_miracast::source::{rtp_pack::Packetizer, session::*, ts_mux::Muxer};
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+/// How long to wait for the display to answer at all.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How often the session's timers are serviced when nothing is arriving.
+const TICK: Duration = Duration::from_millis(200);
+
+#[derive(Debug, Clone)]
+pub struct MiracastOptions {
+    pub duration: Option<Duration>,
+    /// Which monitor to cast; the same meaning as `CASTR_OUTPUT` elsewhere.
+    pub output: u32,
+    pub fps: u32,
+}
+
+impl Default for MiracastOptions {
+    fn default() -> Self {
+        Self {
+            duration: None,
+            output: 0,
+            fps: 30,
+        }
+    }
+}
+
+enum Media {
+    Video { data: Vec<u8>, pts_us: u64 },
+    Audio { samples: Vec<i16>, pts_us: u64 },
+}
+
+/// Casts this desktop to the Miracast display at `addr` until it ends.
+pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
+    let mut sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
+        .with_context(|| format!("connect: {addr} did not answer within {CONNECT_TIMEOUT:?}"))?;
+    sock.set_read_timeout(Some(TICK))?;
+    sock.set_nodelay(true).ok();
+    tracing::info!("miracast: connected to {addr}");
+
+    // Bind before negotiating: the port we will send from is part of what M4
+    // tells the display.
+    let rtp_sock = UdpSocket::bind("0.0.0.0:0").context("binding an RTP socket")?;
+    let mut session = SourceSession::new(SourceConfig {
+        rtp_port: rtp_sock.local_addr()?.port(),
+        ..SourceConfig::default()
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let (media_tx, media_rx) = mpsc::channel::<Media>();
+    let mut media_started = false;
+    let mut muxer = Muxer::new();
+    let mut packetizer = Packetizer::new(rand_ssrc());
+    let mut rtp_target: Option<SocketAddr> = None;
+    let started = Instant::now();
+
+    write_actions(&mut sock, session.start())?;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let reason = loop {
+        if let Some(limit) = opts.duration {
+            if started.elapsed() >= limit {
+                break "the requested duration elapsed";
+            }
+        }
+
+        // Anything the display has to say.
+        match sock.read(&mut chunk) {
+            Ok(0) => break "session: the display closed the connection",
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(e).context("session: reading the control connection"),
+        }
+
+        let mut ended = None;
+        while let Some((msg, used)) = rtsp::parse(&buf).context("session: unreadable RTSP")? {
+            buf.drain(..used);
+            for action in session.on_message(&msg) {
+                match action {
+                    Action::Send(m) => sock.write_all(m.format().as_bytes())?,
+                    Action::Play => {
+                        let port = session.sink_rtp_port().unwrap_or(5000);
+                        rtp_target = Some(SocketAddr::new(addr.ip(), port));
+                        if !media_started {
+                            media_started = true;
+                            start_media(&session, &opts, media_tx.clone(), stop.clone());
+                            tracing::info!(
+                                "miracast: playing {:?} to {}",
+                                session.chosen(),
+                                rtp_target.expect("just set")
+                            );
+                        }
+                    }
+                    Action::Teardown(why) => ended = Some(why),
+                }
+            }
+            if ended.is_some() {
+                break;
+            }
+        }
+        if let Some(why) = ended {
+            break why;
+        }
+
+        for action in session.tick(Instant::now()) {
+            match action {
+                Action::Send(m) => sock.write_all(m.format().as_bytes())?,
+                Action::Play => {}
+                Action::Teardown(why) => ended = Some(why),
+            }
+        }
+        if let Some(why) = ended {
+            break why;
+        }
+
+        // Whatever the encoder and the audio capture have produced.
+        if let Some(target) = rtp_target {
+            while let Ok(unit) = media_rx.try_recv() {
+                let (packets, pts_us) = match unit {
+                    Media::Video { data, pts_us } => (muxer.push_video(&data, pts_us), pts_us),
+                    Media::Audio { samples, pts_us } => {
+                        (muxer.push_audio(&samples, pts_us), pts_us)
+                    }
+                };
+                let stamp = (pts_us * 9 / 100) as u32;
+                for datagram in packetizer.push(&packets, stamp) {
+                    if let Err(e) = rtp_sock.send_to(&datagram, target) {
+                        tracing::warn!("miracast: sending media: {e:#}");
+                    }
+                }
+            }
+        }
+    };
+
+    // Always, on every path out: a display left believing a session is live can
+    // refuse the next one.
+    stop.store(true, Ordering::SeqCst);
+    let bye = session.teardown();
+    let _ = sock.write_all(bye.format().as_bytes());
+    tracing::info!("miracast: teardown: {reason}");
+    Ok(())
+}
+
+fn write_actions(sock: &mut TcpStream, actions: Vec<Action>) -> anyhow::Result<()> {
+    for action in actions {
+        if let Action::Send(m) = action {
+            sock.write_all(m.format().as_bytes())?;
+        }
+    }
+    Ok(())
+}
+
+/// A source identifier that will not collide with another cast on the same
+/// display. Nothing here needs cryptographic quality.
+fn rand_ssrc() -> u32 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    RandomState::new().build_hasher().finish() as u32
+}
+
+#[cfg(windows)]
+fn start_media(
+    session: &SourceSession,
+    opts: &MiracastOptions,
+    tx: mpsc::Sender<Media>,
+    stop: Arc<AtomicBool>,
+) {
+    let mode = session.chosen();
+    let (width, height) = mode.map(|m| (m.width, m.height)).unwrap_or((1280, 720));
+    let fps = mode.map(|m| m.fps).unwrap_or(opts.fps);
+    // The display told us what it can take; exceeding it is how a stream gets
+    // refused for reasons that never reach us.
+    let bitrate_bps = session
+        .max_bitrate_kbps()
+        .map(|k| k.saturating_mul(1000))
+        .unwrap_or(10_000_000);
+    let output = opts.output;
+    let start = Instant::now();
+
+    let vtx = tx.clone();
+    let vstop = stop.clone();
+    let _ = std::thread::Builder::new()
+        .name("miracast-video".into())
+        .spawn(move || {
+            let mut cap = match castr_capture_win::DesktopCapture::new(output) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("miracast: capture init: {e:#}");
+                    return;
+                }
+            };
+            let cfg = EncoderConfig {
+                width,
+                height,
+                fps,
+                bitrate_bps,
+                mode: Mode::Quality,
+            };
+            let mut enc = match castr_codec_win::MfEncoder::new(cfg) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::error!("miracast: no encoder: {e:#}");
+                    return;
+                }
+            };
+            tracing::info!(
+                "miracast: encoding {width}x{height}p{fps} at {} kbps with {}",
+                bitrate_bps / 1000,
+                enc.name()
+            );
+            let want = enc.input_format();
+            while !vstop.load(Ordering::Relaxed) {
+                let now = start.elapsed().as_micros() as u64;
+                let frame = match cap.next_frame(100, now) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!("miracast: capture: {e:#}");
+                        break;
+                    }
+                };
+                let frame = match (frame.format, want) {
+                    (a, b) if a == b => frame,
+                    (PixelFormat::Bgra, _) => frame, // the encoder converts
+                    _ => frame,
+                };
+                match enc.encode(&frame) {
+                    Ok(Some(out)) => {
+                        if vtx
+                            .send(Media::Video {
+                                data: out.data,
+                                pts_us: out.timestamp_us,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!("miracast: encode: {e:#}");
+                        break;
+                    }
+                }
+            }
+        });
+
+    let _ = std::thread::Builder::new()
+        .name("miracast-audio".into())
+        .spawn(move || {
+            let mut cap = match castr_capture_win::LoopbackCapture::new() {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!("miracast: audio capture unavailable: {e:#}");
+                    return;
+                }
+            };
+            let mut buf = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                buf.clear();
+                if let Err(e) = cap.drain(&mut buf) {
+                    tracing::warn!("miracast: audio drain: {e:#}");
+                    break;
+                }
+                if buf.is_empty() {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                let pts_us = start.elapsed().as_micros() as u64;
+                if tx
+                    .send(Media::Audio {
+                        samples: buf.clone(),
+                        pts_us,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+}
+
+#[cfg(not(windows))]
+fn start_media(
+    _session: &SourceSession,
+    _opts: &MiracastOptions,
+    _tx: mpsc::Sender<Media>,
+    _stop: Arc<AtomicBool>,
+) {
+    tracing::error!("miracast: casting is Windows-only for now");
+}
