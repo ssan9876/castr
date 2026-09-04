@@ -13,6 +13,7 @@ use crate::dhcp;
 use crate::lifecycle;
 use crate::p2p::{Command, Control, Event};
 use crate::pairing::{Pairing, Show};
+use crate::supplicant_conf;
 use crate::session::{Session, SinkEvent};
 use crate::wfd::{AudioCodecs, Capabilities, ClientPorts, DeviceInfo, VideoFormats};
 use std::io::{ErrorKind, Read, Write};
@@ -26,8 +27,16 @@ use std::time::{Duration, Instant};
 /// Where the supplicant we start puts its control socket. Its own instance,
 /// not the system one, so a station connection on `wlan0` is untouched.
 pub const CTRL_DIR: &str = "/run/wpa_supplicant_castr";
-/// The configuration `setup.sh` installs.
+/// The configuration `setup.sh` installs. Root-owned, and replaced on every
+/// deploy, so it is the template rather than the file the supplicant uses.
 pub const CONF_PATH: &str = "/etc/castr/wpa_supplicant-p2p.conf";
+/// The working configuration, which the supplicant must be able to write: it
+/// is where a persistent group's SSID and passphrase are kept, and without a
+/// writable copy they are lost on every restart.
+pub const WORKING_CONF_PATH: &str = "/var/lib/castr/wpa_supplicant-p2p.conf";
+/// Records which template the working copy was derived from, so a changed
+/// template is noticed without rewriting - and re-pairing - on every start.
+pub const WORKING_CONF_STAMP: &str = "/var/lib/castr/wpa_supplicant-p2p.template";
 /// The radio interface. The group owner appears as a second, virtual one.
 pub const WLAN: &str = "wlan0";
 /// The 2.4 GHz channels that do not overlap. The Pi's radio has no 5 GHz.
@@ -204,7 +213,24 @@ fn one_group(
     let channel = cfg.channel.unwrap_or_else(|| pick_channel(&mut ctrl));
     let freq = channel_to_freq(channel);
     tracing::info!("miracast: advertising as {:?} on channel {channel}", cfg.name);
-    say(&mut ctrl, &Command::group_add_persistent(freq))?;
+    // Reuse the stored group when there is one. A bare `persistent` makes a
+    // new group with a new SSID and passphrase, which locks out every source
+    // that has already paired: it holds credentials for a group that no longer
+    // exists and sits on "connecting" with nothing arriving here to explain it.
+    let stored = ctrl
+        .request(&Command::list_networks())
+        .ok()
+        .and_then(|r| crate::p2p::stored_persistent_group(&r));
+    match stored {
+        Some(id) => {
+            tracing::info!("miracast: reusing the stored persistent group {id}");
+            say(&mut ctrl, &Command::group_add_stored(id, freq))?;
+        }
+        None => {
+            tracing::info!("miracast: no stored group yet; creating one");
+            say(&mut ctrl, &Command::group_add_persistent(freq))?;
+        }
+    }
 
     let iface = wait_for_group(&mut ctrl, stop)?;
     let _group = GroupGuard {
@@ -654,8 +680,14 @@ fn ensure_supplicant() -> anyhow::Result<()> {
     let _ = std::process::Command::new(tool("ip"))
         .args(["link", "set", WLAN, "up"])
         .status();
+    let conf = working_conf().unwrap_or_else(|e| {
+        // A working copy we cannot write means no persistence, not no sink:
+        // casting still works, it just asks for a PIN every time.
+        tracing::warn!("miracast: no writable configuration ({e:#}); pairing will not persist");
+        PathBuf::from(CONF_PATH)
+    });
     let status = std::process::Command::new(tool("wpa_supplicant"))
-        .args(["-i", WLAN, "-c", CONF_PATH, "-B"])
+        .args(["-i", WLAN, "-c", &conf.to_string_lossy(), "-B"])
         .status()?;
     if !status.success() {
         anyhow::bail!("wpa_supplicant exited with {status}");
@@ -669,6 +701,36 @@ fn ensure_supplicant() -> anyhow::Result<()> {
         std::thread::sleep(Duration::from_millis(100));
     }
     anyhow::bail!("wpa_supplicant started but {} never appeared", sock.display())
+}
+
+/// The writable configuration to start the supplicant against, derived from
+/// the deployed template.
+///
+/// Derived once and then left alone, because the supplicant writes the
+/// persistent group into it and rewriting would throw that away. A deploy that
+/// changes the template is noticed through the recorded copy of it, and the
+/// stored groups are carried across.
+fn working_conf() -> anyhow::Result<PathBuf> {
+    let template = std::fs::read_to_string(CONF_PATH)
+        .map_err(|e| anyhow::anyhow!("reading {CONF_PATH}: {e}"))?;
+    let working = PathBuf::from(WORKING_CONF_PATH);
+    if let Some(dir) = working.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let stamp = std::fs::read_to_string(WORKING_CONF_STAMP).unwrap_or_default();
+    let existing = std::fs::read_to_string(&working).unwrap_or_default();
+    let desired = if existing.is_empty() {
+        supplicant_conf::from_template(&template)
+    } else if stamp == template {
+        // Unchanged: leave the file exactly as the supplicant last wrote it.
+        return Ok(working);
+    } else {
+        tracing::info!("miracast: the deployed configuration changed; keeping the stored groups");
+        supplicant_conf::reseed(&template, &existing)
+    };
+    std::fs::write(&working, desired)?;
+    std::fs::write(WORKING_CONF_STAMP, &template)?;
+    Ok(working)
 }
 
 /// The service runs as an unprivileged user whose PATH may not carry the

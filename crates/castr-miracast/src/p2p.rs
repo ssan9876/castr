@@ -21,9 +21,20 @@ impl Command {
     pub fn subelement(index: u8, hex: &str) -> String {
         format!("WFD_SUBELEM_SET {index} {hex}")
     }
-    /// Creates a persistent group with us as group owner on a fixed channel.
+    /// Creates a *new* persistent group with us as group owner on a fixed
+    /// channel. New credentials every time, so anything already paired is
+    /// locked out - use `group_add_stored` when there is a group to reuse.
     pub fn group_add_persistent(freq_mhz: u32) -> String {
         format!("P2P_GROUP_ADD persistent freq={freq_mhz}")
+    }
+    /// Brings the stored persistent group back up, keeping the SSID and
+    /// passphrase a source was already given.
+    pub fn group_add_stored(network_id: u32, freq_mhz: u32) -> String {
+        format!("P2P_GROUP_ADD persistent={network_id} freq={freq_mhz}")
+    }
+    /// Lists the stored networks, which is where a persistent group lives.
+    pub fn list_networks() -> String {
+        "LIST_NETWORKS".to_string()
     }
     /// Authorises an enrolment with the PIN we display.
     pub fn wps_pin(pin: &str) -> String {
@@ -59,6 +70,22 @@ pub enum Event {
 
 /// Parses one unsolicited event line. Unknown events yield `None` rather than
 /// an error: the supplicant emits many we do not care about.
+/// The id of the stored persistent P2P group in a `LIST_NETWORKS` reply, if
+/// there is one.
+///
+/// The reply is a header line then one tab-separated row per network:
+/// `id / ssid / bssid / flags`. A persistent group owner's row carries
+/// `[P2P-PERSISTENT]`, which is what distinguishes it from an ordinary saved
+/// station network - and reusing it is the only way a source that paired once
+/// gets back in without being asked for a PIN again.
+pub fn stored_persistent_group(reply: &str) -> Option<u32> {
+    reply
+        .lines()
+        .skip(1)
+        .filter(|l| l.contains("[P2P-PERSISTENT]"))
+        .find_map(|l| l.split('\t').next()?.trim().parse().ok())
+}
+
 pub fn parse_event(line: &str) -> Option<Event> {
     // Strip the "<3>" priority prefix if present.
     let body = match line.split_once('>') {
@@ -446,7 +473,34 @@ mod tests {
             Command::group_add_persistent(2437),
             "P2P_GROUP_ADD persistent freq=2437"
         );
+        assert_eq!(
+            Command::group_add_stored(3, 2437),
+            "P2P_GROUP_ADD persistent=3 freq=2437"
+        );
+        assert_eq!(Command::list_networks(), "LIST_NETWORKS");
         assert_eq!(Command::wps_pin("12345670"), "WPS_PIN any 12345670");
+        assert_eq!(
+            stored_persistent_group(
+                "network id / ssid / bssid / flags\n\
+                 0\tDIRECT-ab\tany\t[P2P-PERSISTENT]\n"
+            ),
+            Some(0),
+            "a stored group must be found, or every restart re-pairs"
+        );
+        assert_eq!(
+            stored_persistent_group(
+                "network id / ssid / bssid / flags\n\
+                 0\thome-wifi\tany\t[CURRENT]\n\
+                 2\tDIRECT-xy\tany\t[P2P-PERSISTENT]\n"
+            ),
+            Some(2),
+            "an ordinary saved network is not a persistent group"
+        );
+        assert_eq!(
+            stored_persistent_group("network id / ssid / bssid / flags\n"),
+            None
+        );
+        assert_eq!(stored_persistent_group(""), None);
         assert_eq!(
             Command::group_remove("p2p-wlan0-0"),
             "P2P_GROUP_REMOVE p2p-wlan0-0"
