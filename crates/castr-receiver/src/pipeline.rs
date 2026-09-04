@@ -666,7 +666,7 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
     );
     let mut session = ReceiverSession::new(cfg.name.clone(), cfg.caps.clone(), rand::random());
     cfg.ui
-        .send(UiEvent::Overlay(Some("Waiting for sender".into())))
+        .send(UiEvent::Overlay(Some(idle_overlay(&cfg.name))))
         .await
         .ok();
     loop {
@@ -692,9 +692,9 @@ async fn network_main(cfg: NetConfig) -> anyhow::Result<()> {
         }
         cfg.jitter.lock().unwrap().flush();
         let overlay = if matches!(session.state(), ReceiverState::Disconnected { .. }) {
-            "Reconnecting"
+            "Reconnecting".to_string()
         } else {
-            "Waiting for sender"
+            idle_overlay(&cfg.name)
         };
         cfg.ui
             .send(UiEvent::Overlay(Some(overlay.into())))
@@ -709,6 +709,23 @@ fn hex_short(fp: &[u8; 32]) -> String {
 
 /// Only a session that had actually reached `Streaming` should be marked
 /// disconnected when its connection drops. A connection that ended before
+/// The idle screen, which names this receiver above the state.
+///
+/// The name is the one thing a viewer needs before they can cast anything: it
+/// is what they have to pick out of a list on the phone or PC, and a
+/// television has nowhere else to show it. On its own line so the renderer
+/// stacks it above the state rather than running the two together.
+fn idle_overlay(name: &str) -> String {
+    format!("{name}
+Waiting for sender")
+}
+
+/// The pairing screen: the same name, and the PIN to type into the source.
+fn pairing_overlay(name: &str, pin: &str) -> String {
+    format!("{name}
+Miracast PIN {pin}")
+}
+
 /// streaming began (failed pairing, or a control read error before `Hello`)
 /// must leave the session untouched, otherwise a fresh `Hello` on the very
 /// next connection lands on the `Disconnected` arm of `on_message` and is
@@ -1018,6 +1035,22 @@ mod tests {
             params: None
         }));
         assert!(!should_mark_disconnected(&ReceiverState::AwaitingHello));
+    }
+
+    #[test]
+    fn the_idle_screen_names_the_device_on_its_own_line() {
+        // The name has to be readable as the thing to pick on the phone or PC,
+        // so it leads and the state follows underneath.
+        let text = idle_overlay("DietPi");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec!["DietPi", "Waiting for sender"]);
+    }
+
+    #[test]
+    fn the_pairing_screen_shows_the_name_and_the_pin() {
+        let text = pairing_overlay("DietPi", "12345670");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines, vec!["DietPi", "Miracast PIN 12345670"]);
         assert!(!should_mark_disconnected(&ReceiverState::Disconnected {
             since_us: 0
         }));
@@ -1128,8 +1161,12 @@ fn start_miracast(
         }
     }
 
+    // The sink's own name, cloned for the event thread: the overlays it puts
+    // up name the device the viewer is looking for, which for Miracast is the
+    // sink's name and not necessarily castr's.
+    let idle_name = cfg.miracast_name.clone().unwrap_or_else(|| cfg.name.clone());
     let sink_cfg = SinkConfig {
-        name: cfg.miracast_name.clone().unwrap_or_else(|| cfg.name.clone()),
+        name: idle_name.clone(),
         channel: cfg.miracast_channel,
         paired_path: cfg.config_dir.join("miracast-peers.txt"),
         ..SinkConfig::default()
@@ -1155,9 +1192,15 @@ fn start_miracast(
             while let Ok(ev) = events.recv() {
                 match ev {
                     SinkOut::Pin(pin) => {
-                        let _ = ui.blocking_send(UiEvent::Overlay(Some(format!(
-                            "Miracast PIN: {pin}"
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(pairing_overlay(
+                            &idle_name, &pin,
                         ))));
+                    }
+                    SinkOut::PinCleared => {
+                        // Back to the idle screen rather than a blank one: the
+                        // source has joined but nothing is streaming yet, and
+                        // the name is still what a second viewer would need.
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(idle_overlay(&idle_name))));
                     }
                     SinkOut::Started => {
                         let _ = ui.blocking_send(UiEvent::Overlay(None));
@@ -1172,9 +1215,9 @@ fn start_miracast(
                         // when it releases the screen (pipeline.rs:694-697),
                         // so the two protocols leave the screen in the same
                         // state.
-                        let _ = ui.blocking_send(UiEvent::Overlay(Some(
-                            "Waiting for sender".into(),
-                        )));
+                        let _ = ui.blocking_send(UiEvent::Overlay(Some(idle_overlay(
+                            &idle_name,
+                        ))));
                     }
                     SinkOut::Video { data, pts_us } => {
                         let keyframe = has_keyframe(&data);

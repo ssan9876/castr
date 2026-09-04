@@ -12,6 +12,7 @@
 use crate::dhcp;
 use crate::lifecycle;
 use crate::p2p::{Command, Control, Event};
+use crate::pairing::{Pairing, Show};
 use crate::session::{Session, SinkEvent};
 use crate::wfd::{AudioCodecs, Capabilities, ClientPorts, DeviceInfo, VideoFormats};
 use std::io::{ErrorKind, Read, Write};
@@ -73,8 +74,12 @@ impl Default for SinkConfig {
 /// What the sink hands back to the receiver.
 #[derive(Debug)]
 pub enum SinkOut {
-    /// Show this eight-digit PIN on the television.
+    /// Show this eight-digit PIN on the television. Sent as soon as the group
+    /// is up, because the source asks the viewer for it before it sends
+    /// anything we could react to.
     Pin(String),
+    /// Take the PIN down: a source has joined and nobody needs to type it.
+    PinCleared,
     Video {
         data: Vec<u8>,
         pts_us: Option<u64>,
@@ -219,7 +224,16 @@ fn one_group(
         cfg.rtp_port
     );
 
-    serve(cfg, arbiter, out, cmds, stop, &mut ctrl, &dhcp_sock, &rtp, &listener)
+    // The PIN goes up now, not when a source starts provisioning. Windows asks
+    // the viewer for it the moment the sink is picked from the list, and sends
+    // nothing until it has been typed, so a PIN minted on the provisioning
+    // event is one nobody could ever have read.
+    let mut pairing = Pairing::new();
+    apply_pin(pairing.group_up(random_entropy()), out, &mut ctrl)?;
+
+    serve(
+        cfg, arbiter, out, cmds, stop, &mut ctrl, &dhcp_sock, &rtp, &listener, &mut pairing,
+    )
 }
 
 /// Removes the group when the pass ends, however it ends. Without this a
@@ -248,6 +262,7 @@ fn serve(
     dhcp_sock: &UdpSocket,
     rtp: &UdpSocket,
     listener: &TcpListener,
+    pairing: &mut Pairing,
 ) -> anyhow::Result<()> {
     let mut peers = PeerStore::load(&cfg.paired_path);
     let mut conn: Option<TcpStream> = None;
@@ -285,17 +300,17 @@ fn serve(
                     // Provisioning only happens when the peer has no stored
                     // credentials, so a returning PC never reaches here: the
                     // persistent group lets it back in silently.
-                    let pin = generate_pin();
+                    //
+                    // The PIN is the one that has been on the screen since the
+                    // group came up: the source is about to send the digits the
+                    // viewer already read, so minting a new one here would
+                    // guarantee a mismatch.
                     tracing::info!(
-                        "miracast: {peer} is enrolling{}; PIN {pin}",
-                        if peers.contains(&peer) {
-                            " again"
-                        } else {
-                            ""
-                        }
+                        "miracast: {peer} is enrolling{} with PIN {}",
+                        if peers.contains(&peer) { " again" } else { "" },
+                        pairing.current().unwrap_or("(none)")
                     );
-                    let _ = out.send(SinkOut::Pin(pin.clone()));
-                    if let Err(e) = say(ctrl, &Command::wps_pin(&pin)) {
+                    if let Err(e) = apply_pin(pairing.provisioning(random_entropy()), out, ctrl) {
                         // A control socket that will not take a command is
                         // not a socket we can trust the group through. We are
                         // about to return, ending `serve`, so `session_peer`
@@ -309,10 +324,20 @@ fn serve(
                     // A failed enrolment is not a session ending: nothing was streaming, and
                     // telling the receiver otherwise would flush a buffer that may belong to
                     // the other protocol.
+                    //
+                    // Fresh digits, though: the rejected ones are worth nothing,
+                    // and a viewer who mistyped needs to see something change.
                     tracing::info!("miracast: pairing failed");
+                    if let Err(e) = apply_pin(pairing.failed(random_entropy()), out, ctrl) {
+                        radio_error_releases(&mut life, arbiter, out, &mut held);
+                        return Err(e);
+                    }
                 }
                 Event::ClientConnected { mac } => {
                     peers.remember(&mac);
+                    // Nobody has to type anything now; take the PIN down so a
+                    // stale one is not left sitting over the picture.
+                    let _ = apply_pin(pairing.joined(), out, ctrl);
                     let mac_lc = mac.to_ascii_lowercase();
                     let same_peer = session_peer.as_deref() == Some(mac_lc.as_str());
                     if life.phase() == lifecycle::Phase::Holding && !same_peer {
@@ -780,28 +805,31 @@ fn session_id() -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
-/// A WPS PIN: seven random digits and the checksum digit the standard defines.
-/// Windows rejects a PIN whose checksum does not match, so this is not
-/// decoration.
-fn generate_pin() -> String {
-    let mut b = [0u8; 4];
-    fill_random(&mut b);
-    let value = u32::from_be_bytes(b) % 10_000_000;
-    format!("{:07}{}", value, pin_checksum(value))
+/// Carries out what `pairing` decided. The screen and the supplicant are the
+/// two places a PIN has to reach, and they must never disagree, so one place
+/// does both.
+fn apply_pin(show: Show, out: &mpsc::Sender<SinkOut>, ctrl: &mut Control) -> anyhow::Result<()> {
+    match show {
+        Show::Pin(pin) => {
+            tracing::info!("miracast: PIN {pin} is on the screen");
+            let _ = out.send(SinkOut::Pin(pin.clone()));
+            say(ctrl, &Command::wps_pin(&pin))?;
+        }
+        Show::Clear => {
+            let _ = out.send(SinkOut::PinCleared);
+        }
+        Show::Nothing => {}
+    }
+    Ok(())
 }
 
-/// The WPS checksum digit, as defined by the specification and implemented by
-/// `wpa_supplicant`: the argument is the seven-digit value, and the digit
-/// this returns is appended to it.
-fn pin_checksum(mut pin: u32) -> u32 {
-    let mut accum = 0;
-    while pin > 0 {
-        accum += 3 * (pin % 10);
-        pin /= 10;
-        accum += pin % 10;
-        pin /= 10;
-    }
-    (10 - accum % 10) % 10
+/// Entropy for a PIN: unpredictable enough that the next one cannot be guessed
+/// from the last. The PIN is read off a screen in the room, not used as a
+/// secret at a distance.
+fn random_entropy() -> u32 {
+    let mut b = [0u8; 4];
+    fill_random(&mut b);
+    u32::from_be_bytes(b)
 }
 
 fn fill_random(buf: &mut [u8]) {
@@ -873,23 +901,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_pin_is_eight_digits_and_carries_a_valid_checksum() {
+    fn the_entropy_source_yields_a_pin_a_source_will_accept() {
+        // The digits and the checksum are `pairing`'s business and tested
+        // there; what belongs here is that this platform's randomness feeds
+        // them something usable.
         for _ in 0..50 {
-            let pin = generate_pin();
-            assert_eq!(pin.len(), 8, "{pin}");
-            assert!(pin.chars().all(|c| c.is_ascii_digit()), "{pin}");
-            let value: u32 = pin[..7].parse().unwrap();
-            let check: u32 = pin[7..].parse().unwrap();
-            assert_eq!(check, pin_checksum(value), "{pin}");
+            let pin = crate::pairing::pin_from(random_entropy());
+            assert!(crate::pairing::is_valid(&pin), "{pin}");
         }
-    }
-
-    #[test]
-    fn the_checksum_matches_the_values_the_specification_publishes() {
-        // 12345670 and 87654325 are the two PINs the specification and
-        // wpa_supplicant use as examples; both must validate.
-        assert_eq!(pin_checksum(1234567), 0);
-        assert_eq!(pin_checksum(8765432), 5);
     }
 
     #[test]

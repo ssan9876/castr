@@ -3,7 +3,7 @@
 //! Linux only in its radio layer; on other targets the pure layers still build
 //! so the workspace compiles everywhere.
 //!
-//! The parsing layers (`wfd`, `rtsp`, `ts`, `rtp`, `dhcp`) are pure and are
+//! The parsing layers (`wfd`, `rtsp`, `ts`, `rtp`, `dhcp`, `pairing`) are pure and are
 //! declared on every platform so their tests run in the Windows workspace
 //! suite; only the parts that own sockets are Linux-gated.
 
@@ -13,6 +13,7 @@
 pub mod dhcp;
 pub mod lifecycle;
 pub mod p2p;
+pub mod pairing;
 pub mod quality;
 pub mod rtp;
 pub mod rtsp;

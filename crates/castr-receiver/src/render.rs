@@ -14,16 +14,20 @@ const GLYPH_ROWS: usize = 7;
 const GLYPH_COLS: u32 = 5;
 
 /// A 5x7 bitmap font, enough for the overlay strings the receiver shows
-/// ("PIN 123456", "WAITING FOR SENDER", "RECONNECTING"). Pulling in a real
-/// font rasteriser would break the no-external-assets property of the
-/// receiver binary, and the overlays only ever need uppercase letters,
-/// digits, space, colon and hyphen.
+/// ("MIRACAST PIN 12345670", "WAITING FOR SENDER", "RECONNECTING") and for the
+/// device's own name, which is shown beside them. Pulling in a real font
+/// rasteriser would break the no-external-assets property of the receiver
+/// binary, and the overlays only ever need uppercase letters, digits, space,
+/// colon, hyphen, dot and underscore - the last two because a hostname may
+/// carry them.
 ///
 /// Each entry is 7 row bytes, top to bottom; bit 4 is the leftmost pixel,
 /// bit 0 the rightmost, so no row may use a bit above the 5th.
 const FONT: &[(char, [u8; GLYPH_ROWS])] = &[
     (' ', [0, 0, 0, 0, 0, 0, 0]),
     ('-', [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00]),
+    ('.', [0x00, 0x00, 0x00, 0x00, 0x00, 0x0C, 0x0C]),
+    ('_', [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F]),
     (':', [0x00, 0x04, 0x04, 0x00, 0x04, 0x04, 0x00]),
     ('0', [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E]),
     ('1', [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E]),
@@ -69,8 +73,19 @@ const FONT: &[(char, [u8; GLYPH_ROWS])] = &[
 /// yet); every other overlay ("Waiting for sender", "Reconnecting") is
 /// stale the instant a real picture is drawn. Free function (rather than a
 /// `Renderer` method) so it is testable without an SDL canvas.
+///
+/// Matched anywhere in the text, not just at the start: the overlay names the
+/// device on a line of its own before the PIN, so anchoring at the start meant
+/// the prompt the receiver actually sends was never recognised.
 fn overlay_survives_frame(text: &str) -> bool {
-    text.starts_with("PIN ")
+    text.to_uppercase().contains("PIN")
+}
+
+/// The overlay split into the lines to draw, uppercased for the font. The
+/// device's name goes on its own line above the state, so a viewer can see
+/// which entry to pick on the casting device without hunting for it.
+fn overlay_lines(text: &str) -> Vec<String> {
+    text.lines().map(|l| l.trim().to_uppercase()).collect()
 }
 
 /// Rows for `c`, or the blank glyph for anything the font does not cover.
@@ -336,12 +351,21 @@ impl Renderer {
                 .fill_rect(Rect::new(x, bar_y, bar_w, 8))
                 .map_err(|e| anyhow!(e))?;
             // Glyphs about 1/20 of the window height, centred above the bar.
-            let text = text.to_uppercase();
+            // Lines stack upwards from the bar so the last one sits closest to
+            // it and the block grows away from it, keeping the bar clear.
+            let lines = overlay_lines(&text);
             let scale = (wh / 20 / GLYPH_ROWS as u32).max(2);
-            let tw = text_width(&text, scale);
-            let tx = ((ww as i32 - tw as i32) / 2).max(0);
-            let ty = bar_y - (GLYPH_ROWS as u32 * scale) as i32 - 3 * scale as i32;
-            self.draw_text(&text, tx, ty, scale, Color::RGBA(255, 255, 255, 235))?;
+            let line_h = (GLYPH_ROWS as u32 + 3) * scale;
+            for (i, line) in lines.iter().enumerate() {
+                let from_bottom = (lines.len() - 1 - i) as u32;
+                let tw = text_width(line, scale);
+                let tx = ((ww as i32 - tw as i32) / 2).max(0);
+                let ty = bar_y
+                    - (GLYPH_ROWS as u32 * scale) as i32
+                    - 3 * scale as i32
+                    - (from_bottom * line_h) as i32;
+                self.draw_text(line, tx, ty, scale, Color::RGBA(255, 255, 255, 235))?;
+            }
         }
         // Read back before present: after the swap the back buffer is undefined
         // on double-buffered GL targets such as KMSDRM.
@@ -358,9 +382,35 @@ mod tests {
     #[test]
     fn only_a_pin_prompt_survives_a_presented_frame() {
         assert!(overlay_survives_frame("PIN 123456"));
+        // The text the receiver actually sends, which names the device on its
+        // own line first - matching only a leading "PIN " missed this.
+        assert!(overlay_survives_frame("DietPi
+Miracast PIN 12345670"));
         assert!(!overlay_survives_frame("Waiting for sender"));
+        assert!(!overlay_survives_frame("DietPi
+Waiting for sender"));
         assert!(!overlay_survives_frame("Reconnecting"));
         assert!(!overlay_survives_frame(""));
+    }
+
+    #[test]
+    fn an_overlay_is_laid_out_line_by_line() {
+        // One line is unchanged; a second stacks below it, and each is
+        // measured on its own so the wider one decides nothing for the other.
+        assert_eq!(overlay_lines("Waiting for sender").len(), 1);
+        let lines = overlay_lines("DietPi
+Waiting for sender");
+        assert_eq!(lines, vec!["DIETPI", "WAITING FOR SENDER"]);
+        assert!(text_width(&lines[1], 2) > text_width(&lines[0], 2));
+    }
+
+    #[test]
+    fn the_font_covers_what_a_hostname_can_contain() {
+        // Device names reach the screen verbatim; a dot or an underscore in
+        // one would otherwise be drawn as a gap.
+        for c in "._".chars() {
+            assert!(FONT.iter().any(|(g, _)| *g == c), "missing glyph {c:?}");
+        }
     }
 
     #[test]
