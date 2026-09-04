@@ -62,6 +62,27 @@ On a multi-monitor machine the cast is the first duplication output.
 the numbering is the graphics adapter's, not the order shown in Windows display
 settings, so it is worth a short test cast to see which is which.
 
+### Casting to an ordinary Miracast display
+
+castr can also act as a Wi-Fi Display *source*, casting to a television, dongle
+or any other Miracast sink rather than to a castr receiver:
+
+```
+castr-sender miracast-cast 192.168.173.1:7236 [--duration SECS] [--fps 30]
+```
+
+The address is the display's RTSP control port, 7236 by default; a bare host is
+accepted and the port assumed. `CASTR_OUTPUT` chooses the monitor here too.
+
+There is no radio layer yet, so the Wi-Fi Direct group has to exist already and
+the display's address be known. Given an address on the ordinary LAN this is
+Miracast over Infrastructure; over a Wi-Fi Direct group it is ordinary
+Miracast — the media path does not care which.
+
+The picture is negotiated with the display and sent as H.264 in MPEG-TS over
+RTP, with audio as LPCM. See the "Known gaps" below before relying on it: it has
+only ever been tested against castr's own sink.
+
 ### Wi-Fi health check
 
 Miracast drops are usually caused by the sending machine, not the display.
@@ -240,9 +261,16 @@ saving, driver age � and offers to fix the safe ones.
 - Only the first monitor is cast unless `CASTR_OUTPUT` names another
   duplication output; there is no UI for choosing one.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
-- V4L2 hardware decode and DRM/KMS output landed in sub-project 2; Miracast
-  over Infrastructure (casting without forming a Wi-Fi Direct group) is a later
-  sub-project.
+- V4L2 hardware decode and DRM/KMS output landed in sub-project 2.
+- Casting *to* an ordinary Miracast display works over IP but has only ever been
+  pointed at our own sink. No third-party television or dongle has been tried,
+  and interoperability is the whole point of the exercise, so treat it as
+  unproven. It also has no radio layer yet: the display's address must be given,
+  and forming the Wi-Fi Direct group is a separate step. HDCP is not supported
+  at all, so a display that requires content protection cannot be cast to.
+- A cast to a Miracast display has been verified for ten minutes against castr's
+  own sink, with no dropped frames, but its audio has never been listened to and
+  lip sync is unmeasured.
 - Lip sync has not been measured against ITU-R BT.1359 in either mode, and
   Miracast audio is carried as uncompressed LPCM.
 

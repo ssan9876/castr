@@ -1,6 +1,7 @@
 mod cast;
 mod diagnose;
 mod gui;
+mod miracast_cast;
 
 use cast::*;
 use castr_proto::Mode;
@@ -25,6 +26,16 @@ enum Cmd {
         /// Offer to apply the safe fixes, prompting for each
         #[arg(long)]
         fix: bool,
+    },
+    /// Cast the screen to an ordinary Miracast display, by address
+    MiracastCast {
+        /// The display's RTSP address, host:port (Wi-Fi Display uses 7236)
+        target: String,
+        /// Stop automatically after this many seconds (mainly for testing)
+        #[arg(long)]
+        duration: Option<u64>,
+        #[arg(long, default_value_t = 30)]
+        fps: u32,
     },
     /// Cast the screen to a receiver
     Cast {
@@ -104,6 +115,28 @@ fn main() -> anyhow::Result<()> {
         Some(Cmd::Diagnose { fix }) => {
             let code = diagnose::run(fix)?;
             std::process::exit(code);
+        }
+        Some(Cmd::MiracastCast {
+            target,
+            duration,
+            fps,
+        }) => {
+            // Bare host or host:port; Wi-Fi Display's control port is 7236.
+            let addr = target
+                .parse::<std::net::SocketAddr>()
+                .or_else(|_| format!("{target}:7236").parse::<std::net::SocketAddr>())
+                .map_err(|e| anyhow::anyhow!("connect: {target:?} is not an address ({e})"))?;
+            // Which monitor to cast, the same control the other cast path uses.
+            let output = std::env::var("CASTR_OUTPUT")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(0);
+            let opts = miracast_cast::MiracastOptions {
+                duration: duration.map(Duration::from_secs),
+                output,
+                fps,
+            };
+            miracast_cast::cast_to(addr, opts)
         }
         Some(Cmd::Cast {
             target,

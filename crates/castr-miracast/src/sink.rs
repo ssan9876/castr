@@ -12,7 +12,7 @@
 use crate::dhcp;
 use crate::lifecycle;
 use crate::p2p::{Command, Control, Event};
-use crate::pairing::{Pairing, Show};
+use crate::pairing::{Pairing, Show, WpsWindow};
 use crate::supplicant_conf;
 use crate::session::{Session, SinkEvent};
 use crate::wfd::{AudioCodecs, Capabilities, ClientPorts, DeviceInfo, VideoFormats};
@@ -324,6 +324,12 @@ fn serve(
     // Lifecycle::abandon_hold and the ClientConnected/ClientDisconnected arms
     // below.
     let mut session_peer: Option<String> = None;
+    // The registrar's window, which lapses long before a viewer gets round to
+    // typing the PIN.
+    let mut wps = WpsWindow::new();
+    // Stations currently in the group. A PIN belongs on the screen only when
+    // nobody is here, so this is what says whether the sink is idle.
+    let mut clients: usize = 0;
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -341,6 +347,42 @@ fn serve(
             conn.as_ref().map(|c| c.as_raw_fd()).unwrap_or(-1),
         ];
         poll_readable(&fds, POLL_INTERVAL);
+
+        // A `WPS_PIN` opens a registration window of about two minutes. Armed
+        // once when the group came up, it was already shut by the time anyone
+        // read the PIN off the television and typed it: the sink stayed
+        // discoverable, so a source offered to connect and then failed to find
+        // any network it could enrol with, reporting only that it could not
+        // connect. Nothing reached the sink to explain it, because nothing
+        // reached the sink at all.
+        //
+        // So it is re-armed for as long as the PIN is on the screen.
+        let now = Instant::now();
+        if session.is_none() && clients == 0 {
+            // Idle with nothing on the screen: someone paired, joined, and has
+            // since gone. Joining clears the PIN, which is right - nobody
+            // should be typing one while a cast is up - but without minting a
+            // fresh one the sink could only ever pair once per start. It stayed
+            // discoverable and refused every enrolment after the first.
+            if pairing.current().is_none() {
+                match apply_pin(pairing.group_up(random_entropy()), out, group_ctrl) {
+                    Ok(()) => wps.armed(now),
+                    Err(e) => {
+                        radio_error_releases(&mut life, arbiter, out, &mut held);
+                        return Err(e);
+                    }
+                }
+            } else if wps.due(now) {
+                if let Some(pin) = pairing.current() {
+                    match say(group_ctrl, &Command::wps_pin(pin)) {
+                        Ok(()) => wps.armed(now),
+                        Err(e) => {
+                            tracing::warn!("miracast: could not re-arm the registrar: {e:#}")
+                        }
+                    }
+                }
+            }
+        }
 
         // Supplicant events: pairing, and the peer going away. Drained from
         // both attachments - the group's events never appear on wlan0's.
@@ -399,6 +441,7 @@ fn serve(
                     }
                 }
                 Event::ClientConnected { mac } => {
+                    clients += 1;
                     peers.remember(&mac);
                     // Nobody has to type anything now; take the PIN down so a
                     // stale one is not left sitting over the picture.
@@ -420,6 +463,7 @@ fn serve(
                     session_peer = Some(mac_lc);
                 }
                 Event::ClientDisconnected { mac } => {
+                    clients = clients.saturating_sub(1);
                     let owns = session_peer.as_deref() == Some(mac.to_ascii_lowercase().as_str());
                     if !owns {
                         // A different station leaving the group must not end
@@ -450,6 +494,10 @@ fn serve(
                     return Ok(());
                 }
                 Event::GroupStarted { .. } => {}
+                // Already logged above, which is the whole point of carrying
+                // it: the sink can report a failure it does not understand
+                // rather than going quiet and leaving the source to time out.
+                Event::Other(_) => {}
             }
         }
 

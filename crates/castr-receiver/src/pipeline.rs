@@ -1233,8 +1233,11 @@ fn start_miracast(
                     }
                     SinkOut::Audio { data, .. } => {
                         // LPCM, 16-bit big-endian stereo at 48 kHz, which is
-                        // the only audio format we offer the source.
-                        let samples: Vec<i16> = data
+                        // the only audio format we offer the source, behind the
+                        // audio data header a source may put in front of it.
+                        // Reading that header as samples would put a click at
+                        // the head of every packet.
+                        let samples: Vec<i16> = castr_miracast::source::lpcm::payload(&data)
                             .chunks_exact(2)
                             .map(|b| i16::from_be_bytes([b[0], b[1]]))
                             .collect();

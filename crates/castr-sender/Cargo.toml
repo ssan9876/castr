@@ -16,6 +16,7 @@ eframe.workspace = true
 castr-proto = { path = "../castr-proto" }
 castr-net = { path = "../castr-net" }
 castr-media = { path = "../castr-media" }
+castr-miracast = { path = "../castr-miracast" }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }

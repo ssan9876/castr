@@ -11,9 +11,59 @@
 //! Pure: no radio, no sockets, no platform. The randomness is injected so the
 //! whole policy is testable, and so is the checksum the standard requires.
 
+use std::time::{Duration, Instant};
+
 /// Seven digits and the checksum digit, which is what `wpa_supplicant` and
 /// Windows both expect.
 pub const PIN_DIGITS: usize = 8;
+
+/// The registration window a `WPS_PIN` opens - the specification calls it the
+/// walk time - after which a group owner stops advertising that it will accept
+/// an enrolment.
+pub const WPS_WALK_TIME: Duration = Duration::from_secs(120);
+
+/// How often the registrar is re-armed while a PIN is on the screen.
+///
+/// Arming it once, when the group comes up, makes the offer true for two
+/// minutes and a lie thereafter: the PIN stays on the television and the sink
+/// stays discoverable, but a source finds no network it can enrol with and
+/// reports only that it could not connect. Nothing arrives here to explain it,
+/// because nothing reaches the sink at all.
+///
+/// So it is re-armed on an interval comfortably inside the window, for as long
+/// as the PIN is displayed.
+pub const WPS_REARM: Duration = Duration::from_secs(45);
+
+/// When the registrar was last armed, and whether it is due again.
+#[derive(Debug, Default)]
+pub struct WpsWindow {
+    last: Option<Instant>,
+}
+
+impl WpsWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// True when the registrar has never been armed, or has been left long
+    /// enough that it is worth arming again.
+    pub fn due(&self, now: Instant) -> bool {
+        match self.last {
+            None => true,
+            Some(t) => now.duration_since(t) >= WPS_REARM,
+        }
+    }
+
+    pub fn armed(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+
+    /// Forgets the last arming, so the next check is due. Used when the PIN
+    /// changes: the old registration is worthless.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
 
 /// The checksum digit the WPS specification defines, as `wpa_supplicant`
 /// implements it: the argument is the seven-digit value, and the digit this
@@ -195,6 +245,42 @@ mod tests {
         assert_eq!(p.joined(), Show::Clear);
         assert_eq!(p.current(), None);
         assert_eq!(p.joined(), Show::Nothing, "nothing left to clear");
+    }
+
+    #[test]
+    fn the_registrar_is_rearmed_well_inside_the_walk_time() {
+        // A PIN registered once goes stale after the walk time, and from then
+        // on the sink is discoverable but impossible to pair with - which is
+        // exactly what a source reports as "could not connect".
+        assert!(
+            WPS_REARM * 2 < WPS_WALK_TIME,
+            "re-arming must leave room for a missed interval"
+        );
+    }
+
+    #[test]
+    fn a_window_that_was_never_armed_is_due() {
+        assert!(WpsWindow::new().due(Instant::now()));
+    }
+
+    #[test]
+    fn a_freshly_armed_window_is_not_due_again_at_once() {
+        let now = Instant::now();
+        let mut w = WpsWindow::new();
+        w.armed(now);
+        assert!(!w.due(now));
+        assert!(!w.due(now + WPS_REARM - Duration::from_secs(1)));
+        assert!(w.due(now + WPS_REARM));
+    }
+
+    #[test]
+    fn a_reset_window_is_due_immediately() {
+        // A new PIN makes the old registration worthless.
+        let now = Instant::now();
+        let mut w = WpsWindow::new();
+        w.armed(now);
+        w.reset();
+        assert!(w.due(now));
     }
 
     #[test]
