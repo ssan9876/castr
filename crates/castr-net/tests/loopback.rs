@@ -271,7 +271,10 @@ async fn nack_recovers_dropped_keyframe_fragment() {
                 missing: vec![1]
             }
         );
-        for f in rtx.lookup(&n, 10_000, 33_333) {
+        // Dropped fragment belongs to a keyframe, so the now-removed
+        // one-interval delta rule never gated this test; dropping the
+        // argument here changes nothing about what it asserts.
+        for f in rtx.lookup(&n, 10_000) {
             s.send_datagram(f).unwrap();
         }
     };

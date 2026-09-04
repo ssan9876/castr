@@ -537,7 +537,6 @@ pub async fn cast(
         // contiguous to spot a missing reference frame.
         let mut audio_packetizer = Packetizer::new();
         let mut rtx = RetransmitBuffer::new(500_000);
-        let frame_interval_us = 1_000_000 / params.fps as u64;
         let mut sent_frames = 0u32;
         let mut fps_window = Instant::now();
         let mut nack_rx: Option<NackReceiver> = None;
@@ -622,7 +621,7 @@ pub async fn cast(
                     }
                 } => {
                     match ev {
-                        NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now, frame_interval_us) { let _ = link.send_datagram(f); },
+                        NackEv::Nack(Ok(nack)) => for f in rtx.lookup(&nack, now) { let _ = link.send_datagram(f); },
                         NackEv::Nack(Err(_)) => nack_rx = None,
                         NackEv::Stream(Ok(rx)) => nack_rx = Some(rx),
                         NackEv::Stream(Err(e)) => { tracing::debug!("nack stream: {e:#}"); tokio::time::sleep(Duration::from_millis(100)).await; }
