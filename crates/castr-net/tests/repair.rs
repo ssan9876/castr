@@ -13,7 +13,12 @@ fn a_dropped_delta_fragment_is_repaired_and_the_frame_completes() {
     let mut sender_rtx = RetransmitBuffer::new(500_000);
     let mut receiver = Reassembler::new(500_000);
 
-    let payload = vec![42u8; 4000];
+    // Patterned, not uniform: a uniform payload would let a wrong fragment
+    // (wrong offset, or a duplicate of a neighbour) of the right length
+    // satisfy the byte-for-byte assertion below, which is the one thing this
+    // test exists to catch. 251 is prime and < 256, so the pattern never
+    // lines up with a fragment boundary.
+    let payload: Vec<u8> = (0..4000u32).map(|i| (i % 251) as u8).collect();
     let frags = p.packetize(STREAM_VIDEO, false, 1_000, &payload, 1200);
     assert!(frags.len() > 2, "the test needs a fragmented frame");
     sender_rtx.record(p.last_frame_number(), false, frags.clone(), 0);
