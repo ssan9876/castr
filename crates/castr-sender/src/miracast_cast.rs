@@ -10,7 +10,7 @@
 //! media path does not care which.
 
 use anyhow::Context;
-use castr_media::codec::{EncoderConfig, Mode, PixelFormat, VideoEncoder};
+use castr_media::codec::{EncoderConfig, Mode, PixelFormat, RawFrame, VideoEncoder};
 use castr_miracast::rtsp::{self, Action};
 use castr_miracast::source::{rtp_pack::Packetizer, session::*, ts_mux::Muxer};
 use std::io::{Read, Write};
@@ -229,22 +229,54 @@ fn start_media(
                 enc.name()
             );
             let want = enc.input_format();
+            let interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
+            let mut last: Option<RawFrame> = None;
+            let mut next_due = Instant::now();
             while !vstop.load(Ordering::Relaxed) {
                 let now = start.elapsed().as_micros() as u64;
-                let frame = match cap.next_frame(100, now) {
-                    Ok(Some(f)) => f,
-                    Ok(None) => continue,
+                // Duplication hands over a frame only when the desktop changes,
+                // so a still screen yields nothing at all. A display reads that
+                // as a dead source and drops the session within seconds, which
+                // is why the last frame is repeated rather than nothing sent.
+                let wait = next_due.saturating_duration_since(Instant::now());
+                match cap.next_frame(wait.as_millis().max(1) as u32, now) {
+                    Ok(Some(f)) => last = Some(f),
+                    Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("miracast: capture: {e:#}");
                         break;
                     }
+                }
+                if Instant::now() < next_due {
+                    continue;
+                }
+                next_due += interval;
+                let Some(mut frame) = last.clone() else { continue };
+                frame.timestamp_us = start.elapsed().as_micros() as u64;
+                // The display negotiated a size; the desktop is whatever it is.
+                // Scale first, then convert, because the encoder takes only its
+                // own input format and will refuse anything else outright.
+                let scaled = if frame.width != width || frame.height != height {
+                    RawFrame {
+                        format: PixelFormat::Bgra,
+                        width,
+                        height,
+                        stride: width * 4,
+                        data: crate::cast::resize_bgra_nearest(
+                            &frame.data,
+                            frame.width,
+                            frame.height,
+                            frame.stride,
+                            width,
+                            height,
+                        ),
+                        timestamp_us: frame.timestamp_us,
+                    }
+                } else {
+                    frame
                 };
-                let frame = match (frame.format, want) {
-                    (a, b) if a == b => frame,
-                    (PixelFormat::Bgra, _) => frame, // the encoder converts
-                    _ => frame,
-                };
-                match enc.encode(&frame) {
+                let input = castr_media::convert::convert(&scaled, want);
+                match enc.encode(&input) {
                     Ok(Some(out)) => {
                         if vtx
                             .send(Media::Video {
