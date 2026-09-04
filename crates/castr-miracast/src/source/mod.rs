@@ -5,6 +5,7 @@
 //! `rtp_pack` against `rtp` - and follows the same rule: bytes in, bytes or
 //! actions out, no sockets, so a whole session replays in a test.
 
+pub mod caps;
 pub mod lpcm;
 pub mod rtp_pack;
 pub mod ts_mux;
