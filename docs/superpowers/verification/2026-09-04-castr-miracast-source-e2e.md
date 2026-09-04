@@ -19,10 +19,10 @@ all, which it could not before today, and that castr can act as a Miracast
 | 6 | The sink can be paired with more than once per start | PASS | Two consecutive fresh pairings, `DevicePairingResultStatus(0)` both times, with a fresh PIN minted between them |
 | 7 | Our source negotiates M1-M7 with the sink | PASS | Sink logged `playing 1280x720@30` |
 | 8 | Video reaches the sink and decodes in hardware | PASS | `v4l2 decoder: 1280x720 visible in 1280x720 coded`, then ~150 pictures per 5 s window |
-| 9 | A cast is stable | PASS for 30 s | `presented 153 ... queue 0, dropped 0`, five consecutive windows, no stall |
+| 9 | A cast is stable | PASS | See row 12 |
 | 10 | A second cast works without restarting anything | PASS | Two sessions at 19:24 and 19:26, the second after the first ended |
 | 11 | The connect stage names itself on failure | PASS | `connect: 192.168.88.157:7777 did not answer within 10s`, with the OS cause beneath |
-| 12 | A cast is stable for ten minutes | NOT RUN | Only 30 s was run |
+| 12 | A cast is stable for ten minutes | PASS | `playing 1280x720@30` at 19:30:46, `session ended: source closed the connection` at 19:40:46 — 600 s exactly, ended by the duration and not by a fault. 120 five-second performance windows, **none** reporting a dropped frame, ~150 pictures each |
 | 13 | Audio arrives and is audible | INCONCLUSIVE | Nothing in the path reported an error, but audio was never listened to. Needs a person |
 | 14 | The negotiation stage names itself on failure | PARTIAL | Unit-tested (`no_common_format_tears_down_rather_than_streaming_blindly`), never provoked against hardware |
 | 15 | The session stage notices a display that stops answering | NOT RUN | Keep-alive timeout is unit-tested only |

@@ -268,8 +268,9 @@ saving, driver age � and offers to fix the safe ones.
   unproven. It also has no radio layer yet: the display's address must be given,
   and forming the Wi-Fi Direct group is a separate step. HDCP is not supported
   at all, so a display that requires content protection cannot be cast to.
-- A cast to a Miracast display has been verified for 30 seconds, not longer, and
-  its audio has never been listened to.
+- A cast to a Miracast display has been verified for ten minutes against castr's
+  own sink, with no dropped frames, but its audio has never been listened to and
+  lip sync is unmeasured.
 - Lip sync has not been measured against ITU-R BT.1359 in either mode, and
   Miracast audio is carried as uncompressed LPCM.
 
