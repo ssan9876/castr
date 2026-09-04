@@ -12,6 +12,7 @@
 
 use crate::rtsp::VideoMode;
 use crate::wfd::parse_parameter_body;
+use castr_media::codec::Mode;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SinkCaps {
@@ -155,6 +156,43 @@ pub fn sink_modes(c: &SinkCaps) -> Vec<VideoMode> {
         .collect()
 }
 
+/// What one mode costs, roughly, in Mbit/s.
+///
+/// A formula rather than a table of magic numbers: pixels times frames, scaled
+/// so that 1080p60 lands near 20 Mbit/s, which is about what H.264 needs for a
+/// desktop at that size. It only has to be good enough to keep us from
+/// proposing a mode a display has already said it cannot carry.
+pub fn needs_mbps(m: VideoMode) -> u16 {
+    let bits = m.width as u64 * m.height as u64 * m.fps as u64;
+    ((bits / 6_000_000).max(1)) as u16
+}
+
+/// Every mode we are willing to encode, in the order we would rather have
+/// them, dropping any the display cannot carry.
+///
+/// The ordering is what the Game/Quality toggle already means everywhere else
+/// in castr: Quality prefers a bigger picture, which keeps text legible, and
+/// Game prefers a faster one, which keeps motion smooth.
+pub fn our_modes(mode: Mode, ceiling_mbps: Option<u16>) -> Vec<VideoMode> {
+    let mut all = vec![
+        VideoMode { width: 1920, height: 1080, fps: 60 },
+        VideoMode { width: 1920, height: 1080, fps: 30 },
+        VideoMode { width: 1280, height: 720, fps: 60 },
+        VideoMode { width: 1280, height: 720, fps: 30 },
+        VideoMode { width: 640, height: 480, fps: 60 },
+    ];
+    match mode {
+        Mode::Quality => all.sort_by(|a, b| {
+            b.height.cmp(&a.height).then(b.fps.cmp(&a.fps))
+        }),
+        Mode::Game => all.sort_by(|a, b| b.fps.cmp(&a.fps).then(b.height.cmp(&a.height))),
+    }
+    if let Some(ceiling) = ceiling_mbps {
+        all.retain(|m| needs_mbps(*m) <= ceiling);
+    }
+    all
+}
+
 /// Our modes in preference order; the first the display also offers wins.
 pub fn choose(sink: &SinkCaps, ours: &[VideoMode]) -> Result<VideoMode, NoCommonFormat> {
     let offered = sink_modes(sink);
@@ -272,6 +310,66 @@ mod tests {
             c.content_protection.as_deref(),
             Some("HDCP2.0 port=1189")
         );
+    }
+
+    #[test]
+    fn quality_prefers_a_bigger_picture_and_game_a_faster_one() {
+        // The toggle already means exactly this for castr's own protocol.
+        let quality = our_modes(Mode::Quality, None);
+        let game = our_modes(Mode::Game, None);
+        assert_eq!(quality[0], VideoMode { width: 1920, height: 1080, fps: 60 });
+        assert_eq!(
+            quality[1],
+            VideoMode { width: 1920, height: 1080, fps: 30 },
+            "quality takes 1080p30 over 720p60"
+        );
+        assert_eq!(
+            game[1],
+            VideoMode { width: 1280, height: 720, fps: 60 },
+            "game takes 720p60 over 1080p30"
+        );
+    }
+
+    #[test]
+    fn a_display_is_never_offered_more_than_it_says_it_can_carry() {
+        // Our own Pi advertises 10 Mbit/s. Proposing 1080p60 to it would be
+        // asking for a stream it has already said it cannot take.
+        let modes = our_modes(Mode::Quality, Some(10));
+        assert!(!modes.contains(&VideoMode { width: 1920, height: 1080, fps: 60 }));
+        assert!(modes.contains(&P720P30));
+    }
+
+    #[test]
+    fn a_generous_ceiling_keeps_everything() {
+        // A television advertising 54 Mbit/s should see our whole list.
+        assert_eq!(our_modes(Mode::Quality, Some(54)).len(), 5);
+        assert_eq!(our_modes(Mode::Quality, None).len(), 5);
+    }
+
+    #[test]
+    fn a_tiny_ceiling_still_leaves_something_to_offer() {
+        // Better a small picture than "no format in common".
+        let modes = our_modes(Mode::Quality, Some(3));
+        assert!(!modes.is_empty(), "nothing left to propose");
+        assert!(modes.iter().all(|m| needs_mbps(*m) <= 3));
+    }
+
+    #[test]
+    fn the_cost_estimate_is_in_the_right_neighbourhood() {
+        // It only has to be good enough to keep us from proposing the absurd.
+        assert!((18..=22).contains(&needs_mbps(VideoMode { width: 1920, height: 1080, fps: 60 })));
+        assert!((3..=6).contains(&needs_mbps(P720P30)));
+    }
+
+    #[test]
+    fn against_our_own_sink_the_one_mode_it_offers_is_chosen() {
+        // Whatever we now propose, a sink offering only 720p30 must still get
+        // 720p30 - the working path must not break.
+        let c = parse(&our_sink_body()).unwrap();
+        for mode in [Mode::Quality, Mode::Game] {
+            let ours = our_modes(mode, Some(10));
+            assert_eq!(choose(&c, &ours).unwrap(), P720P30, "{mode:?}");
+        }
     }
 
     #[test]

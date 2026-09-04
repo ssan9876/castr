@@ -15,6 +15,7 @@
 
 use crate::rtsp::{self, Action, Message, StartLine, VideoMode};
 use crate::source::caps::{self, SinkCaps};
+use castr_media::codec::Mode;
 use std::time::{Duration, Instant};
 
 /// Matches the sink's tolerance in `rtsp.rs`: two missed keep-alives, not one,
@@ -28,24 +29,25 @@ const PRESENTATION_URL: &str = "rtsp://localhost/wfd1.0/streamid=0";
 
 #[derive(Debug, Clone)]
 pub struct SourceConfig {
-    /// Our modes, in preference order: the first the display also offers wins.
-    pub modes: Vec<VideoMode>,
+    /// Which way to lean when a display offers several modes: a bigger picture
+    /// or a faster one. The same toggle castr's own protocol uses.
+    pub mode: Mode,
     /// The port we will send RTP from.
     pub rtp_port: u16,
     /// The session id we hand back when the display sets up the stream.
     pub session_id: String,
+    /// What the display's information element said it can carry, if the radio
+    /// read one. The capability body may name a ceiling too; the lower wins.
+    pub ceiling_mbps: Option<u16>,
 }
 
 impl Default for SourceConfig {
     fn default() -> Self {
         Self {
-            modes: vec![VideoMode {
-                width: 1280,
-                height: 720,
-                fps: 30,
-            }],
+            mode: Mode::Quality,
             rtp_port: 5000,
             session_id: "1234567890".to_string(),
+            ceiling_mbps: None,
         }
     }
 }
@@ -219,7 +221,15 @@ impl SourceSession {
                 )]
             }
         };
-        let chosen = match caps::choose(&sink, &self.cfg.modes) {
+        // The list of what to propose can only be built now: until M3 we did not
+        // know what the display can carry, and offering it more than that is
+        // asking for a stream it has already said it cannot take.
+        let ceiling = [self.cfg.ceiling_mbps, sink.max_bitrate_kbps.map(|k| (k / 1000) as u16)]
+            .into_iter()
+            .flatten()
+            .min();
+        let ours = caps::our_modes(self.cfg.mode, ceiling);
+        let chosen = match caps::choose(&sink, &ours) {
             Ok(mode) => mode,
             Err(_) => return vec![Action::Teardown("negotiation: no video format in common")],
         };
@@ -308,9 +318,14 @@ mod tests {
         height: 720,
         fps: 30,
     };
-    const P1080P60: VideoMode = VideoMode {
+    const P1080P30: VideoMode = VideoMode {
         width: 1920,
         height: 1080,
+        fps: 30,
+    };
+    const P720P60: VideoMode = VideoMode {
+        width: 1280,
+        height: 720,
         fps: 60,
     };
 
@@ -386,13 +401,11 @@ mod tests {
 
     #[test]
     fn no_common_format_tears_down_rather_than_streaming_blindly() {
-        let mut s = SourceSession::new(SourceConfig {
-            modes: vec![P1080P60],
-            ..cfg()
-        });
+        // CEA bit 3 is 720x576p50, a European broadcast mode we never encode.
+        let mut s = SourceSession::new(cfg());
         s.start();
         s.on_message(&rtsp::response(200, 1, ""));
-        let body = "wfd_video_formats: 40 00 02 04 00000020 00000000 00000000 00 0000 0000 00 none none\r\n";
+        let body = "wfd_video_formats: 40 00 02 04 00000008 00000000 00000000 00 0000 0000 00 none none\r\n";
         let actions = s.on_message(&rtsp::response(200, 2, body));
         let reason = actions.iter().find_map(|a| match a {
             Action::Teardown(r) => Some(*r),
@@ -467,6 +480,43 @@ mod tests {
         assert_eq!(sink.state(), NegState::Playing, "the sink never reached Playing");
         assert_eq!(source.chosen(), Some(P720P30));
         assert_eq!(sink.chosen_video(), Some(P720P30), "the two chose differently");
+    }
+
+    #[test]
+    fn the_toggle_decides_which_of_a_displays_modes_is_taken() {
+        // A display offering 720p30, 720p60 and 1080p30 - CEA bits 5, 6 and 7.
+        // Quality should take the biggest picture, Game the fastest one, and
+        // the choice is made here rather than baked in at construction.
+        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none
+";
+        for (mode, want) in [(Mode::Quality, P1080P30), (Mode::Game, P720P60)] {
+            let mut s = SourceSession::new(SourceConfig {
+                mode,
+                ..SourceConfig::default()
+            });
+            s.start();
+            s.on_message(&rtsp::response(200, 1, ""));
+            s.on_message(&rtsp::response(200, 2, body));
+            assert_eq!(s.chosen(), Some(want), "{mode:?} chose the wrong mode");
+        }
+    }
+
+    #[test]
+    fn a_ceiling_keeps_us_from_proposing_what_a_display_cannot_carry() {
+        // The same display, but it says it can take only 9 Mbit/s. 1080p30 is
+        // reckoned at 10, so Quality has to settle for the next thing that
+        // fits rather than proposing what the display cannot carry.
+        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none
+";
+        let mut s = SourceSession::new(SourceConfig {
+            mode: Mode::Quality,
+            ceiling_mbps: Some(9),
+            ..SourceConfig::default()
+        });
+        s.start();
+        s.on_message(&rtsp::response(200, 1, ""));
+        s.on_message(&rtsp::response(200, 2, body));
+        assert_eq!(s.chosen(), Some(P720P60));
     }
 
     #[test]

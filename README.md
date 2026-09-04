@@ -69,7 +69,7 @@ or any other Miracast sink rather than to a castr receiver:
 
 ```
 castr-sender miracast-list
-castr-sender miracast-cast "Living Room TV" [--duration SECS] [--fps 30]
+castr-sender miracast-cast "Living Room TV" [--mode quality|game] [--duration SECS]
 castr-sender miracast-cast 192.168.173.1:7236       # or by address
 ```
 
@@ -80,6 +80,12 @@ Given a name, castr finds the display, pairs with it the first time (prompting
 for the PIN the display shows), forms the Wi-Fi Direct group, casts, and drops
 the group when it exits. Most displays advertise only while their screen
 mirroring page is open, so the command waits up to a minute for one to appear.
+
+The picture mode is negotiated with the display: castr offers every mode it can
+encode that the display's advertised bandwidth will carry, and takes the first
+the display also offers. `--mode quality` prefers a bigger picture (1080p30 over
+720p60), `--mode game` a faster one — the same distinction the toggle makes for
+castr's own protocol.
 
 Given an address instead, the radio is skipped entirely: on the ordinary LAN
 that is Miracast over Infrastructure, and over an existing Wi-Fi Direct group it
@@ -274,7 +280,9 @@ saving, driver age � and offers to fix the safe ones.
   interoperability is the whole point of the exercise, so treat it as unproven.
   HDCP is not supported at all, so a display that requires content protection
   cannot be cast to, and only the PIN pairing ceremony is implemented — a display
-  offering push-button only will not pair.
+  offering push-button only will not pair. Mode negotiation offers up to 1080p60
+  but has only ever been exercised against a sink advertising 720p30, so the
+  larger modes are untested on real hardware.
 - A cast to a Miracast display has been verified for ten minutes against castr's
   own sink, with no dropped frames, but its audio has never been listened to and
   lip sync is unmeasured.

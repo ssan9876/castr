@@ -31,6 +31,11 @@ pub struct MiracastOptions {
     /// Which monitor to cast; the same meaning as `CASTR_OUTPUT` elsewhere.
     pub output: u32,
     pub fps: u32,
+    /// Bigger picture or faster one, when the display offers both.
+    pub mode: Mode,
+    /// What the display's advertisement said it can carry, when the radio read
+    /// one. Nothing here invents a ceiling of its own.
+    pub ceiling_mbps: Option<u16>,
 }
 
 impl Default for MiracastOptions {
@@ -39,6 +44,8 @@ impl Default for MiracastOptions {
             duration: None,
             output: 0,
             fps: 30,
+            mode: Mode::Quality,
+            ceiling_mbps: None,
         }
     }
 }
@@ -61,6 +68,8 @@ pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
     let rtp_sock = UdpSocket::bind("0.0.0.0:0").context("binding an RTP socket")?;
     let mut session = SourceSession::new(SourceConfig {
         rtp_port: rtp_sock.local_addr()?.port(),
+        mode: opts.mode,
+        ceiling_mbps: opts.ceiling_mbps,
         ..SourceConfig::default()
     });
 
@@ -195,6 +204,7 @@ fn start_media(
         .map(|k| k.saturating_mul(1000))
         .unwrap_or(10_000_000);
     let output = opts.output;
+    let enc_mode = opts.mode;
     let start = Instant::now();
 
     let vtx = tx.clone();
@@ -214,7 +224,7 @@ fn start_media(
                 height,
                 fps,
                 bitrate_bps,
-                mode: Mode::Quality,
+                mode: enc_mode,
             };
             let mut enc = match castr_codec_win::MfEncoder::new(cfg) {
                 Ok(e) => e,
