@@ -250,7 +250,11 @@ async fn nack_recovers_dropped_keyframe_fragment() {
                     }
                 }
                 _ => {
-                    for n in reasm.tick(100_000) {
+                    // This test drops a keyframe fragment, which is NACKed
+                    // unconditionally regardless of the repair window, so the
+                    // added rtt/window arguments don't change this test's
+                    // outcome.
+                    for n in reasm.tick(100_000, 5_000, 150_000) {
                         nack_tx.send(&n).await.unwrap();
                     }
                 }

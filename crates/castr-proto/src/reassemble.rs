@@ -1,6 +1,10 @@
 use crate::header::*;
 use std::collections::BTreeMap;
 
+/// Allowed for decoding and presenting a repaired frame, on top of the round
+/// trip, when deciding whether a repair can still arrive in time.
+const DECODE_MARGIN_US: u64 = 10_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompleteFrame {
     pub stream: u8,
@@ -113,7 +117,14 @@ impl Reassembler {
         }))
     }
 
-    pub fn tick(&mut self, now_us: u64) -> Vec<Nack> {
+    /// Frames still missing fragments, as NACKs to send.
+    ///
+    /// `rtt_us` and `repair_window_us` decide whether asking is still worth
+    /// it for a delta: past the point where a repair could arrive before the
+    /// receiver needs the frame, the request is wasted upstream bandwidth on
+    /// a link that has just demonstrated it is lossy. Keyframes ignore the
+    /// deadline, because without one nothing decodes at all.
+    pub fn tick(&mut self, now_us: u64, rtt_us: u64, repair_window_us: u64) -> Vec<Nack> {
         let mut nacks = Vec::new();
         let mut expired = Vec::new();
         for (&fnum, p) in self.partial.iter() {
@@ -121,19 +132,24 @@ impl Reassembler {
             if age > self.max_age_us {
                 expired.push(fnum);
                 self.lost += (p.parts.len() - p.received) as u64;
-            } else if p.keyframe {
-                let missing: Vec<u16> = p
-                    .parts
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, x)| x.is_none())
-                    .map(|(i, _)| i as u16)
-                    .collect();
-                nacks.push(Nack {
-                    frame_number: fnum,
-                    missing,
-                });
+                continue;
             }
+            let in_time = now_us + rtt_us + DECODE_MARGIN_US
+                < p.first_seen_us + repair_window_us;
+            if !p.keyframe && !in_time {
+                continue;
+            }
+            let missing: Vec<u16> = p
+                .parts
+                .iter()
+                .enumerate()
+                .filter(|(_, x)| x.is_none())
+                .map(|(i, _)| i as u16)
+                .collect();
+            nacks.push(Nack {
+                frame_number: fnum,
+                missing,
+            });
         }
         for f in expired {
             self.partial.remove(&f);
@@ -196,7 +212,7 @@ mod tests {
         let dgs = frames(&mut p, true, &data);
         r.push(&dgs[0], 0).unwrap();
         r.push(&dgs[3], 0).unwrap();
-        let nacks = r.tick(100_000);
+        let nacks = r.tick(100_000, 5_000, 150_000);
         assert_eq!(
             nacks,
             vec![Nack {
@@ -205,19 +221,23 @@ mod tests {
             }]
         );
         assert_eq!(r.pending(), 1);
-        assert!(r.tick(600_001).is_empty());
+        assert!(r.tick(600_001, 5_000, 150_000).is_empty());
         assert_eq!(r.pending(), 0);
         assert_eq!(r.fragments_lost(), 2);
         assert_eq!(r.fragments_lost(), 0);
     }
 
     #[test]
-    fn tick_does_not_nack_delta_frames() {
+    fn tick_does_not_nack_delta_frames_once_a_repair_could_not_land() {
+        // This used to assert deltas are never NACKed at all; that is exactly
+        // the behavior Task 3 changes. What still holds is that a delta past
+        // its repair deadline is not worth asking for, so the timings here
+        // are chosen to be outside the repair window rather than inside it.
         let mut p = Packetizer::new();
         let mut r = Reassembler::new(500_000);
         let dgs = frames(&mut p, false, &[2u8; 350]);
         r.push(&dgs[0], 0).unwrap();
-        assert!(r.tick(100_000).is_empty());
+        assert!(r.tick(200_000, 5_000, 150_000).is_empty());
     }
 
     #[test]
@@ -271,5 +291,59 @@ mod tests {
         let result = r.push(&frame_0_dup, 0).unwrap();
         assert_eq!(result, None);
         assert_eq!(r.pending(), 0);
+    }
+
+    #[test]
+    fn a_delta_missing_a_fragment_is_nacked_while_a_repair_could_still_land() {
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new(500_000);
+        let f = frames(&mut p, false, &vec![7u8; 400]);
+        assert!(f.len() > 1, "the test needs a fragmented frame");
+        // Everything but the last fragment.
+        for d in &f[..f.len() - 1] {
+            r.push(d, 0).unwrap();
+        }
+        let nacks = r.tick(1_000, 5_000, 150_000);
+        assert_eq!(nacks.len(), 1, "the delta is asked for: {nacks:?}");
+        assert_eq!(nacks[0].missing, vec![(f.len() - 1) as u16]);
+    }
+
+    #[test]
+    fn a_delta_whose_repair_could_not_arrive_in_time_is_not_nacked() {
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new(500_000);
+        let f = frames(&mut p, false, &vec![7u8; 400]);
+        for d in &f[..f.len() - 1] {
+            r.push(d, 0).unwrap();
+        }
+        // 140 ms gone of a 150 ms window, and the round trip is 30 ms: the
+        // repair would arrive after the frame was needed, so asking wastes
+        // upstream bandwidth on a link that has just proved it is lossy.
+        let nacks = r.tick(140_000, 30_000, 150_000);
+        assert!(nacks.is_empty(), "{nacks:?}");
+    }
+
+    #[test]
+    fn a_keyframe_is_still_nacked_after_the_repair_window_has_passed() {
+        // Without a keyframe nothing decodes at all, so a late one is still
+        // worth asking for; the deadline applies to deltas only.
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new(500_000);
+        let f = frames(&mut p, true, &vec![7u8; 400]);
+        for d in &f[..f.len() - 1] {
+            r.push(d, 0).unwrap();
+        }
+        let nacks = r.tick(140_000, 30_000, 150_000);
+        assert_eq!(nacks.len(), 1, "{nacks:?}");
+    }
+
+    #[test]
+    fn a_complete_delta_is_never_nacked() {
+        let mut p = Packetizer::new();
+        let mut r = Reassembler::new(500_000);
+        for d in frames(&mut p, false, &vec![7u8; 400]) {
+            r.push(&d, 0).unwrap();
+        }
+        assert!(r.tick(1_000, 5_000, 150_000).is_empty());
     }
 }
