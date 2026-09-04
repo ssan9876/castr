@@ -27,7 +27,7 @@
 | `crates/castr-miracast/src/wfd.rs` | modified: parse a device-information subelement |
 | `crates/castr-wifidirect-win/Cargo.toml` | the new crate |
 | `crates/castr-wifidirect-win/src/lib.rs` | public surface: `Display`, `Connection`, `discover`, `connect` |
-| `crates/castr-wifidirect-win/src/select.rs` | pure: name matching, ceremony choice, waiting policy |
+| `crates/castr-wifidirect-win/src/select.rs` | pure: name matching and the waiting policy |
 | `crates/castr-wifidirect-win/src/failure.rs` | pure: status and log-text to a named stage failure |
 | `crates/castr-wifidirect-win/src/radio.rs` | the WinRT shell |
 | `crates/castr-sender/src/miracast_cast.rs` | modified: accept a name, hold the connection |
