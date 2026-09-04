@@ -8,4 +8,5 @@
 pub mod caps;
 pub mod lpcm;
 pub mod rtp_pack;
+pub mod session;
 pub mod ts_mux;
