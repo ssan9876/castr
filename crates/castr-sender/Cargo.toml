@@ -22,6 +22,7 @@ castr-miracast = { path = "../castr-miracast" }
 windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_Console"] }
 castr-capture-win = { path = "../castr-capture-win" }
 castr-codec-win = { path = "../castr-codec-win" }
+castr-wifidirect-win = { path = "../castr-wifidirect-win" }
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

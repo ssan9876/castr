@@ -1,0 +1,20 @@
+[package]
+name = "castr-wifidirect-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tracing.workspace = true
+castr-miracast = { path = "../castr-miracast" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Foundation",
+    "Foundation_Collections",
+    "Devices_Enumeration",
+    "Devices_WiFiDirect",
+    "Networking",
+    "Storage_Streams",
+] }

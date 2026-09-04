@@ -136,6 +136,56 @@ pub fn device_info_subelement(d: &DeviceInfo) -> String {
     )
 }
 
+/// The Wi-Fi Alliance display OUI, and the type that marks its information
+/// element among the vendor elements a device advertises.
+pub const WFD_OUI: [u8; 3] = [0x50, 0x6f, 0x9a];
+pub const WFD_OUI_TYPE: u8 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceKind {
+    Source,
+    PrimarySink,
+    SecondarySink,
+    DualRole,
+}
+
+/// What a device says about itself before anything connects to it: enough to
+/// tell a television from a printer, and to know its port, its ceiling and
+/// whether it wants content protection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceCaps {
+    pub kind: DeviceKind,
+    pub session_available: bool,
+    pub content_protection: bool,
+    pub rtsp_port: u16,
+    pub max_throughput_mbps: u16,
+}
+
+/// Reads the 6-byte device-information subelement body: a flags field, the
+/// session-management port, and a throughput ceiling in Mbit/s.
+///
+/// The mirror of `device_info_subelement`, which builds the same thing for the
+/// sink. One layout, both directions, so the two cannot drift apart.
+pub fn parse_device_info(body: &[u8]) -> Option<DeviceCaps> {
+    if body.len() < 6 {
+        return None;
+    }
+    let info = u16::from_be_bytes([body[0], body[1]]);
+    Some(DeviceCaps {
+        kind: match info & 0x0003 {
+            0 => DeviceKind::Source,
+            1 => DeviceKind::PrimarySink,
+            2 => DeviceKind::SecondarySink,
+            _ => DeviceKind::DualRole,
+        },
+        // Bits 4-5: 01 means a session is free to be started.
+        session_available: (info >> 4) & 0x0003 == 1,
+        content_protection: info & 0x0100 != 0,
+        rtsp_port: u16::from_be_bytes([body[2], body[3]]),
+        max_throughput_mbps: u16::from_be_bytes([body[4], body[5]]),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +301,65 @@ mod tests {
             max_throughput_mbps: 10,
         });
         assert_eq!(s, "000600011c44000a");
+    }
+
+    #[test]
+    fn a_real_televisions_element_parses() {
+        // Captured from a Samsung 75" Crystal UHD, 2026-09-04. Bytes from a
+        // vendor we did not write are the only interoperability evidence
+        // available until a television can actually be cast to.
+        let body = [0x01, 0x11, 0x1c, 0x44, 0x00, 0x36];
+        let c = parse_device_info(&body).expect("a real element must parse");
+        assert_eq!(c.kind, DeviceKind::PrimarySink);
+        assert!(c.session_available, "it was advertising a free session");
+        assert!(c.content_protection, "this television supports HDCP");
+        assert_eq!(c.rtsp_port, 7236);
+        assert_eq!(c.max_throughput_mbps, 54);
+    }
+
+    #[test]
+    fn our_own_sinks_element_parses_as_what_we_built() {
+        // The builder and the parser must agree, or the source and the sink
+        // disagree about the sink's own advertisement.
+        let hex = device_info_subelement(&DeviceInfo {
+            session_available: true,
+            rtsp_port: 7236,
+            max_throughput_mbps: 10,
+        });
+        let bytes: Vec<u8> = (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).expect("hex"))
+            .collect();
+        // The first two bytes are the subelement's length, not its body.
+        let c = parse_device_info(&bytes[2..]).expect("our own element must parse");
+        assert_eq!(c.kind, DeviceKind::PrimarySink);
+        assert!(c.session_available);
+        assert!(!c.content_protection);
+        assert_eq!(c.rtsp_port, 7236);
+        assert_eq!(c.max_throughput_mbps, 10);
+    }
+
+    #[test]
+    fn a_source_is_not_mistaken_for_a_sink() {
+        // Device type 00 is a source. Casting to one would never work.
+        let body = [0x00, 0x10, 0x1c, 0x44, 0x00, 0x0a];
+        assert_eq!(
+            parse_device_info(&body).expect("parse").kind,
+            DeviceKind::Source
+        );
+    }
+
+    #[test]
+    fn a_truncated_element_is_rejected_rather_than_guessed() {
+        assert!(parse_device_info(&[0x01, 0x11, 0x1c]).is_none());
+        assert!(parse_device_info(&[]).is_none());
+    }
+
+    #[test]
+    fn an_unavailable_sink_says_so() {
+        // Bits 4-5 clear: a sink already busy with somebody else.
+        let body = [0x01, 0x01, 0x1c, 0x44, 0x00, 0x0a];
+        let c = parse_device_info(&body).expect("parse");
+        assert_eq!(c.kind, DeviceKind::PrimarySink);
+        assert!(!c.session_available);
     }
 }

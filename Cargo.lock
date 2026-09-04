@@ -842,6 +842,7 @@ dependencies = [
  "castr-miracast",
  "castr-net",
  "castr-proto",
+ "castr-wifidirect-win",
  "clap",
  "eframe",
  "hex",
@@ -850,6 +851,16 @@ dependencies = [
  "tracing-subscriber",
  "windows 0.58.0",
  "winres",
+]
+
+[[package]]
+name = "castr-wifidirect-win"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "castr-miracast",
+ "tracing",
+ "windows 0.58.0",
 ]
 
 [[package]]
