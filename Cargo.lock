@@ -842,6 +842,7 @@ dependencies = [
  "castr-miracast",
  "castr-net",
  "castr-proto",
+ "castr-wifidirect-win",
  "clap",
  "eframe",
  "hex",

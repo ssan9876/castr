@@ -27,9 +27,11 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
-    /// Cast the screen to an ordinary Miracast display, by address
+    /// List the Wi-Fi Direct devices in range, and which of them are displays
+    MiracastList,
+    /// Cast the screen to an ordinary Miracast display, by name or address
     MiracastCast {
-        /// The display's RTSP address, host:port (Wi-Fi Display uses 7236)
+        /// The display's name, or its RTSP address as host:port
         target: String,
         /// Stop automatically after this many seconds (mainly for testing)
         #[arg(long)]
@@ -116,16 +118,33 @@ fn main() -> anyhow::Result<()> {
             let code = diagnose::run(fix)?;
             std::process::exit(code);
         }
+        Some(Cmd::MiracastList) => {
+            for c in castr_wifidirect_win::radio::discover()? {
+                match c.caps {
+                    Some(caps) if c.is_display() => println!(
+                        "{:<32} display, RTSP {}, up to {} Mbps{}",
+                        c.name,
+                        caps.rtsp_port,
+                        caps.max_throughput_mbps,
+                        if caps.content_protection { ", HDCP" } else { "" }
+                    ),
+                    _ => println!("{:<32} not a display", c.name),
+                }
+            }
+            Ok(())
+        }
         Some(Cmd::MiracastCast {
             target,
             duration,
             fps,
         }) => {
-            // Bare host or host:port; Wi-Fi Display's control port is 7236.
+            // A name is the ordinary case; an address skips the radio entirely,
+            // which is how this was tested before the radio existed and how a
+            // display on the ordinary network is reached.
             let addr = target
                 .parse::<std::net::SocketAddr>()
                 .or_else(|_| format!("{target}:7236").parse::<std::net::SocketAddr>())
-                .map_err(|e| anyhow::anyhow!("connect: {target:?} is not an address ({e})"))?;
+                .ok();
             // Which monitor to cast, the same control the other cast path uses.
             let output = std::env::var("CASTR_OUTPUT")
                 .ok()
@@ -136,7 +155,29 @@ fn main() -> anyhow::Result<()> {
                 output,
                 fps,
             };
-            miracast_cast::cast_to(addr, opts)
+            match addr {
+                Some(addr) => miracast_cast::cast_to(addr, opts),
+                None => {
+                    let wait = castr_wifidirect_win::select::WaitPolicy::new(
+                        Duration::from_secs(60),
+                    );
+                    let name = target.clone();
+                    let connection = castr_wifidirect_win::radio::connect(&target, wait, &mut || {
+                        println!("Enter the PIN shown on {name:?}:");
+                        let mut pin = String::new();
+                        std::io::stdin().read_line(&mut pin)?;
+                        Ok(pin.trim().to_string())
+                    })?;
+                    let addr = std::net::SocketAddr::new(
+                        connection.remote_ip(),
+                        connection.rtsp_port(),
+                    );
+                    let result = miracast_cast::cast_to(addr, opts);
+                    // The group goes when this does, which is the teardown.
+                    drop(connection);
+                    result
+                }
+            }
         }
         Some(Cmd::Cast {
             target,
