@@ -135,22 +135,27 @@ Two rules are built in deliberately:
 Every failure names its stage and reports what was known at that point.
 "Connecting" forever is the behaviour being replaced.
 
-| Stage | Failure | Reported as |
-|---|---|---|
-| Discovery | no Wi-Fi Display element | the display is not in mirroring mode, and how to fix that |
-| Association | no group, or a group with no beacon | the reason quoted from the WLAN stack |
-| WPS | wrong PIN, or expired walk time | the two distinguished, with different advice |
-| Negotiation | no common format | what each side offered |
-| Session | sink powered off or input changed | detected by keepalive, not by silence |
-| Teardown | none | `TEARDOWN` always sent, group always dropped |
+The full taxonomy spans this part and the radio layer in part 2. The stage
+names are fixed here so both parts report in the same vocabulary, but only the
+last three are built and verified in this sub-project.
+
+| Stage | Part | Failure | Reported as |
+|---|---|---|---|
+| Discovery | 2 | no Wi-Fi Display element | the display is not in mirroring mode, and how to fix that |
+| Association | 2 | no group, or a group with no beacon | the reason quoted from the WLAN stack |
+| WPS | 2 | wrong PIN, or expired walk time | the two distinguished, with different advice |
+| Connect | 1 | RTSP port unreachable, or M1 unanswered | the address tried and the timeout that expired |
+| Negotiation | 1 | no common format | what each side offered |
+| Session | 1 | sink powered off, or input changed | detected by keepalive, not by silence |
+| Teardown | 1 | none | `TEARDOWN` always sent; part 2 also drops the group |
 
 RTP is one-way UDP with no feedback, so silence on the media path cannot
 distinguish an idle desktop from a dead display. Liveness comes from RTSP
 keepalives on the control channel.
 
-A group is always torn down on exit. Leaving one up is how a peer comes to hold
-credentials for a group that no longer exists — a failure this project has
-already paid for once.
+Carried forward into part 2, where it applies: a group is always torn down on
+exit. Leaving one up is how a peer comes to hold credentials for a group that
+no longer exists — a failure this project has already paid for once.
 
 ## 9. Testing
 
@@ -183,5 +188,11 @@ fixtures for `caps`.
 
 `castr-sender` streams desktop and audio to the Pi's Miracast sink over
 Ethernet, negotiated M1-M7, sustained for ten minutes without a stall; the
-round-trip and cross-machine tests pass in the workspace suite; and each of the
-six failure stages has been provoked deliberately and reports itself by name.
+round-trip and cross-machine tests pass in the workspace suite; and the four
+failure stages this part owns — connect, negotiation, session, teardown — have
+each been provoked deliberately and report themselves by name. The three radio
+stages carry their names from here but are proved in part 2.
+
+Teardown is verified by confirming the sink returns to idle and accepts a fresh
+session immediately after one ends. Dropping the P2P group belongs to part 2,
+where there is a group to drop.
