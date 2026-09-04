@@ -1,3 +1,4 @@
+use crate::cursor::{CursorCache, CursorKind, CursorShape};
 use anyhow::{bail, Context};
 use castr_media::{PixelFormat, RawFrame};
 use windows::core::Interface;
@@ -14,6 +15,7 @@ pub struct DesktopCapture {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
+    cursor: CursorCache,
 }
 
 impl DesktopCapture {
@@ -76,6 +78,7 @@ impl DesktopCapture {
             staging: staging.context("no staging texture")?,
             width,
             height,
+            cursor: CursorCache::new(),
         })
     }
 
@@ -103,6 +106,61 @@ impl DesktopCapture {
             }
             return Err(e).context("AcquireNextFrame");
         }
+        // The shape is sent only when it changes, so a zero size here means
+        // "reuse what you have", not "no cursor".
+        let shape = if info.PointerShapeBufferSize > 0 {
+            let mut buf = vec![0u8; info.PointerShapeBufferSize as usize];
+            let mut needed = 0u32;
+            let mut si = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+            // SAFETY: buf is sized by PointerShapeBufferSize, and needed and
+            // si are valid out-pointers we own.
+            let got = unsafe {
+                self.dup.GetFramePointerShape(
+                    buf.len() as u32,
+                    buf.as_mut_ptr() as *mut _,
+                    &mut needed,
+                    &mut si,
+                )
+            };
+            match got {
+                Ok(()) => {
+                    let kind = match DXGI_OUTDUPL_POINTER_SHAPE_TYPE(si.Type as i32) {
+                        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME => {
+                            Some(CursorKind::Monochrome)
+                        }
+                        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR => Some(CursorKind::Color),
+                        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR => {
+                            Some(CursorKind::MaskedColor)
+                        }
+                        // A shape type we do not know how to draw is skipped
+                        // rather than guessed at.
+                        _ => None,
+                    };
+                    kind.map(|kind| CursorShape {
+                        kind,
+                        width: si.Width,
+                        height: si.Height,
+                        pitch: si.Pitch,
+                        hotspot_x: si.HotSpot.x,
+                        hotspot_y: si.HotSpot.y,
+                        data: buf,
+                    })
+                }
+                Err(e) => {
+                    // Keep the cached shape: a stale cursor beats none.
+                    tracing::debug!("cursor shape unavailable: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        self.cursor.update(
+            info.PointerPosition.Position.x,
+            info.PointerPosition.Position.y,
+            info.PointerPosition.Visible.as_bool(),
+            shape,
+        );
         let result = (|| -> anyhow::Result<RawFrame> {
             let tex: ID3D11Texture2D = resource
                 .as_ref()
@@ -155,7 +213,13 @@ impl DesktopCapture {
         })();
         // SAFETY: dup is a valid COM interface; ReleaseFrame must be called after AcquireNextFrame regardless of outcome.
         let _ = unsafe { self.dup.ReleaseFrame() };
-        result.map(Some)
+        let mut frame = result?;
+        // The desktop texture never contains the cursor; Windows hands it
+        // over separately, so it is drawn here rather than by the receiver,
+        // which keeps it consistent with the picture.
+        self.cursor
+            .draw(&mut frame.data, self.width, self.height, frame.stride);
+        Ok(Some(frame))
     }
 }
 
@@ -185,5 +249,27 @@ mod tests {
         assert!(f.stride >= w * 4);
         assert_eq!(f.data.len(), (f.stride * h) as usize);
         assert_eq!(f.timestamp_us, 1);
+    }
+
+    /// Needs an interactive desktop with the cursor over the primary screen.
+    /// Run: cargo test -p castr-capture-win -- --ignored
+    #[test]
+    #[ignore]
+    fn captures_a_frame_that_is_not_uniformly_blank() {
+        let mut cap = DesktopCapture::new(0).unwrap();
+        // The first frame after startup is often empty; take several.
+        let mut frame = None;
+        for _ in 0..30 {
+            if let Ok(Some(f)) = cap.next_frame(200, 0) {
+                frame = Some(f);
+            }
+        }
+        let f = frame.expect("no frame captured");
+        let (pixels, _) = f.data.as_chunks::<4>();
+        let first = pixels[0];
+        assert!(
+            pixels.iter().any(|p| *p != first),
+            "the captured frame has no variation at all"
+        );
     }
 }

@@ -129,6 +129,52 @@ pub fn blend(
     }
 }
 
+/// The last shape, position and visibility reported by the duplication API.
+///
+/// A shape arrives only when it changes, so it is held until replaced;
+/// everything else is refreshed per frame.
+#[derive(Default)]
+pub struct CursorCache {
+    shape: Option<CursorShape>,
+    x: i32,
+    y: i32,
+    visible: bool,
+}
+
+impl CursorCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update(&mut self, x: i32, y: i32, visible: bool, shape: Option<CursorShape>) {
+        self.x = x;
+        self.y = y;
+        self.visible = visible;
+        if let Some(s) = shape {
+            self.shape = Some(s);
+        }
+    }
+
+    /// Draws the cursor into a BGRA frame, hotspot already accounted for.
+    pub fn draw(&self, dst: &mut [u8], width: u32, height: u32, stride: u32) {
+        if !self.visible {
+            return;
+        }
+        let Some(s) = &self.shape else {
+            return;
+        };
+        blend(
+            s,
+            self.x - s.hotspot_x,
+            self.y - s.hotspot_y,
+            dst,
+            width,
+            height,
+            stride,
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -306,5 +352,52 @@ mod tests {
         };
         blend(&shape, 0, 0, &mut dst, 4, 4, 16);
         assert_eq!(px(&dst, 0, 0), (0, 0, 255), "what was delivered is drawn");
+    }
+
+    #[test]
+    fn the_cache_keeps_the_last_shape_when_none_is_offered() {
+        // Windows sends a shape only when it changes, which is rarely. A cache
+        // that forgets makes the cursor flicker out on almost every frame.
+        let mut c = CursorCache::new();
+        c.update(0, 0, true, Some(one_red_pixel()));
+        c.update(2, 2, true, None);
+        let mut dst = canvas(0, 0, 0);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 2, 2), (0, 0, 255), "moved, same shape");
+    }
+
+    #[test]
+    fn the_cache_draws_nothing_before_the_first_shape_arrives() {
+        let mut c = CursorCache::new();
+        c.update(1, 1, true, None);
+        let mut dst = canvas(9, 9, 9);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 1, 1), (9, 9, 9));
+    }
+
+    #[test]
+    fn an_invisible_cursor_is_not_drawn() {
+        // Full-screen games and video players hide the cursor; drawing it
+        // anyway would be conspicuous.
+        let mut c = CursorCache::new();
+        c.update(1, 1, true, Some(one_red_pixel()));
+        c.update(1, 1, false, None);
+        let mut dst = canvas(9, 9, 9);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 1, 1), (9, 9, 9));
+    }
+
+    #[test]
+    fn the_hotspot_is_subtracted_so_the_tip_lands_where_reported() {
+        let mut c = CursorCache::new();
+        let shape = CursorShape {
+            hotspot_x: 1,
+            hotspot_y: 1,
+            ..one_red_pixel()
+        };
+        c.update(2, 2, true, Some(shape));
+        let mut dst = canvas(0, 0, 0);
+        c.draw(&mut dst, 4, 4, 16);
+        assert_eq!(px(&dst, 1, 1), (0, 0, 255), "drawn one up and one left");
     }
 }
