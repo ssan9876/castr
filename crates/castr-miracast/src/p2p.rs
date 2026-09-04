@@ -66,6 +66,12 @@ pub enum Event {
     },
     WpsSuccess,
     WpsFail,
+    /// An event we do not model, carried through so it reaches the log.
+    ///
+    /// Everything unrecognised used to be discarded here, which left the sink
+    /// unable to report any failure it had not been taught in advance - a
+    /// source that could not find the group at all produced complete silence.
+    Other(String),
 }
 
 /// Parses one unsolicited event line. Unknown events yield `None` rather than
@@ -84,6 +90,23 @@ pub fn stored_persistent_group(reply: &str) -> Option<u32> {
         .skip(1)
         .filter(|l| l.contains("[P2P-PERSISTENT]"))
         .find_map(|l| l.split('\t').next()?.trim().parse().ok())
+}
+
+/// Events the supplicant emits on its own schedule, whatever a source is
+/// doing. They arrive in a steady stream and would bury the ones that matter,
+/// so these alone are dropped rather than carried.
+fn is_routine(name: &str) -> bool {
+    matches!(
+        name,
+        "CTRL-EVENT-SCAN-STARTED"
+            | "CTRL-EVENT-SCAN-RESULTS"
+            | "CTRL-EVENT-BSS-ADDED"
+            | "CTRL-EVENT-BSS-REMOVED"
+            | "CTRL-EVENT-SUBNET-STATUS-UPDATE"
+            | "P2P-DEVICE-FOUND"
+            | "P2P-DEVICE-LOST"
+            | "P2P-FIND-STOPPED"
+    )
 }
 
 pub fn parse_event(line: &str) -> Option<Event> {
@@ -125,7 +148,8 @@ pub fn parse_event(line: &str) -> Option<Event> {
         }
         "WPS-SUCCESS" => Some(Event::WpsSuccess),
         "WPS-FAIL" | "WPS-TIMEOUT" => Some(Event::WpsFail),
-        _ => None,
+        _ if is_routine(name) => None,
+        _ => Some(Event::Other(body.trim().to_string())),
     }
 }
 
@@ -501,6 +525,52 @@ mod tests {
             None
         );
         assert_eq!(stored_persistent_group(""), None);
+    }
+
+    #[test]
+    fn an_unmodelled_event_is_carried_rather_than_discarded() {
+        // The sink stayed silent through an afternoon of failed connections
+        // because every line it had not been taught was dropped right here.
+        assert_eq!(
+            parse_event("<3>P2P-GO-NEG-FAILURE status=1"),
+            Some(Event::Other("P2P-GO-NEG-FAILURE status=1".to_string())),
+            "an unmodelled event must still reach the log"
+        );
+        assert_eq!(
+            parse_event("<3>CTRL-EVENT-ASSOC-REJECT status_code=17"),
+            Some(Event::Other(
+                "CTRL-EVENT-ASSOC-REJECT status_code=17".to_string()
+            )),
+            "the priority prefix is not part of the message"
+        );
+    }
+
+    #[test]
+    fn routine_chatter_is_still_dropped() {
+        // These fire on the supplicant's own schedule and carry no news; a sink
+        // that logged them would bury the one line that explains a failure.
+        for line in [
+            "<3>CTRL-EVENT-SCAN-STARTED ",
+            "<3>CTRL-EVENT-SCAN-RESULTS ",
+            "<3>CTRL-EVENT-BSS-ADDED 4 02:00:00:00:00:00",
+            "<3>CTRL-EVENT-BSS-REMOVED 4 02:00:00:00:00:00",
+            "<3>P2P-DEVICE-FOUND 02:00:00:00:00:00 name='pc'",
+            "<3>P2P-DEVICE-LOST p2p_dev_addr=02:00:00:00:00:00",
+        ] {
+            assert_eq!(parse_event(line), None, "{line:?} should be routine");
+        }
+    }
+
+    #[test]
+    fn a_modelled_event_still_parses_as_itself() {
+        assert_eq!(parse_event("<3>WPS-TIMEOUT"), Some(Event::WpsFail));
+        assert_eq!(parse_event("<3>WPS-SUCCESS"), Some(Event::WpsSuccess));
+    }
+
+    #[test]
+    fn an_empty_line_carries_nothing() {
+        assert_eq!(parse_event(""), None);
+        assert_eq!(parse_event("<3>"), None);
         assert_eq!(
             Command::group_remove("p2p-wlan0-0"),
             "P2P_GROUP_REMOVE p2p-wlan0-0"

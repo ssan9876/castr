@@ -450,6 +450,10 @@ fn serve(
                     return Ok(());
                 }
                 Event::GroupStarted { .. } => {}
+                // Already logged above, which is the whole point of carrying
+                // it: the sink can report a failure it does not understand
+                // rather than going quiet and leaving the source to time out.
+                Event::Other(_) => {}
             }
         }
 
