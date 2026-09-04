@@ -57,6 +57,11 @@ castr-sender cast "living room" [--mode game|quality] [--fps 30|60] [--max-bitra
 `--duration N` stops the cast automatically after N seconds; it exists mainly
 for testing and smoke runs. Ctrl-C stops a cast cleanly otherwise.
 
+On a multi-monitor machine the cast is the first duplication output.
+`CASTR_OUTPUT=1` (or 2, ...) casts another one; there is no UI for it yet, and
+the numbering is the graphics adapter's, not the order shown in Windows display
+settings, so it is worth a short test cast to see which is which.
+
 ### Wi-Fi health check
 
 Miracast drops are usually caused by the sending machine, not the display.
@@ -222,16 +227,24 @@ saving, driver age � and offers to fix the safe ones.
 
 ## Known gaps
 
-- The mouse cursor is not composited into the cast yet.
-- Only keyframes are NACK-repaired. A delta frame that loses a fragment costs
-  a 150 ms hold and a fresh keyframe; on a Pi 3 over Ethernet that happens a
-  few times a minute.
+- The mouse cursor is composited into the cast, and a delta frame that loses a
+  fragment is now repaired by NACK when the repair can arrive before the jitter
+  buffer's 150 ms hold expires. A continuously moving cursor costs about
+  98 kbps; a still one costs nothing measurable. The repair's benefit is
+  unmeasured on hardware: over six five-minute casts at 0%, 0.5% and 2% induced
+  loss, the Pi 3 B never entered the hold the repair shortens, so there was
+  nothing to improve — see
+  `docs/superpowers/verification/2026-09-03-castr-cast-quality-e2e.md`.
+- Casting a monitor that Windows has rotated arrives rotated: the capture does
+  not consult the duplication API's rotation.
+- Only the first monitor is cast unless `CASTR_OUTPUT` names another
+  duplication output; there is no UI for choosing one.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
 - V4L2 hardware decode and DRM/KMS output landed in sub-project 2; Miracast
   over Infrastructure (casting without forming a Wi-Fi Direct group) is a later
   sub-project.
-- Miracast audio is carried as uncompressed LPCM and is not yet measured
-  against video for lip sync.
+- Lip sync has not been measured against ITU-R BT.1359 in either mode, and
+  Miracast audio is carried as uncompressed LPCM.
 
 ## Testing
 
