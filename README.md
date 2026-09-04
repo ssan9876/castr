@@ -68,16 +68,23 @@ castr can also act as a Wi-Fi Display *source*, casting to a television, dongle
 or any other Miracast sink rather than to a castr receiver:
 
 ```
-castr-sender miracast-cast 192.168.173.1:7236 [--duration SECS] [--fps 30]
+castr-sender miracast-list
+castr-sender miracast-cast "Living Room TV" [--duration SECS] [--fps 30]
+castr-sender miracast-cast 192.168.173.1:7236       # or by address
 ```
 
-The address is the display's RTSP control port, 7236 by default; a bare host is
-accepted and the port assumed. `CASTR_OUTPUT` chooses the monitor here too.
+`miracast-list` shows the Wi-Fi Direct devices in range and which of them are
+displays, with the RTSP port and bandwidth each advertises.
 
-There is no radio layer yet, so the Wi-Fi Direct group has to exist already and
-the display's address be known. Given an address on the ordinary LAN this is
-Miracast over Infrastructure; over a Wi-Fi Direct group it is ordinary
-Miracast — the media path does not care which.
+Given a name, castr finds the display, pairs with it the first time (prompting
+for the PIN the display shows), forms the Wi-Fi Direct group, casts, and drops
+the group when it exits. Most displays advertise only while their screen
+mirroring page is open, so the command waits up to a minute for one to appear.
+
+Given an address instead, the radio is skipped entirely: on the ordinary LAN
+that is Miracast over Infrastructure, and over an existing Wi-Fi Direct group it
+is ordinary Miracast — the media path does not care which. `CASTR_OUTPUT`
+chooses the monitor here too.
 
 The picture is negotiated with the display and sent as H.264 in MPEG-TS over
 RTP, with audio as LPCM. See the "Known gaps" below before relying on it: it has
@@ -262,12 +269,12 @@ saving, driver age � and offers to fix the safe ones.
   duplication output; there is no UI for choosing one.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
 - V4L2 hardware decode and DRM/KMS output landed in sub-project 2.
-- Casting *to* an ordinary Miracast display works over IP but has only ever been
-  pointed at our own sink. No third-party television or dongle has been tried,
-  and interoperability is the whole point of the exercise, so treat it as
-  unproven. It also has no radio layer yet: the display's address must be given,
-  and forming the Wi-Fi Direct group is a separate step. HDCP is not supported
-  at all, so a display that requires content protection cannot be cast to.
+- Casting *to* an ordinary Miracast display has only ever been pointed at our
+  own sink. No third-party television or dongle has been cast to, and
+  interoperability is the whole point of the exercise, so treat it as unproven.
+  HDCP is not supported at all, so a display that requires content protection
+  cannot be cast to, and only the PIN pairing ceremony is implemented — a display
+  offering push-button only will not pair.
 - A cast to a Miracast display has been verified for ten minutes against castr's
   own sink, with no dropped frames, but its audio has never been listened to and
   lip sync is unmeasured.

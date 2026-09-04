@@ -40,6 +40,8 @@ pub fn pairing_status(code: i32) -> String {
         8 => "that pairing method is not allowed".into(),
         9 => "the PIN was not accepted".into(),
         14 => "pairing was cancelled".into(),
+        16 => "no pairing handler was registered - this is our bug, not yours".into(),
+        17 => "the PIN was rejected, or none was given".into(),
         18 => "the display is already associated with something else".into(),
         19 => "pairing failed, with no reason given".into(),
         other => format!("pairing failed with status {other}"),
@@ -127,6 +129,8 @@ RSSI: 255
         assert!(pairing_status(3).contains("already"));
         assert!(pairing_status(9).contains("PIN"));
         assert!(pairing_status(14).contains("cancel"));
+        // Seen for real on 2026-09-04 when an empty PIN was submitted.
+        assert!(pairing_status(17).contains("PIN"));
     }
 
     #[test]
