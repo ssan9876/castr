@@ -327,9 +327,13 @@ fn serve(
     // The registrar's window, which lapses long before a viewer gets round to
     // typing the PIN.
     let mut wps = WpsWindow::new();
-    // Stations currently in the group. A PIN belongs on the screen only when
-    // nobody is here, so this is what says whether the sink is idle.
-    let mut clients: usize = 0;
+    // Stations currently in the group, by address. A PIN belongs on the screen
+    // only when nobody is here, so this is what says whether the sink is idle.
+    //
+    // A set rather than a count: the supplicant reports a join on both
+    // attachments, and the two copies land in the same drain only sometimes, so
+    // anything counting them drifts. Inserting a station twice is harmless.
+    let mut clients: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         if stop.load(Ordering::SeqCst) {
@@ -358,7 +362,7 @@ fn serve(
         //
         // So it is re-armed for as long as the PIN is on the screen.
         let now = Instant::now();
-        if session.is_none() && clients == 0 {
+        if session.is_none() && clients.is_empty() {
             // Idle with nothing on the screen: someone paired, joined, and has
             // since gone. Joining clears the PIN, which is right - nobody
             // should be typing one while a cast is up - but without minting a
@@ -441,7 +445,7 @@ fn serve(
                     }
                 }
                 Event::ClientConnected { mac } => {
-                    clients += 1;
+                    clients.insert(mac.to_ascii_lowercase());
                     peers.remember(&mac);
                     // Nobody has to type anything now; take the PIN down so a
                     // stale one is not left sitting over the picture.
@@ -463,7 +467,7 @@ fn serve(
                     session_peer = Some(mac_lc);
                 }
                 Event::ClientDisconnected { mac } => {
-                    clients = clients.saturating_sub(1);
+                    clients.remove(&mac.to_ascii_lowercase());
                     let owns = session_peer.as_deref() == Some(mac.to_ascii_lowercase().as_str());
                     if !owns {
                         // A different station leaving the group must not end
