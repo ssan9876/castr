@@ -71,6 +71,8 @@ or any other Miracast sink rather than to a castr receiver:
 castr-sender miracast-list
 castr-sender miracast-cast "Living Room TV" [--mode quality|game] [--duration SECS]
 castr-sender miracast-cast 192.168.173.1:7236       # or by address
+castr-sender miracast-status                        # what it is sending
+castr-sender miracast-stop                          # end it
 ```
 
 `miracast-list` shows the Wi-Fi Direct devices in range and which of them are
@@ -86,6 +88,21 @@ encode that the display's advertised bandwidth will carry, and takes the first
 the display also offers. `--mode quality` prefers a bigger picture (1080p30 over
 720p60), `--mode game` a faster one — the same distinction the toggle makes for
 castr's own protocol.
+
+A cast ends on `--duration`, on Ctrl-C, or on `miracast-stop` from another
+shell, and all three tear the session down properly and drop the Wi-Fi Direct
+group. Only one Miracast cast runs at a time; a second is refused, naming the
+display already being cast to.
+
+`miracast-status` reports the negotiated mode, what the display said it can
+carry, the throughput actually being sent, and how long ago the display last
+answered a keep-alive. **Every number except that last one is sent-side.**
+Wi-Fi Display makes the source authoritative and gives it no back-channel of
+receiver statistics, so unlike a cast to a castr receiver there is no round
+trip time and no loss figure — nothing here knows what arrived, only what was
+sent. `repeated_frames` counts frames re-sent because the desktop did not
+change, which is worth watching: a still screen is normal, and without that
+count it looks identical to a capture that has stopped.
 
 Given an address instead, the radio is skipped entirely: on the ordinary LAN
 that is Miracast over Infrastructure, and over an existing Wi-Fi Direct group it

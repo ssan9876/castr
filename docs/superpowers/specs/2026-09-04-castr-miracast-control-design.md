@@ -95,7 +95,7 @@ newline:
 | Request | Response |
 |---|---|
 | `STOP <token>` | `OK stopping` |
-| `STATUS <token>` | `OK <key>=<value> <key>=<value> ...` |
+| `STATUS <token>` | `OK <key>=<value>⇥<key>=<value>⇥...` |
 | anything, wrong token | `ERR unauthorised` |
 | anything unparseable | `ERR bad request` |
 
@@ -103,6 +103,12 @@ Text rather than a serialization format because the codebase already reads
 line-oriented text well, the payload is a dozen scalars, and a protocol a
 person can type into `nc` while debugging a cast is worth more here than one
 that is convenient to derive.
+
+Status fields are separated by a **tab**, not a space. Found while
+implementing: a display name legitimately contains spaces — the television in
+range is named `75" Crystal UHD` — so space-separated fields let a name swallow
+the one after it. A value that can forge the next field is a parser bug waiting
+to be written, and it has a test.
 
 `castr-sender` gains `toml`, `serde` and `rand` from the existing workspace
 dependency set — all three are already built for other crates, so this adds

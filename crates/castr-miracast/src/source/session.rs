@@ -109,6 +109,15 @@ impl SourceSession {
         self.sink.as_ref().and_then(|c| c.max_bitrate_kbps)
     }
 
+    /// When the display was last heard from at all.
+    ///
+    /// RTP carries no feedback, so this is the only thing a source knows about
+    /// the far end, and it is what a status readout has to report. `None`
+    /// before the first reply arrives.
+    pub fn last_heard(&self) -> Option<Instant> {
+        self.last_heard
+    }
+
     fn cseq(&mut self) -> u32 {
         let c = self.next_cseq;
         self.next_cseq += 1;
