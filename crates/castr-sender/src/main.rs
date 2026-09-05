@@ -234,12 +234,23 @@ fn main() -> anyhow::Result<()> {
                         Duration::from_secs(60),
                     );
                     let name = target.clone();
-                    let connection = castr_wifidirect_win::radio::connect(&target, wait, &mut || {
-                        println!("Enter the PIN shown on {name:?}:");
-                        let mut pin = String::new();
-                        std::io::stdin().read_line(&mut pin)?;
-                        Ok(pin.trim().to_string())
-                    })?;
+                    // Called during the pairing, once the display has actually
+                    // been told to show a PIN - not before it has one.
+                    let ask: castr_wifidirect_win::radio::PinSource =
+                        std::sync::Arc::new(move || {
+                            println!("Enter the PIN shown on {name:?}:");
+                            let mut pin = String::new();
+                            let read = std::io::stdin().read_line(&mut pin)?;
+                            if read == 0 {
+                                anyhow::bail!(
+                                    "no PIN was given (nothing on standard input); run this \
+                                     from a terminal, or pipe the PIN in"
+                                );
+                            }
+                            Ok(pin.trim().to_string())
+                        });
+                    let connection =
+                        castr_wifidirect_win::radio::connect(&target, wait, &ask)?;
                     let addr = std::net::SocketAddr::new(
                         connection.remote_ip(),
                         connection.rtsp_port(),

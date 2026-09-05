@@ -23,6 +23,18 @@ use std::time::{Duration, Instant};
 const KEEPALIVE_EVERY: Duration = Duration::from_secs(5);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long to wait for the sink's M2 before asking for capabilities anyway.
+///
+/// The sequence is M1 (our OPTIONS), then **M2 (the sink's OPTIONS)**, then M3.
+/// A wireless display adapter ignored an M3 that arrived before it had sent its
+/// M2, then waited for one that never came again, and closed the session after
+/// half a minute. Our own sink answers M3 whenever it arrives, which is why
+/// this went unnoticed for so long.
+///
+/// The grace period exists so a sink that never sends M2 is not waited on for
+/// ever: after it, M3 goes out regardless, which is exactly the old behaviour.
+const M2_GRACE: Duration = Duration::from_secs(2);
+
 const PUBLIC: &str =
     "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER";
 const PRESENTATION_URL: &str = "rtsp://localhost/wfd1.0/streamid=0";
@@ -71,6 +83,8 @@ pub struct SourceSession {
     state: SourceState,
     next_cseq: u32,
     asked_caps: bool,
+    /// When M1 was answered, so M2 can be waited for without waiting for ever.
+    m1_answered: Option<Instant>,
     chosen: Option<VideoMode>,
     sink: Option<SinkCaps>,
     last_heard: Option<Instant>,
@@ -84,6 +98,7 @@ impl SourceSession {
             state: SourceState::Init,
             next_cseq: 1,
             asked_caps: false,
+            m1_answered: None,
             chosen: None,
             sink: None,
             last_heard: None,
@@ -147,7 +162,7 @@ impl SourceSession {
                 let method = method.clone();
                 self.on_request(&method, m)
             }
-            StartLine::Response { status, .. } => self.on_response(*status, m),
+            StartLine::Response { status, .. } => self.on_response(*status, m, now),
         }
     }
 
@@ -158,7 +173,13 @@ impl SourceSession {
             "OPTIONS" => {
                 let mut ok = rtsp::response(200, cseq, "");
                 ok.headers.push(("Public".into(), PUBLIC.into()));
-                vec![Action::Send(ok)]
+                let mut actions = vec![Action::Send(ok)];
+                // M2 has now happened, so M3 is due. This is the ordering the
+                // specification asks for and that a real display insists on.
+                if !self.asked_caps && self.m1_answered.is_some() {
+                    actions.push(self.ask_capabilities());
+                }
+                actions
             }
             // M6. The sink refuses a SETUP response with no Session header, so
             // this is where the session id has to appear.
@@ -195,30 +216,33 @@ impl SourceSession {
         }
     }
 
-    fn on_response(&mut self, status: u16, m: &Message) -> Vec<Action> {
+    fn on_response(&mut self, status: u16, m: &Message, now: Instant) -> Vec<Action> {
         if status != 200 {
             return vec![Action::Teardown("negotiation: the display refused a request")];
         }
         if !self.asked_caps {
-            // M1 answered. Ask what it can take.
-            self.asked_caps = true;
-            let cseq = self.cseq();
-            let body = "wfd_video_formats\r\n\
-                        wfd_audio_codecs\r\n\
-                        wfd_content_protection\r\n\
-                        wfd_client_rtp_ports\r\n";
-            return vec![Action::Send(rtsp::request(
-                "GET_PARAMETER",
-                PRESENTATION_URL,
-                cseq,
-                body,
-            ))];
+            // M1 answered. Do *not* ask for capabilities yet: the sink's own
+            // OPTIONS - M2 - comes next, and an M3 sent before it is ignored
+            // by a display that follows the sequence properly.
+            self.m1_answered = Some(now);
+            return Vec::new();
         }
         if self.sink.is_none() && !m.body.trim().is_empty() {
             return self.on_capabilities(m);
         }
         // A keep-alive answered, or an acknowledgement of something we set.
         Vec::new()
+    }
+
+    /// M3: ask the display what it can take.
+    fn ask_capabilities(&mut self) -> Action {
+        self.asked_caps = true;
+        let cseq = self.cseq();
+        let body = "wfd_video_formats\r\n\
+                    wfd_audio_codecs\r\n\
+                    wfd_content_protection\r\n\
+                    wfd_client_rtp_ports\r\n";
+        Action::Send(rtsp::request("GET_PARAMETER", PRESENTATION_URL, cseq, body))
     }
 
     fn on_capabilities(&mut self, m: &Message) -> Vec<Action> {
@@ -278,6 +302,16 @@ impl SourceSession {
     /// tell a still desktop from a dead display. This is the only liveness
     /// signal there is.
     pub fn tick(&mut self, now: Instant) -> Vec<Action> {
+        // A sink that never sends M2 must not be waited on for ever. After the
+        // grace period, ask anyway - which is what this did before the ordering
+        // was corrected, so no display that used to work stops working.
+        if !self.asked_caps {
+            if let Some(answered) = self.m1_answered {
+                if now.duration_since(answered) >= M2_GRACE {
+                    return vec![self.ask_capabilities()];
+                }
+            }
+        }
         if self.state != SourceState::Playing {
             return Vec::new();
         }
@@ -391,11 +425,83 @@ mod tests {
         );
     }
 
+    /// Whether a batch of actions contains an M3.
+    fn has_m3(actions: &[Action]) -> bool {
+        sent(actions).iter().any(|m| {
+            matches!(&m.start, StartLine::Request { method, .. } if method == "GET_PARAMETER")
+                && m.body.contains("wfd_video_formats")
+        })
+    }
+
+    #[test]
+    fn capabilities_are_not_asked_for_before_the_display_has_sent_its_own_options() {
+        // The bug a real display found: M3 sent straight after M1's answer,
+        // before M2. The adapter ignored it, sent its M2, and then waited for
+        // an M3 that had already been and gone - closing the session after
+        // half a minute with nothing to explain it.
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        let actions = s.on_message(&rtsp::response(200, 1, ""));
+        assert!(
+            !has_m3(&actions),
+            "M3 must wait for M2; it was sent as soon as M1 was answered"
+        );
+    }
+
+    #[test]
+    fn the_displays_options_brings_out_the_capability_request() {
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        s.on_message(&rtsp::response(200, 1, ""));
+        let actions = s.on_message(&rtsp::request("OPTIONS", "*", 1, ""));
+        assert!(has_m3(&actions), "M2 should be answered and M3 sent");
+        // And the answer still goes out, in the same batch.
+        assert!(sent(&actions)
+            .iter()
+            .any(|m| matches!(m.start, StartLine::Response { status: 200, .. })));
+    }
+
+    #[test]
+    fn a_display_that_never_sends_m2_is_not_waited_on_for_ever() {
+        // Preserves the behaviour every display that already worked relied on.
+        let t0 = Instant::now();
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        s.on_message_at(&rtsp::response(200, 1, ""), t0);
+        assert!(!has_m3(&s.tick(t0 + Duration::from_millis(500))));
+        assert!(
+            has_m3(&s.tick(t0 + M2_GRACE)),
+            "after the grace period M3 must go out anyway"
+        );
+    }
+
+    #[test]
+    fn capabilities_are_asked_for_only_once() {
+        // A display may send OPTIONS more than once; each one must not produce
+        // another M3.
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        s.on_message(&rtsp::response(200, 1, ""));
+        assert!(has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 1, ""))));
+        assert!(!has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 2, ""))));
+        assert!(!has_m3(&s.tick(Instant::now() + M2_GRACE * 2)));
+    }
+
+    #[test]
+    fn an_options_arriving_before_m1_is_answered_does_not_bring_out_m3_early() {
+        // Ordering the other way round: the display speaks first. M3 still
+        // waits until our own M1 has been answered.
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        assert!(!has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 1, ""))));
+    }
+
     #[test]
     fn an_unknown_parameter_does_not_end_the_session() {
         let mut s = SourceSession::new(cfg());
         s.start();
         s.on_message(&rtsp::response(200, 1, "")); // M1 answered
+        s.on_message(&rtsp::request("OPTIONS", "*", 1, "")); // M2 brings out M3
         let body = "wfd_video_formats: 40 00 02 04 00000020 00000000 00000000 00 0000 0000 00 none none\r\n\
                     wfd_audio_codecs: LPCM 00000002 00\r\n\
                     wfd_client_rtp_ports: RTP/AVP/UDP;unicast 5000 0 mode=play\r\n\
@@ -414,6 +520,7 @@ mod tests {
         let mut s = SourceSession::new(cfg());
         s.start();
         s.on_message(&rtsp::response(200, 1, ""));
+        s.on_message(&rtsp::request("OPTIONS", "*", 1, "")); // M2 brings out M3
         let body = "wfd_video_formats: 40 00 02 04 00000008 00000000 00000000 00 0000 0000 00 none none\r\n";
         let actions = s.on_message(&rtsp::response(200, 2, body));
         let reason = actions.iter().find_map(|a| match a {
@@ -505,6 +612,7 @@ mod tests {
             });
             s.start();
             s.on_message(&rtsp::response(200, 1, ""));
+            s.on_message(&rtsp::request("OPTIONS", "*", 1, "")); // M2 brings out M3
             s.on_message(&rtsp::response(200, 2, body));
             assert_eq!(s.chosen(), Some(want), "{mode:?} chose the wrong mode");
         }
@@ -524,6 +632,7 @@ mod tests {
         });
         s.start();
         s.on_message(&rtsp::response(200, 1, ""));
+        s.on_message(&rtsp::request("OPTIONS", "*", 1, "")); // M2 brings out M3
         s.on_message(&rtsp::response(200, 2, body));
         assert_eq!(s.chosen(), Some(P720P60));
     }

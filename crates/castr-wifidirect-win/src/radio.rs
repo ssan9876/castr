@@ -13,7 +13,7 @@ use anyhow::{bail, Context};
 use castr_miracast::wfd;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 use windows::Devices::Enumeration::{
@@ -142,15 +142,22 @@ impl Drop for Connection {
     }
 }
 
+/// How the caller asks somebody for the PIN a display is showing.
+///
+/// Shared and thread-safe rather than a borrowed closure, because it is called
+/// from a WinRT callback thread during the pairing rather than from the thread
+/// that started it. Keeping it a callback at all is what lets a graphical
+/// sender substitute a dialog without touching this crate.
+pub type PinSource = Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>;
+
 /// Finds a display by name, pairs if it must, and brings up the group.
 ///
 /// `pin` is called only when the display has to be paired with, so a display
-/// Windows already knows connects silently. Keeping it a callback is what lets
-/// a graphical sender substitute a dialog without touching this crate.
+/// Windows already knows connects silently.
 pub fn connect(
     name: &str,
     wait: WaitPolicy,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
 ) -> anyhow::Result<Connection> {
     let target = find(name, wait)?;
     match bring_up(&target, pin) {
@@ -205,7 +212,7 @@ fn unpair(target: &Candidate) -> anyhow::Result<()> {
 
 fn bring_up(
     target: &Candidate,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
 ) -> anyhow::Result<Connection> {
     let id = HSTRING::from(&target.id);
     let info = DeviceInformation::CreateFromIdAsync(&id)?
@@ -263,7 +270,7 @@ fn bring_up(
 fn pair_with_pin(
     info: &DeviceInformation,
     target: &Candidate,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
 ) -> anyhow::Result<()> {
     let params = WiFiDirectConnectionParameters::new()?;
     // Intent zero: the display should own the group. That is how a Miracast
@@ -273,18 +280,42 @@ fn pair_with_pin(
     methods.Clear()?;
     methods.Append(WiFiDirectConfigurationMethod::ProvidePin)?;
 
-    // The PIN is fetched inside the handler because that is when it is needed:
-    // asking earlier would prompt for a PIN the display had not shown yet.
-    let digits = pin()?;
-    let entered = HSTRING::from(&digits);
+    // Anything the prompt refused, kept so it can be reported after the
+    // pairing has failed rather than swallowed inside a callback.
+    let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let ask = pin.clone();
+    let seen = refusal.clone();
     let custom: DeviceInformationCustomPairing = info.Pairing()?.Custom()?;
     custom.PairingRequested(&TypedEventHandler::<
         DeviceInformationCustomPairing,
         DevicePairingRequestedEventArgs,
     >::new(move |_, args| {
-        if let Some(args) = args.as_ref() {
-            args.AcceptWithPin(&entered)?;
+        let Some(args) = args.as_ref() else {
+            return Ok(());
+        };
+        // The PIN is asked for *here*, not before the pairing starts.
+        //
+        // A display is only told to show a PIN once a pairing is actually
+        // under way. Asking first prompts for a number that does not exist
+        // yet - invisible against a sink that displays one permanently, as
+        // ours does, and fatal against one that does not. A wireless display
+        // adapter showed exactly that: it advertises Display, and had no PIN
+        // on screen when we asked.
+        //
+        // The prompt blocks while somebody reads the display, so this takes a
+        // deferral: without one Windows treats the handler as finished the
+        // moment it returns and stops waiting for an answer.
+        let deferral = args.GetDeferral()?;
+        match ask() {
+            Ok(digits) => args.AcceptWithPin(&HSTRING::from(&digits))?,
+            Err(e) => {
+                // Not accepting is what fails the pairing, which is the right
+                // outcome for a cancelled prompt.
+                *seen.lock().unwrap() = Some(format!("{e:#}"));
+            }
         }
+        deferral.Complete()?;
         Ok(())
     }))?;
 
@@ -295,6 +326,9 @@ fn pair_with_pin(
             &params,
         )?
         .get()?;
+    if let Some(why) = refusal.lock().unwrap().take() {
+        bail!("{}: {:?} - {why}", Stage::Pairing, target.name);
+    }
     let status = result.Status()?;
     if status != DevicePairingResultStatus::Paired
         && status != DevicePairingResultStatus::AlreadyPaired
@@ -318,8 +352,18 @@ fn address_of(device: &WiFiDirectDevice, target: &Candidate) -> anyhow::Result<I
     loop {
         let pairs = device.GetConnectionEndpointPairs()?;
         for p in &pairs {
+            // Both ends are logged, not just the one we use. Which side owns
+            // the group decides who is at `.1`, and taking the remote on faith
+            // is how a source ends up connecting to itself and reporting the
+            // display as refusing it.
+            let local = p
+                .LocalHostName()
+                .and_then(|h| h.ToString())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "?".into());
             if let Ok(host) = p.RemoteHostName() {
                 if let Ok(text) = host.ToString() {
+                    tracing::info!("wifidirect: endpoint local={local} remote={text}");
                     if let Ok(ip) = text.to_string().parse::<IpAddr>() {
                         return Ok(ip);
                     }
@@ -383,5 +427,195 @@ mod tests {
             Ok(Err(e)) => panic!("discovery failed on a worker thread: {e:#}"),
             Err(_) => panic!("discovery did not finish within 180s, which is beyond slow"),
         }
+    }
+}
+
+#[cfg(test)]
+mod wps_probe {
+    use super::*;
+
+    /// What pairing ceremonies each device in range actually offers.
+    ///
+    /// The WPS information element (OUI 00:50:F2, type 4) carries a Config
+    /// Methods attribute, 0x1008, as a two-byte bitmask. Reading it says
+    /// whether a display wants a PIN, a button press, or something we cannot
+    /// do - which is the difference between pairing and failing.
+    ///
+    /// `cargo test -p castr-wifidirect-win wps -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn what_pairing_methods_are_offered() {
+        let selector = WiFiDirectDevice::GetDeviceSelector2(
+            WiFiDirectDeviceSelectorType::AssociationEndpoint,
+        )
+        .unwrap();
+        let found = DeviceInformation::FindAllAsyncAqsFilter(&selector)
+            .unwrap()
+            .get()
+            .unwrap();
+        for d in &found {
+            let name = d.Name().map(|n| n.to_string()).unwrap_or_default();
+            let paired = d.Pairing().and_then(|p| p.IsPaired()).unwrap_or(false);
+            let can_pair = d.Pairing().and_then(|p| p.CanPair()).unwrap_or(false);
+            let mut methods = None;
+            if let Ok(elements) = WiFiDirectInformationElement::CreateFromDeviceInformation(&d) {
+                for e in &elements {
+                    let oui = e.Oui().ok().and_then(|b| buffer_bytes(&b).ok());
+                    let Some(oui) = oui else { continue };
+                    // WPS: 00 50 F2, type 4.
+                    if oui.as_slice() != [0x00, 0x50, 0xF2] || e.OuiType().unwrap_or(0) != 4 {
+                        continue;
+                    }
+                    let Some(value) = e.Value().ok().and_then(|b| buffer_bytes(&b).ok()) else {
+                        continue;
+                    };
+                    // Attributes are id(2) len(2) body, big endian throughout.
+                    let mut i = 0usize;
+                    while i + 4 <= value.len() {
+                        let id = u16::from_be_bytes([value[i], value[i + 1]]);
+                        let len = u16::from_be_bytes([value[i + 2], value[i + 3]]) as usize;
+                        let body = &value[i + 4..(i + 4 + len).min(value.len())];
+                        if id == 0x1008 && body.len() >= 2 {
+                            methods = Some(u16::from_be_bytes([body[0], body[1]]));
+                        }
+                        i += 4 + len;
+                    }
+                }
+            }
+            let described = methods.map(describe_config_methods).unwrap_or_else(|| {
+                "no WPS element (not advertising how to pair)".into()
+            });
+            println!("{name:<34} paired={paired} can_pair={can_pair}  {described}");
+        }
+    }
+
+    fn describe_config_methods(bits: u16) -> String {
+        let mut names = Vec::new();
+        for (bit, name) in [
+            (0x0001, "USB"),
+            (0x0002, "Ethernet"),
+            (0x0004, "Label"),
+            (0x0008, "Display"),
+            (0x0010, "ExternalNFCToken"),
+            (0x0020, "IntegratedNFCToken"),
+            (0x0040, "NFCInterface"),
+            (0x0080, "PushButton"),
+            (0x0100, "Keypad"),
+            (0x0280, "PhysicalPushButton"),
+            (0x2008, "VirtualDisplay"),
+            (0x0480, "VirtualPushButton"),
+        ] {
+            if bits & bit == bit {
+                names.push(name);
+            }
+        }
+        format!("config methods 0x{bits:04x} = {}", names.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod rtsp_probe {
+    use super::*;
+    use std::net::{SocketAddr, TcpStream};
+
+    /// When does a display's RTSP server actually start accepting?
+    ///
+    /// A wireless display adapter refused the connection outright the instant
+    /// its group came up. Either it listens on a different port than the one
+    /// it advertises, or its server is simply not up yet - and those want
+    /// opposite fixes, so this measures rather than guesses.
+    ///
+    /// Needs the display paired already:
+    /// `cargo test -p castr-wifidirect-win rtsp -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn when_does_the_display_start_listening() {
+        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
+        let refuse: PinSource = Arc::new(|| {
+            anyhow::bail!("this probe expects the display to be paired already")
+        });
+        let wait = WaitPolicy::new(Duration::from_secs(90));
+        let connection = connect(&name, wait, &refuse).expect("connecting to the display");
+        let ip = connection.remote_ip();
+        let advertised = connection.rtsp_port();
+        println!("group up at {ip}, advertised RTSP port {advertised}");
+
+        // Every port a Wi-Fi Display sink is plausibly on, plus the one it says.
+        let ports = [advertised, 7236, 554, 7100, 8554, 5000];
+        let started = Instant::now();
+        let mut open: Vec<(u16, f32)> = Vec::new();
+        while started.elapsed() < Duration::from_secs(45) {
+            for p in ports {
+                if open.iter().any(|(q, _)| *q == p) {
+                    continue;
+                }
+                let addr = SocketAddr::new(ip, p);
+                if TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
+                    let at = started.elapsed().as_secs_f32();
+                    println!("port {p} accepted at {at:.1}s");
+                    open.push((p, at));
+                }
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if open.is_empty() {
+            println!("no port accepted within 45s (advertised {advertised})");
+        }
+        drop(connection);
+    }
+}
+
+#[cfg(test)]
+mod address_probe {
+    use super::*;
+
+    /// Who is actually at each end of the group?
+    ///
+    /// `address_of` takes the first remote host name it finds and never looks
+    /// at the local one. If the roles came out the other way round - us as
+    /// group owner - then "remote" could be our own address, and a connection
+    /// refused by our own machine looks identical to one refused by a display.
+    ///
+    /// `cargo test -p castr-wifidirect-win address_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn who_is_at_each_end() {
+        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
+        let refuse: PinSource =
+            Arc::new(|| anyhow::bail!("this probe expects the display to be paired"));
+        let target = find(&name, WaitPolicy::new(Duration::from_secs(90))).expect("find");
+        let id = HSTRING::from(&target.id);
+        let info = DeviceInformation::CreateFromIdAsync(&id).unwrap().get().unwrap();
+        if !info.Pairing().unwrap().IsPaired().unwrap() {
+            pair_with_pin(&info, &target, &refuse).expect("pair");
+        }
+        let device = WiFiDirectDevice::FromIdAsync(&id).unwrap().get().expect("group");
+        std::thread::sleep(Duration::from_secs(3));
+        let pairs = device.GetConnectionEndpointPairs().unwrap();
+        for p in &pairs {
+            let local = p
+                .LocalHostName()
+                .and_then(|h| h.ToString())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "?".into());
+            let remote = p
+                .RemoteHostName()
+                .and_then(|h| h.ToString())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "?".into());
+            println!("endpoint pair: local={local}  remote={remote}");
+        }
+        let out = std::process::Command::new("ipconfig").output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut adapter = String::new();
+        for line in text.lines() {
+            if line.contains("adapter") {
+                adapter = line.trim().to_string();
+            }
+            if line.contains("IPv4 Address") && adapter.to_lowercase().contains("wi-fi") {
+                println!("{adapter} -> {}", line.trim());
+            }
+        }
+        drop(device);
     }
 }
