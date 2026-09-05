@@ -32,6 +32,34 @@ $exe = Join-Path $env:ProgramFiles 'castr\castr-sender.exe'
 $startMenu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\castr\castr.lnk'
 $desktop = Join-Path ([Environment]::GetFolderPath('CommonDesktopDirectory')) 'castr.lnk'
 function SystemPath { [Environment]::GetEnvironmentVariable('PATH', 'Machine') }
+# MSI resolves [INSTALLFOLDER] with a trailing backslash, so the PATH entry
+# reads `C:\Program Files\castr\`. Harmless to Windows, but a comparison
+# against a path without one silently fails - which it did, and was briefly
+# mistaken for the PATH entry not working at all.
+function PathHas([string]$dir) {
+    $want = $dir.TrimEnd('\')
+    (SystemPath) -split ';' | Where-Object { $_.TrimEnd('\') -eq $want } | Measure-Object |
+        ForEach-Object { $_.Count -gt 0 }
+}
+# What the package declares about its icon, read from the package itself.
+#
+# Deliberately not a probe of the live registry. Two attempts at that asserted
+# the wrong thing - DisplayIcon under the Uninstall key, then ProductIcon
+# through the installer API - and both failed while the install log plainly
+# showed `IconCreate(Icon=castr.ico)` and `ProductIcon=castr.ico`. Whether
+# Windows then *draws* it in Apps and Features is a question about Windows,
+# and like the wizard's appearance it wants an eye, not an assertion.
+function DeclaresIcon([string]$path) {
+    $inst = New-Object -ComObject WindowsInstaller.Installer
+    $db = $inst.OpenDatabase($path, 0)
+    $hasProperty = $false
+    $v = $db.OpenView("SELECT Value FROM Property WHERE Property='ARPPRODUCTICON'")
+    $v.Execute(); if ($v.Fetch()) { $hasProperty = $true }; $v.Close()
+    $hasIcon = $false
+    $v = $db.OpenView("SELECT Name FROM Icon")
+    $v.Execute(); if ($v.Fetch()) { $hasIcon = $true }; $v.Close()
+    $hasProperty -and $hasIcon
+}
 function ArpEntry {
     Get-ChildItem 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' -EA SilentlyContinue |
         ForEach-Object { Get-ItemProperty $_.PSPath -EA SilentlyContinue } |
@@ -53,7 +81,7 @@ Check 'install succeeded' ($p.ExitCode -eq 0)
 Check 'the exe is in Program Files' (Test-Path $exe)
 Check 'Start Menu shortcut exists' (Test-Path $startMenu)
 Check 'Desktop shortcut exists' (Test-Path $desktop)
-Check 'PATH contains the install directory' ((SystemPath) -split ';' -contains (Split-Path $exe))
+Check 'PATH contains the install directory' (PathHas (Split-Path $exe))
 $arp = ArpEntry
 Check 'Apps and Features lists it' ($null -ne $arp)
 if ($arp) {
@@ -61,7 +89,7 @@ if ($arp) {
         Select-String -Path (Join-Path $repo 'Cargo.toml') -Pattern '^version\s*=\s*"([^"]+)"' |
         Select-Object -First 1).Matches[0].Groups[1].Value)
     Check 'it shows a publisher' ($arp.Publisher -eq 'castr')
-    Check 'it shows an icon' ([bool]$arp.DisplayIcon)
+    Check 'the package declares an icon for it' (DeclaresIcon $Msi)
     Check 'it offers an uninstall command' ([bool]$arp.UninstallString)
 }
 Check 'the firewall rule is present' ($null -ne (FirewallRule))
@@ -77,9 +105,12 @@ Check 'uninstall succeeded' ($p.ExitCode -eq 0)
 Check 'the exe is gone' (-not (Test-Path $exe))
 Check 'the Start Menu shortcut is gone' (-not (Test-Path $startMenu))
 Check 'the Desktop shortcut is gone' (-not (Test-Path $desktop))
-Check 'PATH is back as it was' (-not ((SystemPath) -split ';' -contains (Split-Path $exe)))
+Check 'PATH is back as it was' (-not (PathHas (Split-Path $exe)))
 Check 'the firewall rule is gone' ($null -eq (FirewallRule))
 Check 'Apps and Features no longer lists it' ($null -eq (ArpEntry))
+
+# Not checked here, because a script cannot: that the wizard looks right, and
+# that Apps and Features actually draws the icon. Both want a person.
 
 # Deliberately kept: pairings and identity live here, and discarding them would
 # mean pairing every receiver and display again after a reinstall.
