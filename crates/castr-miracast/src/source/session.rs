@@ -638,6 +638,70 @@ mod tests {
             .any(|a| matches!(a, Action::Teardown(r) if r.starts_with("session:"))));
     }
 
+    /// Drives our source and our sink against each other until both are
+    /// playing, and hands them back so a test can carry on from there.
+    fn negotiated_pair() -> (SourceSession, Negotiation) {
+        let mut source = SourceSession::new(cfg());
+        let mut sink = sink();
+        let mut from_source = source.start();
+        for _ in 0..24 {
+            let mut from_sink = Vec::new();
+            for action in from_source.drain(..) {
+                if let Action::Send(m) = action {
+                    from_sink.extend(sink.on_message(&m));
+                }
+            }
+            for action in from_sink.drain(..) {
+                if let Action::Send(m) = action {
+                    from_source.extend(source.on_message(&m));
+                }
+            }
+            if from_source.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(source.state(), SourceState::Playing);
+        assert_eq!(sink.state(), NegState::Playing);
+        (source, sink)
+    }
+
+    #[test]
+    fn the_bitrate_request_our_own_sink_sends_is_understood_by_our_source() {
+        // Not a hand-written body: this is the message the sink actually emits
+        // when its loss rises - "loss is up, asking the source for 2000 kbps".
+        // Testing against the real producer is what stops the two ends drifting
+        // apart, which is how every defect a real display found came about.
+        let (mut source, mut sink) = negotiated_pair();
+        let asked = sink.request_bitrate(2000, Instant::now());
+
+        let mut got = Vec::new();
+        for action in asked {
+            if let Action::Send(m) = action {
+                got.extend(source.on_message(&m));
+            }
+        }
+        assert!(
+            got.iter().any(|a| matches!(a, Action::Bitrate(2000))),
+            "the source ignored what the sink actually asks for: {got:?}"
+        );
+    }
+
+    #[test]
+    fn the_idr_request_our_own_sink_sends_is_understood_by_our_source() {
+        let (mut source, mut sink) = negotiated_pair();
+        let asked = sink.request_idr(Instant::now());
+        let mut got = Vec::new();
+        for action in asked {
+            if let Action::Send(m) = action {
+                got.extend(source.on_message(&m));
+            }
+        }
+        assert!(
+            got.iter().any(|a| matches!(a, Action::Keyframe)),
+            "the source ignored the sink's keyframe request: {got:?}"
+        );
+    }
+
     #[test]
     fn our_source_and_our_sink_negotiate_each_other_to_playing() {
         // Two state machines, no sockets. This does not prove the

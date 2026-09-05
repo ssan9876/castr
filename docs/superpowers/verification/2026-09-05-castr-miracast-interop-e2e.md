@@ -32,7 +32,7 @@ twenty sessions to find.
 | 14 | **A picture appears on it** | PASS | Confirmed visually |
 | 15 | Teardown is clean | PASS | `teardown: the requested duration elapsed`, `releasing the group` |
 | 16 | A stale pairing is recovered from automatically | PASS | `association failed (The operation was cancelled.); forgetting the stored pairing and trying once more`, then re-paired by button and cast, unattended |
-| 17 | Mid-session bitrate requests are honoured | NOT RUN | Unit-tested. The adapter's link was healthy and it never asked; our own sink does ask, but the Pi was unreachable |
+| 17 | Mid-session bitrate requests are honoured | PARTIAL | Driven against the message our own sink actually emits (`request_bitrate`), in process. Never provoked on hardware: the adapter's link was healthy and never asked, and the Pi was unreachable |
 | 18 | The Pi still works after these changes | **NOT RUN** | The Pi was off the network all session |
 | 19 | Audio is audible on it | NOT RUN | Never listened to |
 | 20 | Lip sync | NOT RUN | Unmeasured, as everywhere else |
@@ -111,7 +111,11 @@ drops", and castr had no answer to it. `Action::Bitrate` now reaches the
 encoder's existing `set_bitrate`, clamped so a nonsense request cannot stop the
 picture and never above what was negotiated.
 
-Unit-tested only: the adapter's link was healthy and it never asked.
+Not provoked on hardware: the adapter's link was healthy and never asked. It
+is driven in process against `Negotiation::request_bitrate` - the real producer
+of that message - rather than a hand-written body, because testing the two ends
+against each other is what stops them drifting apart, and drift is how every
+defect above came about.
 
 ### 4. The PIN was requested before the display was asked to show one
 
