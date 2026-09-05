@@ -94,6 +94,15 @@ shell, and all three tear the session down properly and drop the Wi-Fi Direct
 group. Only one Miracast cast runs at a time; a second is refused, naming the
 display already being cast to.
 
+One caveat about Ctrl-C, which is PowerShell's behaviour rather than castr's:
+**if you redirect the output to a file in PowerShell** (`castr-sender
+miracast-cast ... > log.txt`), PowerShell terminates the process on Ctrl-C
+instead of letting it handle the event, so no teardown runs. Without the
+redirect it works, and so does `cmd`. If you want a log *and* a clean exit, stop
+the cast with `miracast-stop` rather than Ctrl-C. A cast killed this way leaves
+a stale record, which the next `miracast-status`, `miracast-stop` or
+`miracast-cast` cleans up by itself.
+
 `miracast-status` reports the negotiated mode, what the display said it can
 carry, the throughput actually being sent, and how long ago the display last
 answered a keep-alive. **Every number except that last one is sent-side.**

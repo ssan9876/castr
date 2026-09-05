@@ -25,7 +25,7 @@ another process, and Ctrl-C ending a cast the way `--duration` already did.
 | 11 | A stale record is cleaned up rather than blocking | PASS | A record naming port 1 was planted; `miracast-status` reported `cleaned up a stale record from a cast started 1757001234` and removed it |
 | 12 | Nothing running is reported as such | PASS | `no Miracast cast is running`, exit 0, from both commands |
 | 13 | A forged token cannot stop a cast | PASS | Unit-tested (`a_forged_token_is_refused_and_stops_nothing`); not provoked against a live cast |
-| 14 | Ctrl-C ends a cast the way `miracast-stop` does | NOT RUN | See below |
+| 14 | Ctrl-C ends a cast the way `miracast-stop` does | PASS | A real `CTRL_C_EVENT` to a live cast: `stopping the cast`, `teardown: stopped by request`, `releasing the group with "DietPi"`, exit 0, and the sink logged `session ended: source closed the connection, holding the group` — the same graceful signature as row 7. Took three attempts to establish; see below |
 | 15 | A second `miracast-cast` is refused while one runs | NOT RUN | Unit-tested via `client::running`; not provoked on hardware |
 | 16 | A cast survives its control channel failing to bind | NOT RUN | Cannot be staged without occupying an ephemeral port we do not choose |
 
@@ -77,19 +77,57 @@ Worth noting how it surfaced. Nothing was looking for this; it fell out of
 having a number for what is actually written to the socket, which did not exist
 before today.
 
-## Ctrl-C
+## Ctrl-C, and two false negatives before it
 
-Not proven, and deliberately not claimed.
+The handler was correct from the first commit. It took three attempts to
+establish that, and both failures were in the method, not the code. Recorded in
+full because either one could have been written up as a defect in castr.
 
-`kill -INT` from Git Bash does not deliver a console control event to a native
-Windows process: the cast ignored it and ran to its full 120 s, ending with
-`teardown: the requested duration elapsed`. That is a fact about the test
-harness and says nothing about the handler.
+**Attempt 1 — `kill -INT` from Git Bash.** Ignored: MSYS's `kill` does not
+deliver a console control event to a native Windows process. The cast ran to
+its full 120 s and ended with `teardown: the requested duration elapsed`.
 
-What *is* proven is the path Ctrl-C shares with `miracast-stop`: the same
-`Command::Stop`, the same channel, the same exit from the loop, the same
-teardown and group release, all exercised in rows 5 to 9. What remains untested
-is only whether the `tokio::signal::ctrl_c` task fires and reaches that channel.
+**Attempt 2 — a person pressing Ctrl-C, with output redirected in PowerShell.**
+The process died with no handler message and no teardown, and the sink logged
+`peer disconnected` rather than a session end. This looked exactly like a real
+defect and was reported as one.
+
+It was not. **PowerShell terminates a native child on Ctrl-C when that child's
+output is redirected to a file.** Without the redirect, the console event
+reaches the child normally. Measured against the real binary, driven by a real
+`GenerateConsoleCtrlEvent`, with the control record as the observable — teardown
+removes it, a kill leaves it behind:
+
+| Host | Output redirected | Teardown ran |
+|---|---|---|
+| launched directly, own console | — | **yes** |
+| `cmd.exe` | yes | **yes** |
+| `pwsh` 7 | no | **yes** |
+| `pwsh` 7 | yes | no |
+| `powershell` 5.1 | yes | no |
+
+The instruction given to the person testing it was `... > cast_ctrlc.log 2>&1`,
+which is precisely the case that breaks. The test method created the failure it
+then reported.
+
+**Attempt 3 — a real `CTRL_C_EVENT` to a live cast to the Pi.** PASS, evidence
+in row 14.
+
+Two lessons, both about method rather than about castr:
+
+- **A negative result from an unvalidated harness is not evidence.** Neither
+  failing attempt proved anything about the handler, and both were briefly
+  believed. The way out was to prove the harness could deliver a Ctrl-C at all
+  — against a throwaway probe with the same structure — before trusting what it
+  said about the real thing.
+- **Redirection is not neutral.** Capturing output to a file is such a reflex
+  when gathering evidence that it is easy to forget it changes how the process
+  is hosted. Here it changed the outcome completely.
+
+No code change resulted. There is no in-process defence against being
+terminated, and none is wanted: `miracast-stop` covers the case, the record's
+staleness handling cleans up after a killed cast, and the sink recovers on its
+own.
 
 ## What is tested and where
 
