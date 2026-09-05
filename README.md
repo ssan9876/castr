@@ -84,6 +84,7 @@ or any other Miracast sink rather than to a castr receiver:
 ```
 castr-sender miracast-list
 castr-sender miracast-cast "Living Room TV" [--mode quality|game] [--duration SECS]
+                                            [--pair auto|push|pin]
 castr-sender miracast-cast 192.168.173.1:7236       # or by address
 castr-sender miracast-status                        # what it is sending
 castr-sender miracast-stop                          # end it
@@ -92,10 +93,15 @@ castr-sender miracast-stop                          # end it
 `miracast-list` shows the Wi-Fi Direct devices in range and which of them are
 displays, with the RTSP port and bandwidth each advertises.
 
-Given a name, castr finds the display, pairs with it the first time (prompting
-for the PIN the display shows), forms the Wi-Fi Direct group, casts, and drops
-the group when it exits. Most displays advertise only while their screen
-mirroring page is open, so the command waits up to a minute for one to appear.
+Given a name, castr finds the display, pairs with it the first time, forms the
+Wi-Fi Direct group, casts, and drops the group when it exits. Most displays
+advertise only while their screen mirroring page is open, so the command waits
+up to a minute for one to appear.
+
+How it pairs is read from the display's own advertisement. A display offering
+push-button is paired with by button, which needs nobody present; one that only
+offers a PIN prompts for the PIN it shows. `--pair pin` or `--pair push` forces
+the choice. `miracast-list` shows which each display offers.
 
 The picture mode is negotiated with the display: castr offers every mode it can
 encode that the display's advertised bandwidth will carry, and takes the first
@@ -315,14 +321,18 @@ saving, driver age � and offers to fix the safe ones.
   another duplication output. The GUI has a picker; the CLI does not.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
 - V4L2 hardware decode and DRM/KMS output landed in sub-project 2.
-- Casting *to* an ordinary Miracast display has only ever been pointed at our
-  own sink. No third-party television or dongle has been cast to, and
-  interoperability is the whole point of the exercise, so treat it as unproven.
-  HDCP is not supported at all, so a display that requires content protection
-  cannot be cast to, and only the PIN pairing ceremony is implemented — a display
-  offering push-button only will not pair. Mode negotiation offers up to 1080p60
-  but has only ever been exercised against a sink advertising 720p30, so the
-  larger modes are untested on real hardware.
+- Casting *to* an ordinary Miracast display works against a real wireless
+  display adapter: paired by push-button with nobody present, negotiated
+  1080p30, and a picture on screen. See
+  `docs/superpowers/verification/2026-09-05-castr-miracast-interop-e2e.md`.
+  No **television** has been cast to yet — the Samsung, LG and TCL sets in
+  range advertise but have not been tried — so treat televisions as unproven.
+  HDCP is not supported at all, so a display that *requires* content protection
+  cannot be cast to, and that refusal path is untested.
+- Some displays invalidate their pairing after every session. castr notices an
+  association failure and re-pairs by itself when the display pairs by button,
+  since that costs nothing; a display that would prompt for a PIN is only
+  re-paired when the radio's own words suggest the stored pairing is stale.
 - A cast to a Miracast display has been verified for ten minutes against castr's
   own sink, with no dropped frames, but its audio has never been listened to and
   lip sync is unmeasured.

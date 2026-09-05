@@ -16,15 +16,20 @@ use castr_media::codec::{EncoderConfig, Mode, PixelFormat, RawFrame, VideoEncode
 use castr_miracast::rtsp::{self, Action};
 use castr_miracast::source::{rtp_pack::Packetizer, session::*, ts_mux::Muxer};
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How long to wait for the display to answer at all.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to keep trying to establish the control connection, in either
+/// direction. Longer than a single dial because a display that connects to us
+/// may take a moment, and may retry.
+const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(20);
+/// The port a Wi-Fi Display source listens on for a sink that dials in. This
+/// is the number Windows itself listens on.
+const WFD_RTSP_PORT: u16 = 7236;
 /// How often the session's timers are serviced when nothing is arriving.
 const TICK: Duration = Duration::from_millis(200);
 
@@ -86,11 +91,10 @@ pub fn cast_to(
     cmd_tx: mpsc::Sender<Command>,
     cmds: mpsc::Receiver<Command>,
 ) -> anyhow::Result<()> {
-    let mut sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
-        .with_context(|| format!("connect: {addr} did not answer within {CONNECT_TIMEOUT:?}"))?;
+    // `establish` has already logged which way round the connection went.
+    let mut sock = establish(addr)?;
     sock.set_read_timeout(Some(TICK))?;
     sock.set_nodelay(true).ok();
-    tracing::info!("miracast: connected to {addr}");
 
     // Bind before negotiating: the port we will send from is part of what M4
     // tells the display.
@@ -103,6 +107,8 @@ pub fn cast_to(
     });
 
     let stop = Arc::new(AtomicBool::new(false));
+    // Set when the display asks for a keyframe; the encoder thread clears it.
+    let want_idr = Arc::new(AtomicBool::new(false));
     let (media_tx, media_rx) = mpsc::channel::<Media>();
     let mut media_started = false;
     let mut muxer = Muxer::new();
@@ -172,22 +178,39 @@ pub fn cast_to(
 
         let mut ended = None;
         while let Some((msg, used)) = rtsp::parse(&buf).context("session: unreadable RTSP")? {
+            // The whole exchange, verbatim. A negotiation that fails against
+            // an unfamiliar display is the single most likely way this breaks,
+            // and it cannot be diagnosed from the outside.
+            tracing::debug!(
+                "miracast: <- {}",
+                String::from_utf8_lossy(&buf[..used]).trim_end()
+            );
             buf.drain(..used);
             for action in session.on_message(&msg) {
                 match action {
-                    Action::Send(m) => sock.write_all(m.format().as_bytes())?,
+                    Action::Send(m) => send(&mut sock, &m)?,
                     Action::Play => {
                         let port = session.sink_rtp_port().unwrap_or(5000);
                         rtp_target = Some(SocketAddr::new(addr.ip(), port));
                         if !media_started {
                             media_started = true;
-                            start_media(&session, &opts, media_tx.clone(), stop.clone());
+                            start_media(
+                                &session,
+                                &opts,
+                                media_tx.clone(),
+                                stop.clone(),
+                                want_idr.clone(),
+                            );
                             tracing::info!(
                                 "miracast: playing {:?} to {}",
                                 session.chosen(),
                                 rtp_target.expect("just set")
                             );
                         }
+                    }
+                    Action::Keyframe => {
+                        // The encoder thread notices and forces one.
+                        want_idr.store(true, Ordering::SeqCst);
                     }
                     Action::Teardown(why) => ended = Some(why),
                 }
@@ -202,8 +225,9 @@ pub fn cast_to(
 
         for action in session.tick(Instant::now()) {
             match action {
-                Action::Send(m) => sock.write_all(m.format().as_bytes())?,
+                Action::Send(m) => send(&mut sock, &m)?,
                 Action::Play => {}
+                Action::Keyframe => want_idr.store(true, Ordering::SeqCst),
                 Action::Teardown(why) => ended = Some(why),
             }
         }
@@ -268,10 +292,100 @@ pub fn cast_to(
     Ok(())
 }
 
+/// Gets the RTSP control connection up, whichever way the display wants it.
+///
+/// **Real Miracast sinks are the TCP initiator.** Measured against a wireless
+/// display adapter on 2026-09-04: Windows listens on 7236 and the adapter
+/// dials in from an ephemeral port. The adapter listens on nothing at all -
+/// not even the port its own information element advertises - so a source that
+/// only dials out can never reach it.
+///
+/// Our own sink is the other way round: it listens and we dial, because we
+/// wrote both ends and made them agree. Testing only against it could never
+/// have revealed this.
+///
+/// So do both, and take whichever answers first. The Pi keeps working because
+/// we still dial it; an adapter works because we now accept it. Everything
+/// above this socket is unchanged - who opened the connection has no bearing
+/// on the RTSP exchange that follows.
+fn establish(addr: SocketAddr) -> anyhow::Result<TcpStream> {
+    let listener = TcpListener::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, WFD_RTSP_PORT)));
+    match &listener {
+        Ok(l) => {
+            l.set_nonblocking(true).ok();
+            tracing::info!("miracast: listening on {WFD_RTSP_PORT} for {} to connect", addr.ip());
+        }
+        // Windows' own Miracast holds this port while it is casting. Not
+        // fatal: a sink that accepts connections can still be dialled.
+        Err(e) => tracing::warn!(
+            "miracast: cannot listen on {WFD_RTSP_PORT} ({e}); only dialling out. \
+             If Windows is casting to something, stop it first"
+        ),
+    }
+
+    let deadline = Instant::now() + ESTABLISH_TIMEOUT;
+    let mut last_dial: Option<std::io::Error> = None;
+    while Instant::now() < deadline {
+        if let Ok(l) = &listener {
+            match l.accept() {
+                Ok((s, peer)) if peer.ip() == addr.ip() => {
+                    tracing::info!("miracast: {peer} connected to us");
+                    s.set_nonblocking(false)?;
+                    return Ok(s);
+                }
+                Ok((_, peer)) => tracing::warn!(
+                    "miracast: ignoring a connection from {peer}; expecting {}",
+                    addr.ip()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => tracing::warn!("miracast: accept: {e:#}"),
+            }
+        }
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
+            Ok(s) => {
+                tracing::info!("miracast: connected to {addr}");
+                return Ok(s);
+            }
+            Err(e) => last_dial = Some(e),
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
+    // Say which of the two actually happened. "Did not answer" was reported
+    // for a connection that was refused outright in two seconds, which sent
+    // an afternoon looking for a timeout that never occurred.
+    let dialling = match last_dial {
+        Some(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+            format!("it refused us on port {}", addr.port())
+        }
+        Some(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+            format!("it did not answer on port {}", addr.port())
+        }
+        Some(e) => format!("dialling port {} failed: {e}", addr.port()),
+        None => format!("port {} was never tried", addr.port()),
+    };
+    let listening = match &listener {
+        Ok(_) => format!("and it did not connect to us on {WFD_RTSP_PORT}"),
+        Err(_) => format!("and we could not listen on {WFD_RTSP_PORT} to let it connect to us"),
+    };
+    anyhow::bail!(
+        "connect: no control connection with {} within {ESTABLISH_TIMEOUT:?} - {dialling}, {listening}",
+        addr.ip()
+    )
+}
+
+/// Writes one RTSP message, and records it.
+fn send(sock: &mut TcpStream, m: &rtsp::Message) -> anyhow::Result<()> {
+    let text = m.format();
+    tracing::debug!("miracast: -> {}", text.trim_end());
+    sock.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 fn write_actions(sock: &mut TcpStream, actions: Vec<Action>) -> anyhow::Result<()> {
     for action in actions {
         if let Action::Send(m) = action {
-            sock.write_all(m.format().as_bytes())?;
+            send(sock, &m)?;
         }
     }
     Ok(())
@@ -291,6 +405,7 @@ fn start_media(
     opts: &MiracastOptions,
     tx: mpsc::Sender<Media>,
     stop: Arc<AtomicBool>,
+    want_idr: Arc<AtomicBool>,
 ) {
     let mode = session.chosen();
     let (width, height) = mode.map(|m| (m.width, m.height)).unwrap_or((1280, 720));
@@ -389,6 +504,13 @@ fn start_media(
                     frame
                 };
                 let input = castr_media::convert::convert(&scaled, want);
+                // A display that joined mid-stream, or lost sync, asks for a
+                // keyframe. Giving it one is the difference between a healthy
+                // session and a black screen.
+                if want_idr.swap(false, Ordering::SeqCst) {
+                    tracing::info!("miracast: the display asked for a keyframe");
+                    enc.request_keyframe();
+                }
                 let repeated = !std::mem::take(&mut fresh);
                 match enc.encode(&input) {
                     Ok(Some(out)) => {
@@ -453,6 +575,7 @@ fn start_media(
     _opts: &MiracastOptions,
     _tx: mpsc::Sender<Media>,
     _stop: Arc<AtomicBool>,
+    _want_idr: Arc<AtomicBool>,
 ) {
     tracing::error!("miracast: casting is Windows-only for now");
 }

@@ -170,6 +170,9 @@ impl Session {
         for a in actions {
             match a {
                 Action::Send(m) => out.push(SinkEvent::SendRtsp(m.format())),
+                // A source-side action: the sink is the one that asks for
+                // keyframes, never the one that produces them.
+                Action::Keyframe => {}
                 Action::Play => {
                     self.playing = true;
                     if let Some(mode) = self.negotiation.chosen_video() {

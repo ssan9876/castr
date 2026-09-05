@@ -200,39 +200,62 @@ impl App {
         let worker = std::thread::Builder::new()
             .name("miracast-gui-cast".into())
             .spawn(move || {
-                let set_stage = |text: String| {
-                    if let Ok(mut s) = state_w.lock() {
-                        s.stage = text;
+                let set_stage = {
+                    let state = state_w.clone();
+                    move |text: String| {
+                        if let Ok(mut s) = state.lock() {
+                            s.stage = text;
+                        }
                     }
                 };
-                // Armed only when the radio actually asks, so a display
-                // Windows already knows never shows a PIN box at all.
-                let mut ask_pin = || -> anyhow::Result<String> {
-                    let (tx, rx) = std::sync::mpsc::channel::<String>();
-                    {
-                        let mut s = shared.lock().unwrap();
-                        s.pin_tx = Some(tx);
-                        s.pin_target = Some(name.clone());
-                        s.pin_kind = PinKind::Miracast;
+                // Armed only when the radio actually asks, which is once the
+                // pairing is under way and the display has been told to show a
+                // PIN - so the box never appears before there is a number on
+                // screen to copy, and never at all for a display Windows
+                // already knows.
+                //
+                // Owns its own clones because the radio calls it from a WinRT
+                // callback thread, not from this one.
+                let ask_pin = {
+                    let shared = shared.clone();
+                    let state = state_w.clone();
+                    let name = name.clone();
+                    move || -> anyhow::Result<String> {
+                        let (tx, rx) = std::sync::mpsc::channel::<String>();
+                        {
+                            let mut s = shared.lock().unwrap();
+                            s.pin_tx = Some(tx);
+                            s.pin_target = Some(name.clone());
+                            s.pin_kind = PinKind::Miracast;
+                        }
+                        if let Ok(mut s) = state.lock() {
+                            s.stage = "Waiting for the PIN shown on the display".into();
+                        }
+                        let pin = rx
+                            .recv()
+                            .map_err(|_| anyhow::anyhow!("pairing: PIN entry was cancelled"));
+                        {
+                            let mut s = shared.lock().unwrap();
+                            s.pin_tx = None;
+                            s.pin_target = None;
+                        }
+                        pin
                     }
-                    set_stage("Waiting for the PIN shown on the display".into());
-                    let pin = rx
-                        .recv()
-                        .map_err(|_| anyhow::anyhow!("pairing: PIN entry was cancelled"));
-                    {
-                        let mut s = shared.lock().unwrap();
-                        s.pin_tx = None;
-                        s.pin_target = None;
-                    }
-                    pin
                 };
 
                 let result = (|| -> anyhow::Result<()> {
                     let wait = castr_wifidirect_win::select::WaitPolicy::new(
                         Duration::from_secs(60),
                     );
-                    let connection =
-                        castr_wifidirect_win::radio::connect(&name, wait, &mut ask_pin)?;
+                    let ask: castr_wifidirect_win::radio::PinSource = Arc::new(ask_pin);
+                    // Auto: the button when the display offers one, so the PIN
+                    // box only ever appears for a display that needs it.
+                    let connection = castr_wifidirect_win::radio::connect(
+                        &name,
+                        wait,
+                        &ask,
+                        castr_wifidirect_win::select::Preference::Auto,
+                    )?;
                     set_stage(format!("Connected to {name}; negotiating"));
                     let addr = std::net::SocketAddr::new(
                         connection.remote_ip(),

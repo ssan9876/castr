@@ -43,6 +43,10 @@ enum Cmd {
         /// quality takes the bigger picture, game the faster one
         #[arg(long, value_enum, default_value_t = ModeArg::Quality)]
         mode: ModeArg,
+        /// How to pair the first time: auto takes whichever the display
+        /// offers, preferring the button because it needs nobody
+        #[arg(long, value_enum, default_value_t = PairArg::Auto)]
+        pair: PairArg,
     },
     /// Report what the running Miracast cast is sending
     MiracastStatus,
@@ -67,6 +71,25 @@ enum Cmd {
 enum ModeArg {
     Game,
     Quality,
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum PairArg {
+    Auto,
+    Push,
+    Pin,
+}
+
+#[cfg(windows)]
+impl From<PairArg> for castr_wifidirect_win::select::Preference {
+    fn from(p: PairArg) -> Self {
+        use castr_wifidirect_win::select::Preference;
+        match p {
+            PairArg::Auto => Preference::Auto,
+            PairArg::Push => Preference::ForcePushButton,
+            PairArg::Pin => Preference::ForcePin,
+        }
+    }
 }
 impl From<ModeArg> for Mode {
     fn from(m: ModeArg) -> Self {
@@ -158,11 +181,14 @@ fn main() -> anyhow::Result<()> {
             for c in castr_wifidirect_win::radio::discover()? {
                 match c.caps {
                     Some(caps) if c.is_display() => println!(
-                        "{:<32} display, RTSP {}, up to {} Mbps{}",
+                        "{:<32} display, RTSP {}, up to {} Mbps{}, pairs by {}",
                         c.name,
                         caps.rtsp_port,
                         caps.max_throughput_mbps,
-                        if caps.content_protection { ", HDCP" } else { "" }
+                        if caps.content_protection { ", HDCP" } else { "" },
+                        c.pairing
+                            .map(|m| m.describe())
+                            .unwrap_or_else(|| "an unstated method".into())
                     ),
                     _ => println!("{:<32} not a display", c.name),
                 }
@@ -174,6 +200,7 @@ fn main() -> anyhow::Result<()> {
             duration,
             fps,
             mode,
+            pair,
         }) => {
             // A name is the ordinary case; an address skips the radio entirely,
             // which is how this was tested before the radio existed and how a
@@ -234,12 +261,23 @@ fn main() -> anyhow::Result<()> {
                         Duration::from_secs(60),
                     );
                     let name = target.clone();
-                    let connection = castr_wifidirect_win::radio::connect(&target, wait, &mut || {
-                        println!("Enter the PIN shown on {name:?}:");
-                        let mut pin = String::new();
-                        std::io::stdin().read_line(&mut pin)?;
-                        Ok(pin.trim().to_string())
-                    })?;
+                    // Called during the pairing, once the display has actually
+                    // been told to show a PIN - not before it has one.
+                    let ask: castr_wifidirect_win::radio::PinSource =
+                        std::sync::Arc::new(move || {
+                            println!("Enter the PIN shown on {name:?}:");
+                            let mut pin = String::new();
+                            let read = std::io::stdin().read_line(&mut pin)?;
+                            if read == 0 {
+                                anyhow::bail!(
+                                    "no PIN was given (nothing on standard input); run this \
+                                     from a terminal, or pipe the PIN in"
+                                );
+                            }
+                            Ok(pin.trim().to_string())
+                        });
+                    let connection =
+                        castr_wifidirect_win::radio::connect(&target, wait, &ask, pair.into())?;
                     let addr = std::net::SocketAddr::new(
                         connection.remote_ip(),
                         connection.rtsp_port(),

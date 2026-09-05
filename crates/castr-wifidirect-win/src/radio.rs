@@ -13,7 +13,7 @@ use anyhow::{bail, Context};
 use castr_miracast::wfd;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use windows::core::HSTRING;
 use windows::Devices::Enumeration::{
@@ -61,6 +61,29 @@ fn display_caps(info: &DeviceInformation) -> Option<wfd::DeviceCaps> {
     None
 }
 
+/// How this device is willing to be paired with, from its WPS element.
+///
+/// Read from the same beacon as the Wi-Fi Display element and before
+/// connecting, so the ceremony can be chosen rather than assumed.
+fn pairing_methods(info: &DeviceInformation) -> Option<wfd::ConfigMethods> {
+    let elements = WiFiDirectInformationElement::CreateFromDeviceInformation(info).ok()?;
+    for e in &elements {
+        let Some(oui) = e.Oui().ok().and_then(|b| buffer_bytes(&b).ok()) else {
+            continue;
+        };
+        if oui.as_slice() != wfd::WPS_OUI || e.OuiType().unwrap_or(0) != wfd::WPS_OUI_TYPE {
+            continue;
+        }
+        let Some(value) = e.Value().ok().and_then(|b| buffer_bytes(&b).ok()) else {
+            continue;
+        };
+        if let Some(m) = wfd::parse_config_methods(&value) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Everything Wi-Fi Direct can currently see, display or not.
 ///
 /// **Slow**: about 50 seconds against the four devices in range here, and the
@@ -86,6 +109,7 @@ pub fn discover() -> anyhow::Result<Vec<Candidate>> {
             id: d.Id()?.to_string(),
             name: d.Name()?.to_string(),
             caps: display_caps(&d),
+            pairing: pairing_methods(&d),
         });
     }
     Ok(out)
@@ -142,32 +166,59 @@ impl Drop for Connection {
     }
 }
 
+/// How the caller asks somebody for the PIN a display is showing.
+///
+/// Shared and thread-safe rather than a borrowed closure, because it is called
+/// from a WinRT callback thread during the pairing rather than from the thread
+/// that started it. Keeping it a callback at all is what lets a graphical
+/// sender substitute a dialog without touching this crate.
+pub type PinSource = Arc<dyn Fn() -> anyhow::Result<String> + Send + Sync>;
+
 /// Finds a display by name, pairs if it must, and brings up the group.
 ///
 /// `pin` is called only when the display has to be paired with, so a display
-/// Windows already knows connects silently. Keeping it a callback is what lets
-/// a graphical sender substitute a dialog without touching this crate.
+/// Windows already knows connects silently.
 pub fn connect(
     name: &str,
     wait: WaitPolicy,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
+    preference: select::Preference,
 ) -> anyhow::Result<Connection> {
     let target = find(name, wait)?;
-    match bring_up(&target, pin) {
+    let was_paired = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
+        .and_then(|op| op.get())
+        .and_then(|info| info.Pairing()?.IsPaired())
+        .unwrap_or(false);
+
+    match bring_up(&target, pin, preference) {
         Ok(c) => Ok(c),
         Err(e) => {
             // Credentials for a group that no longer exists look exactly like a
             // network that is not there, and produce an endless "connecting"
-            // with nothing anywhere to explain it. One retry from scratch is
-            // worth the PIN prompt it costs when the failure was transient.
+            // with nothing anywhere to explain it.
+            //
+            // Retrying from scratch used to be gated on the radio's own words
+            // matching a known phrase, because re-pairing cost somebody a PIN
+            // prompt. A wireless display adapter turned out to invalidate its
+            // pairing after every session, and to describe that as "the
+            // operation was cancelled" - which matches no phrase at all.
+            //
+            // So the gate is now the *cost* rather than the wording: when the
+            // display pairs by button, re-pairing is free and unattended, and
+            // there is no reason not to try. A display that would prompt for a
+            // PIN still needs the wording to justify the interruption.
             let reason = last_wlan_failure().unwrap_or_default();
-            if failure::looks_like_stale_credentials(&reason) {
+            let repairing_is_free = matches!(
+                select::choose_ceremony(target.pairing, preference),
+                select::Ceremony::PushButton
+            );
+            if was_paired && (repairing_is_free || failure::looks_like_stale_credentials(&reason)) {
                 tracing::warn!(
-                    "wifidirect: association failed ({reason}); the stored pairing looks stale, \
-                     forgetting it and trying once more"
+                    "wifidirect: association failed ({reason}); forgetting the stored pairing \
+                     and trying once more"
                 );
                 unpair(&target)?;
-                return bring_up(&target, pin);
+                return bring_up(&target, pin, preference);
             }
             Err(e)
         }
@@ -205,7 +256,8 @@ fn unpair(target: &Candidate) -> anyhow::Result<()> {
 
 fn bring_up(
     target: &Candidate,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
+    preference: select::Preference,
 ) -> anyhow::Result<Connection> {
     let id = HSTRING::from(&target.id);
     let info = DeviceInformation::CreateFromIdAsync(&id)?
@@ -213,7 +265,19 @@ fn bring_up(
         .with_context(|| format!("{}: reading {:?}", Stage::Discovery, target.name))?;
 
     if !info.Pairing()?.IsPaired()? {
-        pair_with_pin(&info, target, pin)?;
+        let ceremony = select::choose_ceremony(target.pairing, preference);
+        tracing::info!(
+            "wifidirect: pairing with {:?} by {ceremony:?}; it offers {}",
+            target.name,
+            target
+                .pairing
+                .map(|m| m.describe())
+                .unwrap_or_else(|| "nothing it will admit to".into())
+        );
+        match ceremony {
+            select::Ceremony::PushButton => pair_with_push_button(&info, target)?,
+            select::Ceremony::Pin => pair_with_pin(&info, target, pin)?,
+        }
     }
 
     let device = WiFiDirectDevice::FromIdAsync(&id)?
@@ -260,10 +324,60 @@ fn bring_up(
     })
 }
 
+/// Pairs by confirmation, with no PIN for anyone to read.
+///
+/// What a wireless display adapter actually wants: it shows a "ready to
+/// connect" screen and mints a PIN per attempt that is often never displayed,
+/// so the PIN ceremony cannot be completed by a person looking at it. The
+/// button is metaphorical here - Windows confirms on our behalf - which is why
+/// this needs nobody present at all.
+fn pair_with_push_button(info: &DeviceInformation, target: &Candidate) -> anyhow::Result<()> {
+    let params = WiFiDirectConnectionParameters::new()?;
+    params.SetGroupOwnerIntent(0)?;
+    let methods = params.PreferenceOrderedConfigurationMethods()?;
+    methods.Clear()?;
+    methods.Append(WiFiDirectConfigurationMethod::PushButton)?;
+
+    let custom: DeviceInformationCustomPairing = info.Pairing()?.Custom()?;
+    custom.PairingRequested(&TypedEventHandler::<
+        DeviceInformationCustomPairing,
+        DevicePairingRequestedEventArgs,
+    >::new(move |_, args| {
+        if let Some(args) = args.as_ref() {
+            args.Accept()?;
+        }
+        Ok(())
+    }))?;
+
+    let result = custom
+        .PairWithProtectionLevelAndSettingsAsync(
+            DevicePairingKinds::ConfirmOnly,
+            DevicePairingProtectionLevel::Default,
+            &params,
+        )?
+        .get()?;
+    let status = result.Status()?;
+    if status != DevicePairingResultStatus::Paired
+        && status != DevicePairingResultStatus::AlreadyPaired
+    {
+        let reason = last_wlan_failure()
+            .map(|r| format!("; the radio said: {r}"))
+            .unwrap_or_default();
+        bail!(
+            "{}: {:?} - {}{reason}. If the display has a physical button for \
+             pairing, press it and try again",
+            Stage::Pairing,
+            target.name,
+            failure::pairing_status(status.0)
+        );
+    }
+    Ok(())
+}
+
 fn pair_with_pin(
     info: &DeviceInformation,
     target: &Candidate,
-    pin: &mut dyn FnMut() -> anyhow::Result<String>,
+    pin: &PinSource,
 ) -> anyhow::Result<()> {
     let params = WiFiDirectConnectionParameters::new()?;
     // Intent zero: the display should own the group. That is how a Miracast
@@ -273,18 +387,42 @@ fn pair_with_pin(
     methods.Clear()?;
     methods.Append(WiFiDirectConfigurationMethod::ProvidePin)?;
 
-    // The PIN is fetched inside the handler because that is when it is needed:
-    // asking earlier would prompt for a PIN the display had not shown yet.
-    let digits = pin()?;
-    let entered = HSTRING::from(&digits);
+    // Anything the prompt refused, kept so it can be reported after the
+    // pairing has failed rather than swallowed inside a callback.
+    let refusal: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let ask = pin.clone();
+    let seen = refusal.clone();
     let custom: DeviceInformationCustomPairing = info.Pairing()?.Custom()?;
     custom.PairingRequested(&TypedEventHandler::<
         DeviceInformationCustomPairing,
         DevicePairingRequestedEventArgs,
     >::new(move |_, args| {
-        if let Some(args) = args.as_ref() {
-            args.AcceptWithPin(&entered)?;
+        let Some(args) = args.as_ref() else {
+            return Ok(());
+        };
+        // The PIN is asked for *here*, not before the pairing starts.
+        //
+        // A display is only told to show a PIN once a pairing is actually
+        // under way. Asking first prompts for a number that does not exist
+        // yet - invisible against a sink that displays one permanently, as
+        // ours does, and fatal against one that does not. A wireless display
+        // adapter showed exactly that: it advertises Display, and had no PIN
+        // on screen when we asked.
+        //
+        // The prompt blocks while somebody reads the display, so this takes a
+        // deferral: without one Windows treats the handler as finished the
+        // moment it returns and stops waiting for an answer.
+        let deferral = args.GetDeferral()?;
+        match ask() {
+            Ok(digits) => args.AcceptWithPin(&HSTRING::from(&digits))?,
+            Err(e) => {
+                // Not accepting is what fails the pairing, which is the right
+                // outcome for a cancelled prompt.
+                *seen.lock().unwrap() = Some(format!("{e:#}"));
+            }
         }
+        deferral.Complete()?;
         Ok(())
     }))?;
 
@@ -295,6 +433,9 @@ fn pair_with_pin(
             &params,
         )?
         .get()?;
+    if let Some(why) = refusal.lock().unwrap().take() {
+        bail!("{}: {:?} - {why}", Stage::Pairing, target.name);
+    }
     let status = result.Status()?;
     if status != DevicePairingResultStatus::Paired
         && status != DevicePairingResultStatus::AlreadyPaired
@@ -318,8 +459,18 @@ fn address_of(device: &WiFiDirectDevice, target: &Candidate) -> anyhow::Result<I
     loop {
         let pairs = device.GetConnectionEndpointPairs()?;
         for p in &pairs {
+            // Both ends are logged, not just the one we use. Which side owns
+            // the group decides who is at `.1`, and taking the remote on faith
+            // is how a source ends up connecting to itself and reporting the
+            // display as refusing it.
+            let local = p
+                .LocalHostName()
+                .and_then(|h| h.ToString())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| "?".into());
             if let Ok(host) = p.RemoteHostName() {
                 if let Ok(text) = host.ToString() {
+                    tracing::info!("wifidirect: endpoint local={local} remote={text}");
                     if let Ok(ip) = text.to_string().parse::<IpAddr>() {
                         return Ok(ip);
                     }
@@ -383,5 +534,48 @@ mod tests {
             Ok(Err(e)) => panic!("discovery failed on a worker thread: {e:#}"),
             Err(_) => panic!("discovery did not finish within 180s, which is beyond slow"),
         }
+    }
+}
+
+#[cfg(test)]
+mod unpair_probe {
+    use super::*;
+
+    /// Forget a display, so the next connection pairs from scratch.
+    ///
+    /// Diagnostic for a display that advertises but will not associate: the
+    /// stored credentials may be for a group that no longer exists, which
+    /// `connect` only retries automatically when the radio's own words match
+    /// the stale-credential heuristic - and "the operation was cancelled" does
+    /// not.
+    ///
+    /// `cargo test -p castr-wifidirect-win unpair_probe -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn forget_the_display() {
+        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
+        let target = find(&name, WaitPolicy::new(Duration::from_secs(90))).expect("find");
+        let info = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
+            .unwrap()
+            .get()
+            .unwrap();
+        println!(
+            "before: paired={:?} can_pair={:?}",
+            info.Pairing().and_then(|p| p.IsPaired()),
+            info.Pairing().and_then(|p| p.CanPair())
+        );
+        match unpair(&target) {
+            Ok(()) => println!("unpaired {name}"),
+            Err(e) => println!("unpair failed: {e:#}"),
+        }
+        let after = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
+            .unwrap()
+            .get()
+            .unwrap();
+        println!(
+            "after:  paired={:?} can_pair={:?}",
+            after.Pairing().and_then(|p| p.IsPaired()),
+            after.Pairing().and_then(|p| p.CanPair())
+        );
     }
 }
