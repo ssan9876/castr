@@ -145,6 +145,21 @@ pub fn cast_to(
             None
         }
     };
+    // A test facility, off unless asked for: drop this percentage of outgoing
+    // RTP so a display genuinely sees loss and genuinely asks us to send less.
+    // The loss is real by the time it reaches the display; only its cause is
+    // arranged. Nothing else can exercise that loop without a degraded radio.
+    let drop_pct: u32 = std::env::var("CASTR_MIRACAST_DROP_PCT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+        .min(100);
+    if drop_pct > 0 {
+        tracing::warn!(
+            "miracast: CASTR_MIRACAST_DROP_PCT={drop_pct} - deliberately discarding              {drop_pct}% of outgoing media. This is a test switch"
+        );
+    }
+
     let mut stats = Stats::new();
     let mut stats_ctx = StatsContext {
         display,
@@ -268,6 +283,9 @@ pub fn cast_to(
                 let stamp = (pts_us * 9 / 100) as u32;
                 let (mut sent, mut bytes) = (0u64, 0u64);
                 for datagram in packetizer.push(&packets, stamp) {
+                    if drop_pct > 0 && rand::random::<u32>() % 100 < drop_pct {
+                        continue;
+                    }
                     match rtp_sock.send_to(&datagram, target) {
                         Ok(n) => {
                             sent += 1;

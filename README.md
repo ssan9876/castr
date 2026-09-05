@@ -123,6 +123,13 @@ the cast with `miracast-stop` rather than Ctrl-C. A cast killed this way leaves
 a stale record, which the next `miracast-status`, `miracast-stop` or
 `miracast-cast` cleans up by itself.
 
+If the display reports that it is losing packets, it asks the source to send
+less, and castr obeys — dropping the encoder's bitrate rather than pushing the
+same rate into a link that is already failing. `CASTR_MIRACAST_DROP_PCT=10`
+deliberately discards that percentage of outgoing media, which is how that path
+is tested without a degraded radio; it is a test switch and logs a warning
+whenever it is set.
+
 `miracast-status` reports the negotiated mode, what the display said it can
 carry, the throughput actually being sent, and how long ago the display last
 answered a keep-alive. **Every number except that last one is sent-side.**

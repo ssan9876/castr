@@ -32,8 +32,8 @@ twenty sessions to find.
 | 14 | **A picture appears on it** | PASS | Confirmed visually |
 | 15 | Teardown is clean | PASS | `teardown: the requested duration elapsed`, `releasing the group` |
 | 16 | A stale pairing is recovered from automatically | PASS | `association failed (The operation was cancelled.); forgetting the stored pairing and trying once more`, then re-paired by button and cast, unattended |
-| 17 | Mid-session bitrate requests are honoured | PARTIAL | Driven against the message our own sink actually emits (`request_bitrate`), in process. Never provoked on hardware: the adapter's link was healthy and never asked, and the Pi was unreachable |
-| 18 | The Pi still works after these changes | **NOT RUN** | The Pi was off the network all session |
+| 17 | Mid-session bitrate requests are honoured | PASS | Under 10% induced loss the Pi logged `loss is up, asking the source for 2000 kbps`; the sender logged `the display asked for 2000 kbps` then `now encoding at 2000 kbps` |
+| 18 | The Pi still works after these changes | PASS | `listening on 7236 ... connected to 192.168.173.1:7236` — the dial wins for our own sink; `playing 1280x720@30`, eight `perf:` windows all `dropped 0`, graceful `session ended` |
 | 19 | Audio is audible on it | NOT RUN | Never listened to |
 | 20 | Lip sync | NOT RUN | Unmeasured, as everywhere else |
 | 21 | HDCP refusal is clean | NOT RUN | It advertises HDCP 2.1 but did not demand it |
@@ -111,11 +111,26 @@ drops", and castr had no answer to it. `Action::Bitrate` now reaches the
 encoder's existing `set_bitrate`, clamped so a nonsense request cannot stop the
 picture and never above what was negotiated.
 
-Not provoked on hardware: the adapter's link was healthy and never asked. It
-is driven in process against `Negotiation::request_bitrate` - the real producer
-of that message - rather than a hand-written body, because testing the two ends
-against each other is what stops them drifting apart, and drift is how every
-defect above came about.
+Proven on hardware against the Pi. The adapter's own link was too healthy to
+ask, and this DietPi has no `tc`, `iptables` or `nft` to shape with, so the
+sender gained a deliberate test switch instead - `CASTR_MIRACAST_DROP_PCT`
+discards that percentage of outgoing RTP. The loss the sink sees is entirely
+real by the time it arrives; only its cause is arranged.
+
+At 10%:
+
+```
+Pi     loss is up, asking the source for 2000 kbps
+sender the display asked for 2000 kbps
+sender now encoding at 2000 kbps
+```
+
+Two observations from that run, neither chased: the sink asked for a keyframe
+about twice a second throughout - it rate-limits to one per 500 ms and we
+honour every one, which at this loss rate means near-continuous IDRs - and the
+session ended with `RTSP read: Connection reset by peer` rather than the clean
+`source closed the connection` every other run produced. Both under artificial
+10% loss, which is far past anything a working link would show.
 
 ### 4. The PIN was requested before the display was asked to show one
 
@@ -171,3 +186,8 @@ discarding what we are not looking at".
 - The Fire TV, which offers no push-button and would need the PIN path.
 - The presentation URL is still `rtsp://localhost/...`, which is meaningless to
   the far end. The adapter accepted it, so it has not been changed.
+- Whether honouring every keyframe request is right under sustained loss. The
+  sink rate-limits its asking; the source applies whatever arrives. A display
+  that asked without limit would drive the encoder to all-IDR.
+- Why teardown under heavy loss reads as a connection reset at the sink rather
+  than a clean close.
