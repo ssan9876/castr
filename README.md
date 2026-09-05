@@ -28,6 +28,53 @@ cargo build --release
 
 Binaries land in `target/release/castr-sender.exe` and `castr-receiver.exe`.
 
+## Installing
+
+There is an installer, and there is no need to use it: `castr-sender.exe` is a
+single portable exe that runs from wherever you put it. The installer exists
+for machines where a Start Menu entry, a working `castr-sender` on the PATH and
+a pre-authorised firewall rule are worth having — and because an MSI can be
+deployed by group policy to managed machines.
+
+```
+powershell -File scripts\windows\build-msi.ps1     # -> dist\castr-<version>-x64.msi
+```
+
+Double-clicking the MSI runs a wizard: licence, install location, then four
+things you can decline — Start Menu shortcut, Desktop shortcut, add to PATH,
+and a Windows Firewall rule. The last is worth keeping: castr listens on 7236
+for a Miracast display to connect back, and a firewall prompt arriving mid-cast
+is the worst possible moment for one.
+
+Uninstalling is Windows' own Apps & Features entry. It removes the PATH entry
+and the firewall rule as well as the files — but **deliberately keeps
+`%APPDATA%\castr\`**, which holds the identity certificate and `paired.toml`.
+Deleting those would silently discard every pairing, including the Miracast
+ones, and reinstalling would mean pairing everything again.
+
+Building the MSI needs the WiX toolset once per machine, as a per-user tool
+with no administrator rights:
+
+```
+dotnet tool install --global wix --version 5.0.2
+wix extension add --global WixToolset.UI.wixext/5.0.2
+wix extension add --global WixToolset.Firewall.wixext/5.0.2
+```
+
+WiX 5 rather than the current 7, which requires accepting the Open Source
+Maintenance Fee licence; 5 is supported and carries no such condition.
+
+**The MSI is unsigned**, so Windows will call the publisher unknown and
+SmartScreen will warn about it. Signing needs a code-signing certificate, which
+is a purchase rather than a code change.
+
+`scripts\windows\verify-msi.ps1`, run from an elevated PowerShell, installs the
+package silently, checks everything it claims to do, uninstalls it, and checks
+it left nothing behind.
+
+The application icon lives at `assets/castr.ico` and is committed;
+`scripts\windows\make-icon.ps1` regenerates it if the artwork changes.
+
 ## Running
 
 Start the receiver on the display machine:
