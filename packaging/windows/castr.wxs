@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The Windows installer for the castr sender.
+
+  Everything optional is a feature the person installing can decline, and
+  everything this adds outside the install directory - the PATH entry and the
+  firewall rule - is removed again on uninstall. Those two are what installers
+  most often strand.
+
+  Deliberately NOT removed on uninstall: %APPDATA%\castr\, which holds the
+  identity certificate and paired.toml. Deleting it would silently discard
+  every pairing, including the Miracast ones, and a reinstall would mean
+  pairing everything again.
+
+  Built by scripts/windows/build-msi.ps1, which passes Version and SourceDir.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+     xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
+
+  <Package Name="castr"
+           Manufacturer="castr"
+           Version="$(Version)"
+           UpgradeCode="5237300B-D9A8-4952-98A2-E5CF9FA3428B"
+           Scope="perMachine"
+           Compressed="yes"
+           InstallerVersion="500">
+
+    <!-- Replaces an older build rather than installing beside it, and refuses
+         to be overwritten by an older one. -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of castr is already installed. Uninstall it first if you really want this one." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="castr.ico" SourceFile="$(IconPath)" />
+    <Property Id="ARPPRODUCTICON" Value="castr.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/ssan9876/castr" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicensePath)" />
+    <ui:WixUI Id="WixUI_FeatureTree" InstallDirectory="INSTALLFOLDER" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="castr" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="castr" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- The program itself. Not optional: without it there is nothing here. -->
+    <Feature Id="Main"
+             Title="castr sender"
+             Description="The sender: its window, its command line, and Miracast casting."
+             Level="1"
+             AllowAbsent="no">
+      <ComponentRef Id="SenderExe" />
+
+      <Feature Id="StartMenuShortcut"
+               Title="Start Menu shortcut"
+               Description="A Start Menu entry that opens the castr window."
+               Level="1">
+        <ComponentRef Id="StartMenuShortcutComponent" />
+      </Feature>
+
+      <Feature Id="DesktopShortcut"
+               Title="Desktop shortcut"
+               Description="The same shortcut on the desktop."
+               Level="1">
+        <ComponentRef Id="DesktopShortcutComponent" />
+      </Feature>
+
+      <Feature Id="PathEntry"
+               Title="Add to PATH"
+               Description="Run castr-sender from any terminal. Much of castr is a command line - miracast-list, diagnose, miracast-cast - and without this it is hidden behind a long path."
+               Level="1">
+        <ComponentRef Id="PathComponent" />
+      </Feature>
+
+      <Feature Id="FirewallRule"
+               Title="Allow through Windows Firewall"
+               Description="Pre-authorises castr so Windows does not raise a firewall prompt mid-cast, when a display connects back to it."
+               Level="1">
+        <ComponentRef Id="FirewallComponent" />
+      </Feature>
+    </Feature>
+
+    <ComponentGroup Id="Everything" Directory="INSTALLFOLDER">
+      <Component Id="SenderExe" Guid="2A1B4C6D-8E9F-4A1B-9C2D-3E4F5A6B7C8D">
+        <File Id="castr_sender.exe"
+              Source="$(SourceDir)\castr-sender.exe"
+              KeyPath="yes" />
+      </Component>
+
+      <!-- The PATH entry goes and comes with the feature, so uninstalling
+           leaves the system PATH as it was found. -->
+      <Component Id="PathComponent" Guid="3B2C5D7E-9F0A-4B2C-8D3E-4F5A6B7C8D9E">
+        <Environment Id="CastrPath"
+                     Name="PATH"
+                     Value="[INSTALLFOLDER]"
+                     Part="last"
+                     Action="set"
+                     System="yes"
+                     Permanent="no" />
+        <RegistryValue Root="HKLM" Key="Software\castr" Name="PathEntry"
+                       Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+
+      <!-- Tied to its component, so it is withdrawn on uninstall rather than
+           left authorising an executable that is no longer there. -->
+      <Component Id="FirewallComponent" Guid="4C3D6E8F-0A1B-4C3D-9E4F-5A6B7C8D9E0F">
+        <RegistryValue Root="HKLM" Key="Software\castr" Name="FirewallRule"
+                       Type="integer" Value="1" KeyPath="yes" />
+        <fw:FirewallException Id="CastrInbound"
+                              Name="castr sender"
+                              Description="Lets a Miracast display connect back to castr."
+                              Program="[INSTALLFOLDER]castr-sender.exe"
+                              Scope="localSubnet"
+                              Profile="all"
+                              IgnoreFailure="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Component Id="StartMenuShortcutComponent"
+               Directory="AppMenuFolder"
+               Guid="5D4E7F90-1B2C-4D4E-8F50-6B7C8D9E0F1A">
+      <Shortcut Id="StartMenuCastr"
+                Name="castr"
+                Description="Cast this screen to a receiver or a Miracast display"
+                Target="[INSTALLFOLDER]castr-sender.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="castr.ico" />
+      <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\castr" Name="StartMenu"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Component Id="DesktopShortcutComponent"
+               Directory="DesktopFolder"
+               Guid="6E5F8091-2C3D-4E5F-9061-7C8D9E0F1A2B">
+      <Shortcut Id="DesktopCastr"
+                Name="castr"
+                Description="Cast this screen to a receiver or a Miracast display"
+                Target="[INSTALLFOLDER]castr-sender.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="castr.ico" />
+      <RegistryValue Root="HKCU" Key="Software\castr" Name="Desktop"
+                     Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+  </Package>
+</Wix>
