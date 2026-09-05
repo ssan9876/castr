@@ -42,9 +42,23 @@ probes on port 7331; QUIC listens on 7332.
 ### Pairing and casting from the GUI
 
 Run `castr-sender` with no arguments (or double-click the exe). It lists
-discovered receivers with Pair and Cast buttons and a Game/Quality toggle.
-Pairing is two-phase: press Pair, read the 6-digit PIN shown on the receiver's
-screen and window title, type it into the sender. Later connections are silent.
+everywhere the screen can go — castr receivers *and* Miracast displays — in one
+list, each row saying which it is, with Pair and Cast buttons and a Game/Quality
+toggle. Pairing a receiver is two-phase: press Pair, read the 6-digit PIN shown
+on the receiver's screen and window title, type it into the sender. Later
+connections are silent.
+
+A Miracast display has no separate Pair step — it pairs during the connect,
+asking for its 8-digit PIN only the first time. Finding displays takes about a
+minute (the radio enumeration is slow, and the window says so while it waits),
+and most displays appear only while their Screen Mirroring page is open.
+
+Where the machine has more than one monitor, a picker chooses which to cast; a
+rotated monitor is labelled, because the cast of one arrives sideways.
+
+The window has not been click-tested end to end — see
+`docs/superpowers/verification/2026-09-04-castr-miracast-gui-e2e.md` for exactly
+what is proven and what is not.
 
 ### Pairing and casting from the CLI
 
@@ -297,8 +311,8 @@ saving, driver age � and offers to fix the safe ones.
   `docs/superpowers/verification/2026-09-03-castr-cast-quality-e2e.md`.
 - Casting a monitor that Windows has rotated arrives rotated: the capture does
   not consult the duplication API's rotation.
-- Only the first monitor is cast unless `CASTR_OUTPUT` names another
-  duplication output; there is no UI for choosing one.
+- From the CLI, only the first monitor is cast unless `CASTR_OUTPUT` names
+  another duplication output. The GUI has a picker; the CLI does not.
 - PIN pairing locks out for 60 s after 3 failed attempts within a minute.
 - V4L2 hardware decode and DRM/KMS output landed in sub-project 2.
 - Casting *to* an ordinary Miracast display has only ever been pointed at our

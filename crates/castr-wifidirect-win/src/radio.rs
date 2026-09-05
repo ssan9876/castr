@@ -62,6 +62,15 @@ fn display_caps(info: &DeviceInformation) -> Option<wfd::DeviceCaps> {
 }
 
 /// Everything Wi-Fi Direct can currently see, display or not.
+///
+/// **Slow**: about 50 seconds against the four devices in range here, and the
+/// same on any thread. Roughly 10 s of that is the enumeration; the rest is
+/// reading each device's information element, one device at a time.
+///
+/// Measured on 2026-09-04 rather than assumed, because a caller with a user
+/// interface has to run this on a worker *and say what it is waiting for* - a
+/// silent minute is indistinguishable from a hang, and was briefly mistaken
+/// for one.
 pub fn discover() -> anyhow::Result<Vec<Candidate>> {
     let selector =
         WiFiDirectDevice::GetDeviceSelector2(WiFiDirectDeviceSelectorType::AssociationEndpoint)
@@ -346,4 +355,33 @@ fn last_wlan_failure() -> Option<String> {
         .output()
         .ok()?;
     failure::parse_wlan_failure(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Needs a radio, so it is not part of the ordinary run:
+    /// `cargo test -p castr-wifidirect-win -- --ignored --nocapture`.
+    ///
+    /// Two things, neither of them obvious:
+    ///
+    /// - Discovery works off the main thread, which a graphical sender needs.
+    /// - It takes about **50 seconds**. That is the point of the generous
+    ///   bound below: a tighter one fails on a working radio, and reads as a
+    ///   hang when it is only slow. It was read as exactly that once already.
+    #[test]
+    #[ignore]
+    fn discovery_finishes_on_a_worker_thread_though_slowly() {
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(discover().map(|v| v.len()));
+        });
+        match rx.recv_timeout(Duration::from_secs(180)) {
+            Ok(Ok(n)) => println!("found {n} devices in {:?} from a worker", started.elapsed()),
+            Ok(Err(e)) => panic!("discovery failed on a worker thread: {e:#}"),
+            Err(_) => panic!("discovery did not finish within 180s, which is beyond slow"),
+        }
+    }
 }
