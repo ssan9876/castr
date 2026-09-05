@@ -31,8 +31,31 @@ impl Record {
         toml::from_str(text).context("the Miracast cast record is not readable")
     }
 
-    pub fn age_secs(&self, now_unix: u64) -> u64 {
-        now_unix.saturating_sub(self.started)
+}
+
+/// How long ago a cast started, in words.
+///
+/// A stale record's `started` is a unix timestamp, and printing one at a
+/// person is no help at all when what they want to know is whether the cast it
+/// describes was a minute ago or last week.
+pub fn describe_age(started: u64, now_unix: u64) -> String {
+    let secs = now_unix.saturating_sub(started);
+    match secs {
+        0..=59 => "less than a minute ago".into(),
+        60..=5399 => {
+            let m = secs / 60;
+            format!("{m} minute{} ago", if m == 1 { "" } else { "s" })
+        }
+        // Rounded to the nearest hour up to a day; past that, days read better
+        // than a large hour count.
+        5400..=86_399 => {
+            let h = (secs + 1800) / 3600;
+            format!("{h} hour{} ago", if h == 1 { "" } else { "s" })
+        }
+        _ => {
+            let d = secs / 86_400;
+            format!("{d} day{} ago", if d == 1 { "" } else { "s" })
+        }
     }
 }
 
@@ -145,7 +168,20 @@ mod tests {
     }
 
     #[test]
-    fn age_does_not_underflow_when_the_clock_moved_backwards() {
-        assert_eq!(a_record().age_secs(0), 0);
+    fn an_age_is_described_in_words_not_a_timestamp() {
+        let t = 1_757_001_234;
+        assert_eq!(describe_age(t, t + 5), "less than a minute ago");
+        assert_eq!(describe_age(t, t + 60), "1 minute ago");
+        assert_eq!(describe_age(t, t + 1500), "25 minutes ago");
+        assert_eq!(describe_age(t, t + 7200), "2 hours ago");
+        assert_eq!(describe_age(t, t + 90_000), "1 day ago");
+        assert_eq!(describe_age(t, t + 300_000), "3 days ago");
+    }
+
+    #[test]
+    fn an_age_does_not_underflow_when_the_clock_moved_backwards() {
+        // A record written before a clock correction would otherwise wrap to
+        // an age of several hundred billion years.
+        assert_eq!(describe_age(1_757_001_234, 0), "less than a minute ago");
     }
 }

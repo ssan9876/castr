@@ -83,10 +83,17 @@ fn print_absent(report: control::client::Report) {
     use control::client::Report;
     match report {
         Report::NoCast => println!("no Miracast cast is running"),
-        Report::Stale { started: Some(t) } => println!(
-            "no Miracast cast is running; cleaned up a stale record from a cast \
-             started {t} (unix seconds)"
-        ),
+        Report::Stale { started: Some(t) } => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            println!(
+                "no Miracast cast is running; cleaned up a stale record from a cast \
+                 started {}",
+                control::record::describe_age(t, now)
+            )
+        }
         Report::Stale { started: None } => {
             println!("no Miracast cast is running; cleaned up an unreadable record")
         }
