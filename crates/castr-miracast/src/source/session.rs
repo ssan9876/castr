@@ -210,6 +210,12 @@ impl SourceSession {
                     Action::Teardown("session: the display ended the session"),
                 ]
             }
+            // A display asking for a keyframe. It gets one: without it a sink
+            // that joined mid-stream has nothing to decode from, and shows
+            // black through an otherwise healthy session.
+            "SET_PARAMETER" if m.body.contains("wfd_idr_request") => {
+                vec![Action::Send(rtsp::response(200, cseq, "")), Action::Keyframe]
+            }
             // Never fatal: a display may ask us things we have never seen, and
             // refusing them would refuse the display.
             _ => vec![Action::Send(rtsp::response(200, cseq, ""))],
@@ -497,6 +503,37 @@ mod tests {
     }
 
     #[test]
+    fn a_request_for_a_keyframe_produces_one() {
+        // The adapter asked three times and was answered "200 OK" three times
+        // with nothing behind it, so the session ran healthily to completion
+        // and showed black throughout.
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        let mut idr = rtsp::request("SET_PARAMETER", "rtsp://x/wfd1.0/streamid=0", 4, "");
+        idr.body = "wfd_idr_request\r\n".into();
+        let actions = s.on_message(&idr);
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Keyframe)),
+            "wfd_idr_request must reach the encoder"
+        );
+        // And it is still answered, or the display gives up on us.
+        assert!(sent(&actions)
+            .iter()
+            .any(|m| matches!(m.start, StartLine::Response { status: 200, .. })));
+    }
+
+    #[test]
+    fn another_set_parameter_does_not_ask_for_a_keyframe() {
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        let mut other = rtsp::request("SET_PARAMETER", "rtsp://x/wfd1.0/streamid=0", 4, "");
+        other.body = "wfd_some_vendor_thing: 1\r\n".into();
+        let actions = s.on_message(&other);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Keyframe)));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Teardown(_))));
+    }
+
+    #[test]
     fn an_unknown_parameter_does_not_end_the_session() {
         let mut s = SourceSession::new(cfg());
         s.start();
@@ -577,6 +614,7 @@ mod tests {
                 match action {
                     Action::Send(m) => from_sink.extend(sink.on_message(&m)),
                     Action::Play => source_playing = true,
+                    Action::Keyframe => {}
                     Action::Teardown(why) => panic!("the source tore down: {why}"),
                 }
             }
@@ -584,6 +622,7 @@ mod tests {
                 match action {
                     Action::Send(m) => from_source.extend(source.on_message(&m)),
                     Action::Play => {}
+                    Action::Keyframe => {}
                     Action::Teardown(why) => panic!("the sink tore down: {why}"),
                 }
             }

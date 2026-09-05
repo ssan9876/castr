@@ -14,6 +14,9 @@ pub struct Candidate {
     /// What its Wi-Fi Display element said, if it published one at all. A
     /// device with none is not offering to be a display right now.
     pub caps: Option<DeviceCaps>,
+    /// How it is willing to be paired with, from its WPS element. `None` when
+    /// it publishes none, which is treated as "the PIN ceremony, as before".
+    pub pairing: Option<castr_miracast::wfd::ConfigMethods>,
 }
 
 impl Candidate {
@@ -134,6 +137,7 @@ mod tests {
                 rtsp_port: 7236,
                 max_throughput_mbps: 54,
             }),
+            pairing: None,
         }
     }
 
@@ -142,6 +146,7 @@ mod tests {
             id: format!("WiFiDirect#{name}"),
             name: name.to_string(),
             caps: None,
+            pairing: None,
         }
     }
 
@@ -233,5 +238,110 @@ mod tests {
         let p = WaitPolicy::new(Duration::from_secs(60));
         assert!(p.keep_waiting(Instant::now()));
         assert!(!p.keep_waiting(Instant::now() - Duration::from_secs(61)));
+    }
+}
+
+/// Which pairing ceremony to use with a display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ceremony {
+    /// Confirm without a PIN. Nobody has to read anything off a screen, which
+    /// is what makes an unattended cast to an adapter possible.
+    PushButton,
+    /// Type in the PIN the display shows.
+    Pin,
+}
+
+/// What the caller asked for, when they have an opinion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Preference {
+    /// Take whichever the display offers, favouring the one needing no human.
+    #[default]
+    Auto,
+    ForcePushButton,
+    ForcePin,
+}
+
+/// Chooses how to pair, from what the display says it accepts.
+///
+/// Push-button is preferred when offered because it needs nobody: a wireless
+/// display adapter shows a "ready to connect" screen and generates its PIN per
+/// attempt, so there is often no PIN for anyone to read even though it
+/// advertises that it can display one.
+///
+/// A display that offers no push-button gets the PIN ceremony, and so does one
+/// that advertises nothing at all - which is exactly what this did before it
+/// could choose, so no display that already worked changes behaviour.
+pub fn choose_ceremony(
+    methods: Option<castr_miracast::wfd::ConfigMethods>,
+    preference: Preference,
+) -> Ceremony {
+    match preference {
+        Preference::ForcePin => Ceremony::Pin,
+        Preference::ForcePushButton => Ceremony::PushButton,
+        Preference::Auto => match methods {
+            Some(m) if m.push_button() => Ceremony::PushButton,
+            _ => Ceremony::Pin,
+        },
+    }
+}
+
+#[cfg(test)]
+mod ceremony_tests {
+    use super::*;
+    use castr_miracast::wfd::ConfigMethods;
+
+    // The real bitmaps, read from the devices in range on 2026-09-05.
+    const ADAPTER: ConfigMethods = ConfigMethods(0x2288);
+    const SAMSUNG: ConfigMethods = ConfigMethods(0x4388);
+    const FIRE_TV: ConfigMethods = ConfigMethods(0x4108);
+    const PRINTER: ConfigMethods = ConfigMethods(0x0000);
+
+    #[test]
+    fn a_display_offering_a_button_gets_the_button() {
+        // No human has to read anything, so this is always the kinder path.
+        assert_eq!(
+            choose_ceremony(Some(ADAPTER), Preference::Auto),
+            Ceremony::PushButton
+        );
+        assert_eq!(
+            choose_ceremony(Some(SAMSUNG), Preference::Auto),
+            Ceremony::PushButton
+        );
+    }
+
+    #[test]
+    fn a_display_with_no_button_gets_the_pin() {
+        assert_eq!(
+            choose_ceremony(Some(FIRE_TV), Preference::Auto),
+            Ceremony::Pin
+        );
+    }
+
+    #[test]
+    fn a_display_that_advertises_nothing_gets_the_pin() {
+        // Which is what happened before there was a choice, so nothing that
+        // already worked starts behaving differently.
+        assert_eq!(choose_ceremony(None, Preference::Auto), Ceremony::Pin);
+        assert_eq!(
+            choose_ceremony(Some(PRINTER), Preference::Auto),
+            Ceremony::Pin
+        );
+    }
+
+    #[test]
+    fn the_caller_can_insist() {
+        assert_eq!(
+            choose_ceremony(Some(ADAPTER), Preference::ForcePin),
+            Ceremony::Pin
+        );
+        assert_eq!(
+            choose_ceremony(Some(FIRE_TV), Preference::ForcePushButton),
+            Ceremony::PushButton
+        );
+        // Insisting works even when nothing is known about the display.
+        assert_eq!(
+            choose_ceremony(None, Preference::ForcePushButton),
+            Ceremony::PushButton
+        );
     }
 }

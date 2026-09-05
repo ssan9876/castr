@@ -107,6 +107,8 @@ pub fn cast_to(
     });
 
     let stop = Arc::new(AtomicBool::new(false));
+    // Set when the display asks for a keyframe; the encoder thread clears it.
+    let want_idr = Arc::new(AtomicBool::new(false));
     let (media_tx, media_rx) = mpsc::channel::<Media>();
     let mut media_started = false;
     let mut muxer = Muxer::new();
@@ -192,13 +194,23 @@ pub fn cast_to(
                         rtp_target = Some(SocketAddr::new(addr.ip(), port));
                         if !media_started {
                             media_started = true;
-                            start_media(&session, &opts, media_tx.clone(), stop.clone());
+                            start_media(
+                                &session,
+                                &opts,
+                                media_tx.clone(),
+                                stop.clone(),
+                                want_idr.clone(),
+                            );
                             tracing::info!(
                                 "miracast: playing {:?} to {}",
                                 session.chosen(),
                                 rtp_target.expect("just set")
                             );
                         }
+                    }
+                    Action::Keyframe => {
+                        // The encoder thread notices and forces one.
+                        want_idr.store(true, Ordering::SeqCst);
                     }
                     Action::Teardown(why) => ended = Some(why),
                 }
@@ -215,6 +227,7 @@ pub fn cast_to(
             match action {
                 Action::Send(m) => send(&mut sock, &m)?,
                 Action::Play => {}
+                Action::Keyframe => want_idr.store(true, Ordering::SeqCst),
                 Action::Teardown(why) => ended = Some(why),
             }
         }
@@ -392,6 +405,7 @@ fn start_media(
     opts: &MiracastOptions,
     tx: mpsc::Sender<Media>,
     stop: Arc<AtomicBool>,
+    want_idr: Arc<AtomicBool>,
 ) {
     let mode = session.chosen();
     let (width, height) = mode.map(|m| (m.width, m.height)).unwrap_or((1280, 720));
@@ -490,6 +504,13 @@ fn start_media(
                     frame
                 };
                 let input = castr_media::convert::convert(&scaled, want);
+                // A display that joined mid-stream, or lost sync, asks for a
+                // keyframe. Giving it one is the difference between a healthy
+                // session and a black screen.
+                if want_idr.swap(false, Ordering::SeqCst) {
+                    tracing::info!("miracast: the display asked for a keyframe");
+                    enc.request_keyframe();
+                }
                 let repeated = !std::mem::take(&mut fresh);
                 match enc.encode(&input) {
                     Ok(Some(out)) => {
@@ -554,6 +575,7 @@ fn start_media(
     _opts: &MiracastOptions,
     _tx: mpsc::Sender<Media>,
     _stop: Arc<AtomicBool>,
+    _want_idr: Arc<AtomicBool>,
 ) {
     tracing::error!("miracast: casting is Windows-only for now");
 }

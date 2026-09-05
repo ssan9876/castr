@@ -363,3 +363,176 @@ mod tests {
         assert!(!c.session_available);
     }
 }
+
+/// WPS lives in its own information element, beside the Wi-Fi Display one.
+pub const WPS_OUI: [u8; 3] = [0x00, 0x50, 0xf2];
+pub const WPS_OUI_TYPE: u8 = 4;
+
+/// How a device is willing to be paired with.
+///
+/// A source that only knows one ceremony can only pair with displays that
+/// happen to offer it. Reading this is what lets the right one be chosen -
+/// and it is read before connecting, from the same beacon the Wi-Fi Display
+/// element arrives in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConfigMethods(pub u16);
+
+impl ConfigMethods {
+    /// The device shows a PIN for someone to type in elsewhere.
+    pub const DISPLAY: u16 = 0x0008;
+    /// The device accepts a button press instead of a PIN.
+    pub const PUSH_BUTTON: u16 = 0x0080;
+    /// The device has a keypad, so it can accept a PIN typed into it.
+    pub const KEYPAD: u16 = 0x0100;
+    pub const PHYSICAL_PUSH_BUTTON: u16 = 0x0280;
+    pub const VIRTUAL_PUSH_BUTTON: u16 = 0x0480;
+    pub const VIRTUAL_DISPLAY: u16 = 0x2008;
+
+    /// Whether every bit of `bits` is set. Composite methods such as
+    /// `PHYSICAL_PUSH_BUTTON` are two bits, so a plain intersection would say
+    /// yes when only half of one is present.
+    pub fn has(self, bits: u16) -> bool {
+        self.0 & bits == bits
+    }
+
+    pub fn push_button(self) -> bool {
+        self.has(Self::PUSH_BUTTON)
+    }
+
+    /// The device can put a PIN on its own screen for us to type.
+    pub fn shows_a_pin(self) -> bool {
+        self.has(Self::DISPLAY) || self.has(Self::VIRTUAL_DISPLAY)
+    }
+
+    pub fn describe(self) -> String {
+        let mut names = Vec::new();
+        for (bits, name) in [
+            (Self::DISPLAY, "display"),
+            (Self::PUSH_BUTTON, "push-button"),
+            (Self::KEYPAD, "keypad"),
+        ] {
+            if self.has(bits) {
+                names.push(name);
+            }
+        }
+        if names.is_empty() {
+            return format!("no pairing method (0x{:04x})", self.0);
+        }
+        names.join(", ")
+    }
+}
+
+/// Reads the Config Methods attribute out of a WPS element's value.
+///
+/// WPS attributes are a two-byte id, a two-byte length and a body, big-endian
+/// throughout; Config Methods is id `0x1008` and is itself two bytes.
+pub fn parse_config_methods(value: &[u8]) -> Option<ConfigMethods> {
+    let mut i = 0usize;
+    while i + 4 <= value.len() {
+        let id = u16::from_be_bytes([value[i], value[i + 1]]);
+        let len = u16::from_be_bytes([value[i + 2], value[i + 3]]) as usize;
+        let end = i.checked_add(4)?.checked_add(len)?;
+        if end > value.len() {
+            return None;
+        }
+        if id == 0x1008 && len >= 2 {
+            return Some(ConfigMethods(u16::from_be_bytes([
+                value[i + 4],
+                value[i + 5],
+            ])));
+        }
+        i = end;
+    }
+    None
+}
+
+#[cfg(test)]
+mod config_method_tests {
+    use super::*;
+
+    /// Read from the real devices in range on 2026-09-05. Genuine bytes from
+    /// four vendors we did not write, which is the only interop evidence there
+    /// is short of casting to each one.
+    const ADAPTER: u16 = 0x2288; // MR-A202 wireless display adapter
+    const SAMSUNG: u16 = 0x4388; // 75" Crystal UHD
+    const LG: u16 = 0x3388; // webOS TV UN7000PUB
+    const FIRE_TV: u16 = 0x4108; // Fire TV Stick
+    const PRINTER: u16 = 0x0000; // Epson WF-2960
+
+    fn tlv(id: u16, body: &[u8]) -> Vec<u8> {
+        let mut v = id.to_be_bytes().to_vec();
+        v.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn the_attribute_is_found_among_others() {
+        let mut value = tlv(0x1044, &[0x02]); // WPS state, in the way
+        value.extend(tlv(0x1008, &ADAPTER.to_be_bytes()));
+        value.extend(tlv(0x1047, &[0u8; 16])); // UUID, after it
+        assert_eq!(parse_config_methods(&value), Some(ConfigMethods(ADAPTER)));
+    }
+
+    #[test]
+    fn an_element_without_the_attribute_yields_nothing() {
+        let value = tlv(0x1044, &[0x02]);
+        assert_eq!(parse_config_methods(&value), None);
+    }
+
+    #[test]
+    fn a_truncated_element_is_survived_rather_than_panicking() {
+        for cut in 0..12 {
+            let full = tlv(0x1008, &ADAPTER.to_be_bytes());
+            let _ = parse_config_methods(&full[..cut.min(full.len())]);
+        }
+        // A length that runs past the end must not be believed.
+        let lying = vec![0x10, 0x08, 0xff, 0xff, 0x22];
+        assert_eq!(parse_config_methods(&lying), None);
+    }
+
+    #[test]
+    fn the_adapter_offers_a_button_and_a_screen_but_no_keypad() {
+        let m = ConfigMethods(ADAPTER);
+        assert!(m.push_button());
+        assert!(m.shows_a_pin());
+        assert!(!m.has(ConfigMethods::KEYPAD));
+    }
+
+    #[test]
+    fn the_televisions_offer_a_button() {
+        assert!(ConfigMethods(SAMSUNG).push_button());
+        assert!(ConfigMethods(LG).push_button());
+    }
+
+    #[test]
+    fn the_fire_tv_offers_no_button() {
+        // The one display here that a push-button-only source could not pair
+        // with at all.
+        let m = ConfigMethods(FIRE_TV);
+        assert!(!m.push_button());
+        assert!(m.shows_a_pin());
+    }
+
+    #[test]
+    fn a_printer_offers_nothing() {
+        let m = ConfigMethods(PRINTER);
+        assert!(!m.push_button());
+        assert!(!m.shows_a_pin());
+        assert!(m.describe().contains("no pairing method"));
+    }
+
+    #[test]
+    fn a_composite_method_needs_both_its_bits() {
+        // 0x0200 alone is half of PHYSICAL_PUSH_BUTTON; on its own it must not
+        // read as one.
+        assert!(!ConfigMethods(0x0200).has(ConfigMethods::PHYSICAL_PUSH_BUTTON));
+        assert!(ConfigMethods(0x0280).has(ConfigMethods::PHYSICAL_PUSH_BUTTON));
+    }
+
+    #[test]
+    fn methods_are_described_in_words() {
+        assert_eq!(ConfigMethods(ADAPTER).describe(), "display, push-button");
+        assert_eq!(ConfigMethods(FIRE_TV).describe(), "display, keypad");
+    }
+}

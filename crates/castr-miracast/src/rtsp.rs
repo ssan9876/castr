@@ -357,6 +357,13 @@ pub enum Action {
     Send(Message),
     /// Media may start flowing; the caller opens its RTP socket.
     Play,
+    /// The display asked for a keyframe and the encoder must produce one.
+    ///
+    /// A sink that joins a stream part-way through a group of pictures has
+    /// nothing to decode from and shows black until an IDR arrives. Answering
+    /// `wfd_idr_request` with `200 OK` and doing nothing is how a session runs
+    /// to completion, exchanging keep-alives, with no picture ever appearing.
+    Keyframe,
     Teardown(&'static str),
 }
 

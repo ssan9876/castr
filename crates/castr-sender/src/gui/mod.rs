@@ -248,8 +248,14 @@ impl App {
                         Duration::from_secs(60),
                     );
                     let ask: castr_wifidirect_win::radio::PinSource = Arc::new(ask_pin);
-                    let connection =
-                        castr_wifidirect_win::radio::connect(&name, wait, &ask)?;
+                    // Auto: the button when the display offers one, so the PIN
+                    // box only ever appears for a display that needs it.
+                    let connection = castr_wifidirect_win::radio::connect(
+                        &name,
+                        wait,
+                        &ask,
+                        castr_wifidirect_win::select::Preference::Auto,
+                    )?;
                     set_stage(format!("Connected to {name}; negotiating"));
                     let addr = std::net::SocketAddr::new(
                         connection.remote_ip(),

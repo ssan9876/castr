@@ -61,6 +61,29 @@ fn display_caps(info: &DeviceInformation) -> Option<wfd::DeviceCaps> {
     None
 }
 
+/// How this device is willing to be paired with, from its WPS element.
+///
+/// Read from the same beacon as the Wi-Fi Display element and before
+/// connecting, so the ceremony can be chosen rather than assumed.
+fn pairing_methods(info: &DeviceInformation) -> Option<wfd::ConfigMethods> {
+    let elements = WiFiDirectInformationElement::CreateFromDeviceInformation(info).ok()?;
+    for e in &elements {
+        let Some(oui) = e.Oui().ok().and_then(|b| buffer_bytes(&b).ok()) else {
+            continue;
+        };
+        if oui.as_slice() != wfd::WPS_OUI || e.OuiType().unwrap_or(0) != wfd::WPS_OUI_TYPE {
+            continue;
+        }
+        let Some(value) = e.Value().ok().and_then(|b| buffer_bytes(&b).ok()) else {
+            continue;
+        };
+        if let Some(m) = wfd::parse_config_methods(&value) {
+            return Some(m);
+        }
+    }
+    None
+}
+
 /// Everything Wi-Fi Direct can currently see, display or not.
 ///
 /// **Slow**: about 50 seconds against the four devices in range here, and the
@@ -86,6 +109,7 @@ pub fn discover() -> anyhow::Result<Vec<Candidate>> {
             id: d.Id()?.to_string(),
             name: d.Name()?.to_string(),
             caps: display_caps(&d),
+            pairing: pairing_methods(&d),
         });
     }
     Ok(out)
@@ -158,23 +182,43 @@ pub fn connect(
     name: &str,
     wait: WaitPolicy,
     pin: &PinSource,
+    preference: select::Preference,
 ) -> anyhow::Result<Connection> {
     let target = find(name, wait)?;
-    match bring_up(&target, pin) {
+    let was_paired = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
+        .and_then(|op| op.get())
+        .and_then(|info| info.Pairing()?.IsPaired())
+        .unwrap_or(false);
+
+    match bring_up(&target, pin, preference) {
         Ok(c) => Ok(c),
         Err(e) => {
             // Credentials for a group that no longer exists look exactly like a
             // network that is not there, and produce an endless "connecting"
-            // with nothing anywhere to explain it. One retry from scratch is
-            // worth the PIN prompt it costs when the failure was transient.
+            // with nothing anywhere to explain it.
+            //
+            // Retrying from scratch used to be gated on the radio's own words
+            // matching a known phrase, because re-pairing cost somebody a PIN
+            // prompt. A wireless display adapter turned out to invalidate its
+            // pairing after every session, and to describe that as "the
+            // operation was cancelled" - which matches no phrase at all.
+            //
+            // So the gate is now the *cost* rather than the wording: when the
+            // display pairs by button, re-pairing is free and unattended, and
+            // there is no reason not to try. A display that would prompt for a
+            // PIN still needs the wording to justify the interruption.
             let reason = last_wlan_failure().unwrap_or_default();
-            if failure::looks_like_stale_credentials(&reason) {
+            let repairing_is_free = matches!(
+                select::choose_ceremony(target.pairing, preference),
+                select::Ceremony::PushButton
+            );
+            if was_paired && (repairing_is_free || failure::looks_like_stale_credentials(&reason)) {
                 tracing::warn!(
-                    "wifidirect: association failed ({reason}); the stored pairing looks stale, \
-                     forgetting it and trying once more"
+                    "wifidirect: association failed ({reason}); forgetting the stored pairing \
+                     and trying once more"
                 );
                 unpair(&target)?;
-                return bring_up(&target, pin);
+                return bring_up(&target, pin, preference);
             }
             Err(e)
         }
@@ -213,6 +257,7 @@ fn unpair(target: &Candidate) -> anyhow::Result<()> {
 fn bring_up(
     target: &Candidate,
     pin: &PinSource,
+    preference: select::Preference,
 ) -> anyhow::Result<Connection> {
     let id = HSTRING::from(&target.id);
     let info = DeviceInformation::CreateFromIdAsync(&id)?
@@ -220,7 +265,19 @@ fn bring_up(
         .with_context(|| format!("{}: reading {:?}", Stage::Discovery, target.name))?;
 
     if !info.Pairing()?.IsPaired()? {
-        pair_with_pin(&info, target, pin)?;
+        let ceremony = select::choose_ceremony(target.pairing, preference);
+        tracing::info!(
+            "wifidirect: pairing with {:?} by {ceremony:?}; it offers {}",
+            target.name,
+            target
+                .pairing
+                .map(|m| m.describe())
+                .unwrap_or_else(|| "nothing it will admit to".into())
+        );
+        match ceremony {
+            select::Ceremony::PushButton => pair_with_push_button(&info, target)?,
+            select::Ceremony::Pin => pair_with_pin(&info, target, pin)?,
+        }
     }
 
     let device = WiFiDirectDevice::FromIdAsync(&id)?
@@ -265,6 +322,56 @@ fn bring_up(
         caps: target.caps,
         up,
     })
+}
+
+/// Pairs by confirmation, with no PIN for anyone to read.
+///
+/// What a wireless display adapter actually wants: it shows a "ready to
+/// connect" screen and mints a PIN per attempt that is often never displayed,
+/// so the PIN ceremony cannot be completed by a person looking at it. The
+/// button is metaphorical here - Windows confirms on our behalf - which is why
+/// this needs nobody present at all.
+fn pair_with_push_button(info: &DeviceInformation, target: &Candidate) -> anyhow::Result<()> {
+    let params = WiFiDirectConnectionParameters::new()?;
+    params.SetGroupOwnerIntent(0)?;
+    let methods = params.PreferenceOrderedConfigurationMethods()?;
+    methods.Clear()?;
+    methods.Append(WiFiDirectConfigurationMethod::PushButton)?;
+
+    let custom: DeviceInformationCustomPairing = info.Pairing()?.Custom()?;
+    custom.PairingRequested(&TypedEventHandler::<
+        DeviceInformationCustomPairing,
+        DevicePairingRequestedEventArgs,
+    >::new(move |_, args| {
+        if let Some(args) = args.as_ref() {
+            args.Accept()?;
+        }
+        Ok(())
+    }))?;
+
+    let result = custom
+        .PairWithProtectionLevelAndSettingsAsync(
+            DevicePairingKinds::ConfirmOnly,
+            DevicePairingProtectionLevel::Default,
+            &params,
+        )?
+        .get()?;
+    let status = result.Status()?;
+    if status != DevicePairingResultStatus::Paired
+        && status != DevicePairingResultStatus::AlreadyPaired
+    {
+        let reason = last_wlan_failure()
+            .map(|r| format!("; the radio said: {r}"))
+            .unwrap_or_default();
+        bail!(
+            "{}: {:?} - {}{reason}. If the display has a physical button for \
+             pairing, press it and try again",
+            Stage::Pairing,
+            target.name,
+            failure::pairing_status(status.0)
+        );
+    }
+    Ok(())
 }
 
 fn pair_with_pin(
@@ -431,191 +538,44 @@ mod tests {
 }
 
 #[cfg(test)]
-mod wps_probe {
+mod unpair_probe {
     use super::*;
 
-    /// What pairing ceremonies each device in range actually offers.
+    /// Forget a display, so the next connection pairs from scratch.
     ///
-    /// The WPS information element (OUI 00:50:F2, type 4) carries a Config
-    /// Methods attribute, 0x1008, as a two-byte bitmask. Reading it says
-    /// whether a display wants a PIN, a button press, or something we cannot
-    /// do - which is the difference between pairing and failing.
+    /// Diagnostic for a display that advertises but will not associate: the
+    /// stored credentials may be for a group that no longer exists, which
+    /// `connect` only retries automatically when the radio's own words match
+    /// the stale-credential heuristic - and "the operation was cancelled" does
+    /// not.
     ///
-    /// `cargo test -p castr-wifidirect-win wps -- --ignored --nocapture`
+    /// `cargo test -p castr-wifidirect-win unpair_probe -- --ignored --nocapture`
     #[test]
     #[ignore]
-    fn what_pairing_methods_are_offered() {
-        let selector = WiFiDirectDevice::GetDeviceSelector2(
-            WiFiDirectDeviceSelectorType::AssociationEndpoint,
-        )
-        .unwrap();
-        let found = DeviceInformation::FindAllAsyncAqsFilter(&selector)
+    fn forget_the_display() {
+        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
+        let target = find(&name, WaitPolicy::new(Duration::from_secs(90))).expect("find");
+        let info = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
             .unwrap()
             .get()
             .unwrap();
-        for d in &found {
-            let name = d.Name().map(|n| n.to_string()).unwrap_or_default();
-            let paired = d.Pairing().and_then(|p| p.IsPaired()).unwrap_or(false);
-            let can_pair = d.Pairing().and_then(|p| p.CanPair()).unwrap_or(false);
-            let mut methods = None;
-            if let Ok(elements) = WiFiDirectInformationElement::CreateFromDeviceInformation(&d) {
-                for e in &elements {
-                    let oui = e.Oui().ok().and_then(|b| buffer_bytes(&b).ok());
-                    let Some(oui) = oui else { continue };
-                    // WPS: 00 50 F2, type 4.
-                    if oui.as_slice() != [0x00, 0x50, 0xF2] || e.OuiType().unwrap_or(0) != 4 {
-                        continue;
-                    }
-                    let Some(value) = e.Value().ok().and_then(|b| buffer_bytes(&b).ok()) else {
-                        continue;
-                    };
-                    // Attributes are id(2) len(2) body, big endian throughout.
-                    let mut i = 0usize;
-                    while i + 4 <= value.len() {
-                        let id = u16::from_be_bytes([value[i], value[i + 1]]);
-                        let len = u16::from_be_bytes([value[i + 2], value[i + 3]]) as usize;
-                        let body = &value[i + 4..(i + 4 + len).min(value.len())];
-                        if id == 0x1008 && body.len() >= 2 {
-                            methods = Some(u16::from_be_bytes([body[0], body[1]]));
-                        }
-                        i += 4 + len;
-                    }
-                }
-            }
-            let described = methods.map(describe_config_methods).unwrap_or_else(|| {
-                "no WPS element (not advertising how to pair)".into()
-            });
-            println!("{name:<34} paired={paired} can_pair={can_pair}  {described}");
+        println!(
+            "before: paired={:?} can_pair={:?}",
+            info.Pairing().and_then(|p| p.IsPaired()),
+            info.Pairing().and_then(|p| p.CanPair())
+        );
+        match unpair(&target) {
+            Ok(()) => println!("unpaired {name}"),
+            Err(e) => println!("unpair failed: {e:#}"),
         }
-    }
-
-    fn describe_config_methods(bits: u16) -> String {
-        let mut names = Vec::new();
-        for (bit, name) in [
-            (0x0001, "USB"),
-            (0x0002, "Ethernet"),
-            (0x0004, "Label"),
-            (0x0008, "Display"),
-            (0x0010, "ExternalNFCToken"),
-            (0x0020, "IntegratedNFCToken"),
-            (0x0040, "NFCInterface"),
-            (0x0080, "PushButton"),
-            (0x0100, "Keypad"),
-            (0x0280, "PhysicalPushButton"),
-            (0x2008, "VirtualDisplay"),
-            (0x0480, "VirtualPushButton"),
-        ] {
-            if bits & bit == bit {
-                names.push(name);
-            }
-        }
-        format!("config methods 0x{bits:04x} = {}", names.join(", "))
-    }
-}
-
-#[cfg(test)]
-mod rtsp_probe {
-    use super::*;
-    use std::net::{SocketAddr, TcpStream};
-
-    /// When does a display's RTSP server actually start accepting?
-    ///
-    /// A wireless display adapter refused the connection outright the instant
-    /// its group came up. Either it listens on a different port than the one
-    /// it advertises, or its server is simply not up yet - and those want
-    /// opposite fixes, so this measures rather than guesses.
-    ///
-    /// Needs the display paired already:
-    /// `cargo test -p castr-wifidirect-win rtsp -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn when_does_the_display_start_listening() {
-        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
-        let refuse: PinSource = Arc::new(|| {
-            anyhow::bail!("this probe expects the display to be paired already")
-        });
-        let wait = WaitPolicy::new(Duration::from_secs(90));
-        let connection = connect(&name, wait, &refuse).expect("connecting to the display");
-        let ip = connection.remote_ip();
-        let advertised = connection.rtsp_port();
-        println!("group up at {ip}, advertised RTSP port {advertised}");
-
-        // Every port a Wi-Fi Display sink is plausibly on, plus the one it says.
-        let ports = [advertised, 7236, 554, 7100, 8554, 5000];
-        let started = Instant::now();
-        let mut open: Vec<(u16, f32)> = Vec::new();
-        while started.elapsed() < Duration::from_secs(45) {
-            for p in ports {
-                if open.iter().any(|(q, _)| *q == p) {
-                    continue;
-                }
-                let addr = SocketAddr::new(ip, p);
-                if TcpStream::connect_timeout(&addr, Duration::from_millis(400)).is_ok() {
-                    let at = started.elapsed().as_secs_f32();
-                    println!("port {p} accepted at {at:.1}s");
-                    open.push((p, at));
-                }
-            }
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        if open.is_empty() {
-            println!("no port accepted within 45s (advertised {advertised})");
-        }
-        drop(connection);
-    }
-}
-
-#[cfg(test)]
-mod address_probe {
-    use super::*;
-
-    /// Who is actually at each end of the group?
-    ///
-    /// `address_of` takes the first remote host name it finds and never looks
-    /// at the local one. If the roles came out the other way round - us as
-    /// group owner - then "remote" could be our own address, and a connection
-    /// refused by our own machine looks identical to one refused by a display.
-    ///
-    /// `cargo test -p castr-wifidirect-win address_probe -- --ignored --nocapture`
-    #[test]
-    #[ignore]
-    fn who_is_at_each_end() {
-        let name = std::env::var("CASTR_PROBE_DISPLAY").unwrap_or_else(|_| "MR-A202".into());
-        let refuse: PinSource =
-            Arc::new(|| anyhow::bail!("this probe expects the display to be paired"));
-        let target = find(&name, WaitPolicy::new(Duration::from_secs(90))).expect("find");
-        let id = HSTRING::from(&target.id);
-        let info = DeviceInformation::CreateFromIdAsync(&id).unwrap().get().unwrap();
-        if !info.Pairing().unwrap().IsPaired().unwrap() {
-            pair_with_pin(&info, &target, &refuse).expect("pair");
-        }
-        let device = WiFiDirectDevice::FromIdAsync(&id).unwrap().get().expect("group");
-        std::thread::sleep(Duration::from_secs(3));
-        let pairs = device.GetConnectionEndpointPairs().unwrap();
-        for p in &pairs {
-            let local = p
-                .LocalHostName()
-                .and_then(|h| h.ToString())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| "?".into());
-            let remote = p
-                .RemoteHostName()
-                .and_then(|h| h.ToString())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| "?".into());
-            println!("endpoint pair: local={local}  remote={remote}");
-        }
-        let out = std::process::Command::new("ipconfig").output().unwrap();
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut adapter = String::new();
-        for line in text.lines() {
-            if line.contains("adapter") {
-                adapter = line.trim().to_string();
-            }
-            if line.contains("IPv4 Address") && adapter.to_lowercase().contains("wi-fi") {
-                println!("{adapter} -> {}", line.trim());
-            }
-        }
-        drop(device);
+        let after = DeviceInformation::CreateFromIdAsync(&HSTRING::from(&target.id))
+            .unwrap()
+            .get()
+            .unwrap();
+        println!(
+            "after:  paired={:?} can_pair={:?}",
+            after.Pairing().and_then(|p| p.IsPaired()),
+            after.Pairing().and_then(|p| p.CanPair())
+        );
     }
 }
