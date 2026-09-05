@@ -60,9 +60,18 @@ decision in pure code, every socket in a thin shell.
 | `control/client.rs` | no | Read the record, connect, print |
 
 Three quarters of this is testable without a socket, a radio or a display, and
-the remaining quarter is testable on Linux as well as Windows, which matters:
-the workspace suite runs in the Docker image and the control channel should not
-be another thing only provable by hand on hardware.
+the remaining quarter needs only loopback — no radio and no display — so it is
+provable in the ordinary suite rather than by hand on hardware.
+
+**Correction, found while verifying.** An earlier draft of this section claimed
+the control channel would also be exercised on Linux. It is not.
+`scripts/pi/test-linux.sh` builds `castr-codec-v4l2` and `castr-miracast` only;
+`castr-sender` is not in the Docker image, so nothing here runs there. The code
+is portable — `std::net`, no platform call — but portable is not the same as
+exercised, and the difference is exactly the kind of claim this project writes
+verification documents to avoid making. Moving `control` into a crate the Linux
+image builds would close it, and is not worth doing until something else needs
+that crate.
 
 ## 5. The control channel
 
@@ -222,11 +231,12 @@ malformed field, the staleness decision, every request form including a wrong
 token and a truncated line, and the statistics accumulator including the
 derived rate over a window.
 
-Impure, and tested in-process on any platform — so it runs in the Linux Docker
-image, not only on the machine with the radio: a server bound to loopback, a
-client that connects and sends `STOP`, and the assertion that the command
-arrives on the channel; a `STATUS` that returns the published snapshot; a wrong
-token refused; a record left behind by a server that is gone, cleaned up.
+Impure, and tested in-process against loopback rather than against a display: a
+server bound to loopback, a client that connects and sends `STOP`, and the
+assertion that the command arrives on the channel; a `STATUS` that returns the
+published snapshot; a wrong token refused; a record left behind by a server
+that is gone, cleaned up. These run wherever `castr-sender` builds, which today
+means Windows (see the correction in §4).
 
 Then hardware, which is the only thing that proves it. Against the Pi:
 

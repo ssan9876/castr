@@ -303,6 +303,13 @@ saving, driver age � and offers to fix the safe ones.
 - A cast to a Miracast display has been verified for ten minutes against castr's
   own sink, with no dropped frames, but its audio has never been listened to and
   lip sync is unmeasured.
+- The bitrate budget caps *video* at the ceiling the display advertises, but
+  the wire also carries uncompressed LPCM audio (1.536 Mbps) and MPEG-TS/RTP/IP
+  framing on top. Measured against the Pi, which advertises 10 Mbps: 8 Mbps of
+  video becomes about 10.4 Mbps sent. The Pi does not police its figure and
+  drops nothing, but a display that enforces its own ceiling may refuse us.
+  Unresolved until a real display can be tested — see
+  `docs/superpowers/verification/2026-09-04-castr-miracast-control-e2e.md`.
 - Lip sync has not been measured against ITU-R BT.1359 in either mode, and
   Miracast audio is carried as uncompressed LPCM.
 
