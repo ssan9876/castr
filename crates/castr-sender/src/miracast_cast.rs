@@ -9,15 +9,18 @@
 //! Infrastructure and over a Wi-Fi Direct group is ordinary Miracast - the
 //! media path does not care which.
 
+use crate::control::server::{Command, ControlServer, Published};
+use crate::control::stats::{Context as StatsContext, Stats};
 use anyhow::Context;
 use castr_media::codec::{EncoderConfig, Mode, PixelFormat, RawFrame, VideoEncoder};
 use castr_miracast::rtsp::{self, Action};
 use castr_miracast::source::{rtp_pack::Packetizer, session::*, ts_mux::Muxer};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// How long to wait for the display to answer at all.
@@ -36,6 +39,11 @@ pub struct MiracastOptions {
     /// What the display's advertisement said it can carry, when the radio read
     /// one. Nothing here invents a ceiling of its own.
     pub ceiling_mbps: Option<u16>,
+    /// What to call this display in the status readout: its name when we found
+    /// it by one, otherwise its address.
+    pub display: String,
+    /// Where the control record goes, so another process can find this cast.
+    pub config_dir: PathBuf,
 }
 
 impl Default for MiracastOptions {
@@ -46,17 +54,38 @@ impl Default for MiracastOptions {
             fps: 30,
             mode: Mode::Quality,
             ceiling_mbps: None,
+            display: String::new(),
+            config_dir: PathBuf::from("."),
         }
     }
 }
 
 enum Media {
-    Video { data: Vec<u8>, pts_us: u64 },
-    Audio { samples: Vec<i16>, pts_us: u64 },
+    Video {
+        data: Vec<u8>,
+        pts_us: u64,
+        /// The desktop did not change, so the last frame was sent again. A
+        /// still screen is the normal case and looks identical to a stalled
+        /// capture unless this is counted.
+        repeated: bool,
+    },
+    Audio {
+        samples: Vec<i16>,
+        pts_us: u64,
+    },
 }
 
 /// Casts this desktop to the Miracast display at `addr` until it ends.
-pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
+///
+/// `cmds` carries `Stop` from `miracast-stop` and from Ctrl-C; `cmd_tx` is the
+/// same channel's sending half, handed to the control listener. Both are made
+/// by the caller so the Ctrl-C handler can exist before the cast does.
+pub fn cast_to(
+    addr: SocketAddr,
+    opts: MiracastOptions,
+    cmd_tx: mpsc::Sender<Command>,
+    cmds: mpsc::Receiver<Command>,
+) -> anyhow::Result<()> {
     let mut sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .with_context(|| format!("connect: {addr} did not answer within {CONNECT_TIMEOUT:?}"))?;
     sock.set_read_timeout(Some(TICK))?;
@@ -81,6 +110,36 @@ pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
     let mut rtp_target: Option<SocketAddr> = None;
     let started = Instant::now();
 
+    // The control channel is an accessory: if it cannot bind, the cast runs
+    // anyway, `miracast-stop` stops working, Ctrl-C still does, and the log
+    // says why.
+    let published: Published = Arc::new(Mutex::new(None));
+    let display = if opts.display.is_empty() {
+        addr.to_string()
+    } else {
+        opts.display.clone()
+    };
+    let control = match ControlServer::start(
+        &opts.config_dir,
+        &display,
+        &addr.to_string(),
+        cmd_tx,
+        published.clone(),
+    ) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            tracing::warn!("miracast: no control channel, so miracast-stop will not work: {e:#}");
+            None
+        }
+    };
+    let mut stats = Stats::new();
+    let mut stats_ctx = StatsContext {
+        display,
+        address: addr.to_string(),
+        ceiling_mbps: opts.ceiling_mbps,
+        ..StatsContext::default()
+    };
+
     write_actions(&mut sock, session.start())?;
 
     let mut buf = Vec::new();
@@ -90,6 +149,16 @@ pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
             if started.elapsed() >= limit {
                 break "the requested duration elapsed";
             }
+        }
+
+        // `miracast-stop`, or Ctrl-C. Both leave by the same door `--duration`
+        // does, so teardown is the code that already works.
+        let mut stopped = false;
+        while let Ok(Command::Stop) = cmds.try_recv() {
+            stopped = true;
+        }
+        if stopped {
+            break "stopped by request";
         }
 
         // Anything the display has to say.
@@ -146,18 +215,44 @@ pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
         if let Some(target) = rtp_target {
             while let Ok(unit) = media_rx.try_recv() {
                 let (packets, pts_us) = match unit {
-                    Media::Video { data, pts_us } => (muxer.push_video(&data, pts_us), pts_us),
+                    Media::Video {
+                        data,
+                        pts_us,
+                        repeated,
+                    } => {
+                        stats.video(repeated);
+                        (muxer.push_video(&data, pts_us), pts_us)
+                    }
                     Media::Audio { samples, pts_us } => {
+                        stats.audio();
                         (muxer.push_audio(&samples, pts_us), pts_us)
                     }
                 };
                 let stamp = (pts_us * 9 / 100) as u32;
+                let (mut sent, mut bytes) = (0u64, 0u64);
                 for datagram in packetizer.push(&packets, stamp) {
-                    if let Err(e) = rtp_sock.send_to(&datagram, target) {
-                        tracing::warn!("miracast: sending media: {e:#}");
+                    match rtp_sock.send_to(&datagram, target) {
+                        Ok(n) => {
+                            sent += 1;
+                            bytes += n as u64;
+                        }
+                        Err(e) => tracing::warn!("miracast: sending media: {e:#}"),
                     }
                 }
+                if sent > 0 {
+                    stats.sent(sent, bytes, Instant::now());
+                }
             }
+        }
+
+        // What `miracast-status` will report if it asks in the next moment.
+        let now = Instant::now();
+        stats_ctx.mode = session
+            .chosen()
+            .map(|m| format!("{}x{}@{}", m.width, m.height, m.fps));
+        stats_ctx.last_heard = session.last_heard();
+        if let Ok(mut slot) = published.lock() {
+            *slot = Some(stats.snapshot(now, started, &stats_ctx));
         }
     };
 
@@ -167,6 +262,9 @@ pub fn cast_to(addr: SocketAddr, opts: MiracastOptions) -> anyhow::Result<()> {
     let bye = session.teardown();
     let _ = sock.write_all(bye.format().as_bytes());
     tracing::info!("miracast: teardown: {reason}");
+    // Takes the record with it, so the next command sees no cast rather than a
+    // stale one.
+    drop(control);
     Ok(())
 }
 
@@ -242,6 +340,8 @@ fn start_media(
             let interval = Duration::from_micros(1_000_000 / fps.max(1) as u64);
             let mut last: Option<RawFrame> = None;
             let mut next_due = Instant::now();
+            // Whether anything new has arrived since the last frame we encoded.
+            let mut fresh = false;
             while !vstop.load(Ordering::Relaxed) {
                 let now = start.elapsed().as_micros() as u64;
                 // Duplication hands over a frame only when the desktop changes,
@@ -250,7 +350,10 @@ fn start_media(
                 // is why the last frame is repeated rather than nothing sent.
                 let wait = next_due.saturating_duration_since(Instant::now());
                 match cap.next_frame(wait.as_millis().max(1) as u32, now) {
-                    Ok(Some(f)) => last = Some(f),
+                    Ok(Some(f)) => {
+                        last = Some(f);
+                        fresh = true;
+                    }
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!("miracast: capture: {e:#}");
@@ -286,12 +389,14 @@ fn start_media(
                     frame
                 };
                 let input = castr_media::convert::convert(&scaled, want);
+                let repeated = !std::mem::take(&mut fresh);
                 match enc.encode(&input) {
                     Ok(Some(out)) => {
                         if vtx
                             .send(Media::Video {
                                 data: out.data,
                                 pts_us: out.timestamp_us,
+                                repeated,
                             })
                             .is_err()
                         {

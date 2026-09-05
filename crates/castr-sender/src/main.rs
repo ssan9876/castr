@@ -1,4 +1,5 @@
 mod cast;
+mod control;
 mod diagnose;
 mod gui;
 mod miracast_cast;
@@ -43,6 +44,10 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = ModeArg::Quality)]
         mode: ModeArg,
     },
+    /// Report what the running Miracast cast is sending
+    MiracastStatus,
+    /// Stop the running Miracast cast
+    MiracastStop,
     /// Cast the screen to a receiver
     Cast {
         target: String,
@@ -69,6 +74,26 @@ impl From<ModeArg> for Mode {
             ModeArg::Game => Mode::Game,
             ModeArg::Quality => Mode::Quality,
         }
+    }
+}
+
+/// What to say when there was nothing to talk to. Shared by `miracast-status`
+/// and `miracast-stop`, which have the same three ways of finding nothing.
+fn print_absent(report: control::client::Report) {
+    use control::client::Report;
+    match report {
+        Report::NoCast => println!("no Miracast cast is running"),
+        Report::Stale { started: Some(t) } => println!(
+            "no Miracast cast is running; cleaned up a stale record from a cast \
+             started {t} (unix seconds)"
+        ),
+        Report::Stale { started: None } => {
+            println!("no Miracast cast is running; cleaned up an unreadable record")
+        }
+        Report::Answered(control::wire::Response::Err(why)) => {
+            println!("the running cast refused: {why}")
+        }
+        Report::Answered(control::wire::Response::Ok(_)) => unreachable!("handled by the caller"),
     }
 }
 
@@ -155,6 +180,35 @@ fn main() -> anyhow::Result<()> {
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok())
                 .unwrap_or(0);
+            // One cast at a time: there is one radio, one group and one
+            // encoder on the monitor. A stale record is cleaned up here rather
+            // than blocking the cast someone actually asked for.
+            if let Some(running) = control::client::running(&config_dir) {
+                anyhow::bail!(
+                    "already casting to {:?} (since {}); stop it with `castr-sender miracast-stop`",
+                    running.display,
+                    running.address
+                );
+            }
+
+            let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<control::server::Command>();
+            {
+                // The Miracast path had no Ctrl-C handler at all, so Ctrl-C
+                // killed the process before TEARDOWN was written and before
+                // the Wi-Fi Direct group was released - leaving the display
+                // believing a session was live.
+                let tx = cmd_tx.clone();
+                rt.spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        eprintln!("stopping the cast; press Ctrl-C again to abort");
+                        let _ = tx.send(control::server::Command::Stop);
+                    }
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        std::process::exit(130);
+                    }
+                });
+            }
+
             let mut opts = miracast_cast::MiracastOptions {
                 duration: duration.map(Duration::from_secs),
                 output,
@@ -163,9 +217,11 @@ fn main() -> anyhow::Result<()> {
                 // Filled in below when the radio has read the display's own
                 // advertisement; an address alone tells us nothing about it.
                 ceiling_mbps: None,
+                display: target.clone(),
+                config_dir: config_dir.clone(),
             };
             match addr {
-                Some(addr) => miracast_cast::cast_to(addr, opts),
+                Some(addr) => miracast_cast::cast_to(addr, opts, cmd_tx, cmd_rx),
                 None => {
                     let wait = castr_wifidirect_win::select::WaitPolicy::new(
                         Duration::from_secs(60),
@@ -182,12 +238,32 @@ fn main() -> anyhow::Result<()> {
                         connection.rtsp_port(),
                     );
                     opts.ceiling_mbps = connection.max_throughput_mbps();
-                    let result = miracast_cast::cast_to(addr, opts);
+                    let result = miracast_cast::cast_to(addr, opts, cmd_tx, cmd_rx);
                     // The group goes when this does, which is the teardown.
                     drop(connection);
                     result
                 }
             }
+        }
+        Some(Cmd::MiracastStatus) => {
+            match control::client::talk(&config_dir, control::wire::Request::Status)? {
+                control::client::Report::Answered(control::wire::Response::Ok(body)) => {
+                    for (k, v) in control::stats::fields(&body) {
+                        println!("{k:<16} {v}");
+                    }
+                }
+                other => print_absent(other),
+            }
+            Ok(())
+        }
+        Some(Cmd::MiracastStop) => {
+            match control::client::talk(&config_dir, control::wire::Request::Stop)? {
+                control::client::Report::Answered(control::wire::Response::Ok(_)) => {
+                    println!("stopping the cast");
+                }
+                other => print_absent(other),
+            }
+            Ok(())
         }
         Some(Cmd::Cast {
             target,

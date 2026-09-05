@@ -71,6 +71,8 @@ or any other Miracast sink rather than to a castr receiver:
 castr-sender miracast-list
 castr-sender miracast-cast "Living Room TV" [--mode quality|game] [--duration SECS]
 castr-sender miracast-cast 192.168.173.1:7236       # or by address
+castr-sender miracast-status                        # what it is sending
+castr-sender miracast-stop                          # end it
 ```
 
 `miracast-list` shows the Wi-Fi Direct devices in range and which of them are
@@ -86,6 +88,30 @@ encode that the display's advertised bandwidth will carry, and takes the first
 the display also offers. `--mode quality` prefers a bigger picture (1080p30 over
 720p60), `--mode game` a faster one — the same distinction the toggle makes for
 castr's own protocol.
+
+A cast ends on `--duration`, on Ctrl-C, or on `miracast-stop` from another
+shell, and all three tear the session down properly and drop the Wi-Fi Direct
+group. Only one Miracast cast runs at a time; a second is refused, naming the
+display already being cast to.
+
+One caveat about Ctrl-C, which is PowerShell's behaviour rather than castr's:
+**if you redirect the output to a file in PowerShell** (`castr-sender
+miracast-cast ... > log.txt`), PowerShell terminates the process on Ctrl-C
+instead of letting it handle the event, so no teardown runs. Without the
+redirect it works, and so does `cmd`. If you want a log *and* a clean exit, stop
+the cast with `miracast-stop` rather than Ctrl-C. A cast killed this way leaves
+a stale record, which the next `miracast-status`, `miracast-stop` or
+`miracast-cast` cleans up by itself.
+
+`miracast-status` reports the negotiated mode, what the display said it can
+carry, the throughput actually being sent, and how long ago the display last
+answered a keep-alive. **Every number except that last one is sent-side.**
+Wi-Fi Display makes the source authoritative and gives it no back-channel of
+receiver statistics, so unlike a cast to a castr receiver there is no round
+trip time and no loss figure — nothing here knows what arrived, only what was
+sent. `repeated_frames` counts frames re-sent because the desktop did not
+change, which is worth watching: a still screen is normal, and without that
+count it looks identical to a capture that has stopped.
 
 Given an address instead, the radio is skipped entirely: on the ordinary LAN
 that is Miracast over Infrastructure, and over an existing Wi-Fi Direct group it
@@ -286,6 +312,13 @@ saving, driver age � and offers to fix the safe ones.
 - A cast to a Miracast display has been verified for ten minutes against castr's
   own sink, with no dropped frames, but its audio has never been listened to and
   lip sync is unmeasured.
+- The bitrate budget caps *video* at the ceiling the display advertises, but
+  the wire also carries uncompressed LPCM audio (1.536 Mbps) and MPEG-TS/RTP/IP
+  framing on top. Measured against the Pi, which advertises 10 Mbps: 8 Mbps of
+  video becomes about 10.4 Mbps sent. The Pi does not police its figure and
+  drops nothing, but a display that enforces its own ceiling may refuse us.
+  Unresolved until a real display can be tested — see
+  `docs/superpowers/verification/2026-09-04-castr-miracast-control-e2e.md`.
 - Lip sync has not been measured against ITU-R BT.1359 in either mode, and
   Miracast audio is carried as uncompressed LPCM.
 
