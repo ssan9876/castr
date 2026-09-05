@@ -357,6 +357,12 @@ pub enum Action {
     Send(Message),
     /// Media may start flowing; the caller opens its RTP socket.
     Play,
+    /// The display asked the source to send at most this many kbps.
+    ///
+    /// A sink watching its own loss asks for less. Ignoring it means sending
+    /// the same rate into a link that is already failing, until the session
+    /// drops - which is the difference between degrading and disconnecting.
+    Bitrate(u32),
     /// The display asked for a keyframe and the encoder must produce one.
     ///
     /// A sink that joins a stream part-way through a group of pictures has

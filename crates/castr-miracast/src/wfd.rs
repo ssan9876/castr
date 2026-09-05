@@ -536,3 +536,74 @@ mod config_method_tests {
         assert_eq!(ConfigMethods(FIRE_TV).describe(), "display, keypad");
     }
 }
+
+/// Reads a mid-session bitrate request out of an RTSP body.
+///
+/// A sink watching its own loss asks the source to send less: our own sink
+/// does exactly this, logging "loss is up, asking the source for 2000 kbps".
+/// A source that reads this only once, from the initial capabilities, and
+/// ignores every later one has no way to ride out a link that is degrading -
+/// it keeps sending the same rate until the session drops.
+///
+/// Returns `None` when the body carries no such request, which is the ordinary
+/// case for every other parameter a display might set.
+pub fn parse_max_bitrate_kbps(body: &str) -> Option<u32> {
+    for line in body.lines() {
+        // A line with no colon is skipped, not fatal: `wfd_idr_request` is a
+        // bare flag and arrives in the same body as this request.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("microsoft_max_bitrate") {
+            return value.trim().parse::<u32>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod bitrate_request_tests {
+    use super::*;
+
+    #[test]
+    fn a_request_is_read() {
+        assert_eq!(
+            parse_max_bitrate_kbps("microsoft_max_bitrate: 2000\r\n"),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn it_is_found_beside_other_parameters() {
+        let body = "wfd_video_formats: 00 00 02 04 00000080\r\n\
+                    microsoft_max_bitrate: 4000\r\n";
+        assert_eq!(parse_max_bitrate_kbps(body), Some(4000));
+    }
+
+    #[test]
+    fn the_name_is_matched_without_regard_to_case() {
+        assert_eq!(
+            parse_max_bitrate_kbps("Microsoft_Max_Bitrate: 1500\r\n"),
+            Some(1500)
+        );
+    }
+
+    #[test]
+    fn a_bare_flag_on_an_earlier_line_does_not_stop_the_search() {
+        // Exactly the body a display sends when it wants both at once.
+        let body = "wfd_idr_request\r\nmicrosoft_max_bitrate: 4000\r\n";
+        assert_eq!(parse_max_bitrate_kbps(body), Some(4000));
+    }
+
+    #[test]
+    fn a_body_without_one_asks_for_nothing() {
+        assert_eq!(parse_max_bitrate_kbps("wfd_idr_request\r\n"), None);
+        assert_eq!(parse_max_bitrate_kbps(""), None);
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_number_is_ignored_rather_than_guessed() {
+        assert_eq!(parse_max_bitrate_kbps("microsoft_max_bitrate: lots\r\n"), None);
+        assert_eq!(parse_max_bitrate_kbps("microsoft_max_bitrate:\r\n"), None);
+    }
+}

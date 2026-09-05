@@ -210,11 +210,19 @@ impl SourceSession {
                     Action::Teardown("session: the display ended the session"),
                 ]
             }
-            // A display asking for a keyframe. It gets one: without it a sink
-            // that joined mid-stream has nothing to decode from, and shows
-            // black through an otherwise healthy session.
-            "SET_PARAMETER" if m.body.contains("wfd_idr_request") => {
-                vec![Action::Send(rtsp::response(200, cseq, "")), Action::Keyframe]
+            // What a display asks of us mid-session. Answering and doing
+            // nothing is how a session stays polite and useless: the sink asks
+            // for a keyframe and sees black, or asks for less bitrate and is
+            // sent the same rate until the link gives out.
+            "SET_PARAMETER" => {
+                let mut actions = vec![Action::Send(rtsp::response(200, cseq, ""))];
+                if m.body.contains("wfd_idr_request") {
+                    actions.push(Action::Keyframe);
+                }
+                if let Some(kbps) = crate::wfd::parse_max_bitrate_kbps(&m.body) {
+                    actions.push(Action::Bitrate(kbps));
+                }
+                actions
             }
             // Never fatal: a display may ask us things we have never seen, and
             // refusing them would refuse the display.
@@ -523,6 +531,38 @@ mod tests {
     }
 
     #[test]
+    fn a_request_to_send_less_reaches_the_encoder() {
+        // Our own sink sends exactly this when its loss rises: "loss is up,
+        // asking the source for 2000 kbps". Answering 200 OK and carrying on
+        // at the old rate is how a struggling link becomes a dropped session.
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        let mut ask = rtsp::request("SET_PARAMETER", "rtsp://x/wfd1.0/streamid=0", 7, "");
+        ask.body = "microsoft_max_bitrate: 2000\r\n".into();
+        let actions = s.on_message(&ask);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Bitrate(2000))),
+            "the bitrate request must reach the encoder"
+        );
+        assert!(sent(&actions)
+            .iter()
+            .any(|m| matches!(m.start, StartLine::Response { status: 200, .. })));
+    }
+
+    #[test]
+    fn a_keyframe_and_a_bitrate_request_together_both_land() {
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        let mut both = rtsp::request("SET_PARAMETER", "rtsp://x/wfd1.0/streamid=0", 8, "");
+        both.body = "wfd_idr_request\r\nmicrosoft_max_bitrate: 4000\r\n".into();
+        let actions = s.on_message(&both);
+        assert!(actions.iter().any(|a| matches!(a, Action::Keyframe)));
+        assert!(actions.iter().any(|a| matches!(a, Action::Bitrate(4000))));
+    }
+
+    #[test]
     fn another_set_parameter_does_not_ask_for_a_keyframe() {
         let mut s = SourceSession::new(cfg());
         s.start();
@@ -614,7 +654,7 @@ mod tests {
                 match action {
                     Action::Send(m) => from_sink.extend(sink.on_message(&m)),
                     Action::Play => source_playing = true,
-                    Action::Keyframe => {}
+                    Action::Keyframe | Action::Bitrate(_) => {}
                     Action::Teardown(why) => panic!("the source tore down: {why}"),
                 }
             }
@@ -622,7 +662,7 @@ mod tests {
                 match action {
                     Action::Send(m) => from_source.extend(source.on_message(&m)),
                     Action::Play => {}
-                    Action::Keyframe => {}
+                    Action::Keyframe | Action::Bitrate(_) => {}
                     Action::Teardown(why) => panic!("the sink tore down: {why}"),
                 }
             }

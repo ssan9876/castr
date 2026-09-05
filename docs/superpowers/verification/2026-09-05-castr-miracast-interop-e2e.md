@@ -31,10 +31,12 @@ twenty sessions to find.
 | 13 | It stays alive through the session | PASS | `keepalive_age_s 4` throughout |
 | 14 | **A picture appears on it** | PASS | Confirmed visually |
 | 15 | Teardown is clean | PASS | `teardown: the requested duration elapsed`, `releasing the group` |
-| 16 | The Pi still works after these changes | **NOT RUN** | The Pi was off the network all session |
-| 17 | Audio is audible on it | NOT RUN | Never listened to |
-| 18 | Lip sync | NOT RUN | Unmeasured, as everywhere else |
-| 19 | HDCP refusal is clean | NOT RUN | It advertises HDCP 2.1 but did not demand it |
+| 16 | A stale pairing is recovered from automatically | PASS | `association failed (The operation was cancelled.); forgetting the stored pairing and trying once more`, then re-paired by button and cast, unattended |
+| 17 | Mid-session bitrate requests are honoured | NOT RUN | Unit-tested. The adapter's link was healthy and it never asked; our own sink does ask, but the Pi was unreachable |
+| 18 | The Pi still works after these changes | **NOT RUN** | The Pi was off the network all session |
+| 19 | Audio is audible on it | NOT RUN | Never listened to |
+| 20 | Lip sync | NOT RUN | Unmeasured, as everywhere else |
+| 21 | HDCP refusal is clean | NOT RUN | It advertises HDCP 2.1 but did not demand it |
 
 ## What the displays in range offer
 
@@ -88,7 +90,7 @@ for one that had already been and gone. Our sink answers M3 whenever it
 arrives. Now M3 follows M2, with a two second grace period so a sink that never
 sends M2 behaves exactly as before.
 
-### 3. Keyframe requests were answered and ignored
+### 3. Requests from the display were answered and ignored
 
 The adapter sent `wfd_idr_request` three times. It fell into the catch-all
 "answer anything we do not recognise with 200 OK" branch, so it got three
@@ -98,6 +100,18 @@ black. `Action::Keyframe` now reaches the encoder, which already had
 `request_keyframe`.
 
 **This is what stood between a healthy-looking session and a picture.**
+
+The same branch swallowed **`microsoft_max_bitrate`**, which is how a sink asks
+a source to send less when its loss rises - our own sink sends exactly that,
+logging "loss is up, asking the source for 2000 kbps". A source that reads the
+bitrate once at M3 and ignores every later request has no way to ride out a
+degrading link; it sends the same rate until the session drops. That is the
+mechanism behind the commonest Miracast complaint of all, "it connects and then
+drops", and castr had no answer to it. `Action::Bitrate` now reaches the
+encoder's existing `set_bitrate`, clamped so a nonsense request cannot stop the
+picture and never above what was negotiated.
+
+Unit-tested only: the adapter's link was healthy and it never asked.
 
 ### 4. The PIN was requested before the display was asked to show one
 

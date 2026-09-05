@@ -170,9 +170,10 @@ impl Session {
         for a in actions {
             match a {
                 Action::Send(m) => out.push(SinkEvent::SendRtsp(m.format())),
-                // A source-side action: the sink is the one that asks for
-                // keyframes, never the one that produces them.
-                Action::Keyframe => {}
+                // Source-side actions: the sink is the one that asks for
+                // keyframes and for less bitrate, never the one that acts on
+                // such a request.
+                Action::Keyframe | Action::Bitrate(_) => {}
                 Action::Play => {
                     self.playing = true;
                     if let Some(mode) = self.negotiation.chosen_video() {

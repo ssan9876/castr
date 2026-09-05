@@ -18,7 +18,7 @@ use castr_miracast::source::{rtp_pack::Packetizer, session::*, ts_mux::Muxer};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,10 @@ const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(20);
 const WFD_RTSP_PORT: u16 = 7236;
 /// How often the session's timers are serviced when nothing is arriving.
 const TICK: Duration = Duration::from_millis(200);
+/// A floor for what a display can ask us down to. Below this the picture is
+/// worthless anyway, and a display asking for nothing at all is more likely
+/// confused than serious.
+const MIN_KBPS: u32 = 1000;
 
 #[derive(Debug, Clone)]
 pub struct MiracastOptions {
@@ -109,6 +113,9 @@ pub fn cast_to(
     let stop = Arc::new(AtomicBool::new(false));
     // Set when the display asks for a keyframe; the encoder thread clears it.
     let want_idr = Arc::new(AtomicBool::new(false));
+    // The bitrate the display last asked for, in kbps; 0 means it has not
+    // asked. The encoder thread applies it and clears it.
+    let want_kbps = Arc::new(AtomicU32::new(0));
     let (media_tx, media_rx) = mpsc::channel::<Media>();
     let mut media_started = false;
     let mut muxer = Muxer::new();
@@ -200,6 +207,7 @@ pub fn cast_to(
                                 media_tx.clone(),
                                 stop.clone(),
                                 want_idr.clone(),
+                                want_kbps.clone(),
                             );
                             tracing::info!(
                                 "miracast: playing {:?} to {}",
@@ -211,6 +219,10 @@ pub fn cast_to(
                     Action::Keyframe => {
                         // The encoder thread notices and forces one.
                         want_idr.store(true, Ordering::SeqCst);
+                    }
+                    Action::Bitrate(kbps) => {
+                        tracing::info!("miracast: the display asked for {kbps} kbps");
+                        want_kbps.store(kbps, Ordering::SeqCst);
                     }
                     Action::Teardown(why) => ended = Some(why),
                 }
@@ -228,6 +240,7 @@ pub fn cast_to(
                 Action::Send(m) => send(&mut sock, &m)?,
                 Action::Play => {}
                 Action::Keyframe => want_idr.store(true, Ordering::SeqCst),
+                Action::Bitrate(kbps) => want_kbps.store(kbps, Ordering::SeqCst),
                 Action::Teardown(why) => ended = Some(why),
             }
         }
@@ -406,6 +419,7 @@ fn start_media(
     tx: mpsc::Sender<Media>,
     stop: Arc<AtomicBool>,
     want_idr: Arc<AtomicBool>,
+    want_kbps: Arc<AtomicU32>,
 ) {
     let mode = session.chosen();
     let (width, height) = mode.map(|m| (m.width, m.height)).unwrap_or((1280, 720));
@@ -511,6 +525,17 @@ fn start_media(
                     tracing::info!("miracast: the display asked for a keyframe");
                     enc.request_keyframe();
                 }
+                // A display asking for less is a link that is already
+                // struggling. Clamped so a nonsense request cannot stop the
+                // picture altogether, and never above what was negotiated.
+                let asked = want_kbps.swap(0, Ordering::SeqCst);
+                if asked > 0 {
+                    let applied = asked.clamp(MIN_KBPS, bitrate_bps / 1000);
+                    match enc.set_bitrate(applied * 1000) {
+                        Ok(()) => tracing::info!("miracast: now encoding at {applied} kbps"),
+                        Err(e) => tracing::warn!("miracast: could not change bitrate: {e:#}"),
+                    }
+                }
                 let repeated = !std::mem::take(&mut fresh);
                 match enc.encode(&input) {
                     Ok(Some(out)) => {
@@ -576,6 +601,7 @@ fn start_media(
     _tx: mpsc::Sender<Media>,
     _stop: Arc<AtomicBool>,
     _want_idr: Arc<AtomicBool>,
+    _want_kbps: Arc<AtomicU32>,
 ) {
     tracing::error!("miracast: casting is Windows-only for now");
 }
