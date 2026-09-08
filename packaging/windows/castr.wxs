@@ -2,8 +2,36 @@
 <!--
   The Windows installer for the castr sender.
 
+  Built twice from this one file, because there are two honest answers to
+  "does installing need administrator rights?":
+
+    per-machine (the default)  Program Files, the system PATH, an all-users
+                               Start Menu entry, and the firewall rule. Needs
+                               elevation, and can be deployed by group policy.
+
+    per-user  (-d PerUser=1)   %LOCALAPPDATA%\Programs\castr, the user's own
+                               PATH and Start Menu. Prompts for nothing at all.
+                               Carries no firewall rule: rules live in the
+                               machine-wide policy store, so there is no such
+                               thing as a per-user one, and no installer can
+                               add one without elevation. The sender's own
+                               `firewall` command, with its `allow` switch,
+                               adds it later, once, from an administrator
+                               terminal - and names whichever exe is actually
+                               running, which the rule below does not.
+
+  What the per-user package costs, precisely: without the rule a Miracast
+  display cannot dial in on 7236, so casting to a real display adapter fails.
+  Casting to a castr receiver, and to castr's own sink, is unaffected - both
+  are dialled out from here.
+
+  The two packages carry different UpgradeCodes and different component GUIDs.
+  They must: the same component GUID pointing at two different directories is
+  a component-rules violation, and Windows would reference-count the exe in
+  Program Files and the one in LocalAppData as though they were one file.
+
   Everything optional is a feature the person installing can decline, and
-  everything this adds outside the install directory - the PATH entry and the
+  everything added outside the install directory - the PATH entry and the
   firewall rule - is removed again on uninstall. Those two are what installers
   most often strand.
 
@@ -14,6 +42,31 @@
 
   Built by scripts/windows/build-msi.ps1, which passes Version and SourceDir.
 -->
+<?ifdef PerUser ?>
+  <?define Scope="perUser"?>
+  <?define UpgradeGuid="3929C37C-E8AA-4340-BB0D-266140DC634A"?>
+  <?define SenderExeGuid="3A88D303-10A0-4677-B766-369F4A6037A1"?>
+  <?define PathGuid="7795E65F-8B81-4C14-8F9F-DDF49DCCF423"?>
+  <?define StartMenuGuid="F53B4B8B-2471-4B5D-A68A-7C73BC2FE7C7"?>
+  <?define DesktopGuid="566B913B-1156-42F8-9956-74AF0FEC0566"?>
+  <?define PathIsSystem="no"?>
+  <?define StateRoot="HKCU"?>
+<?else?>
+  <?define Scope="perMachine"?>
+  <?define UpgradeGuid="5237300B-D9A8-4952-98A2-E5CF9FA3428B"?>
+  <?define SenderExeGuid="2A1B4C6D-8E9F-4A1B-9C2D-3E4F5A6B7C8D"?>
+  <?define PathGuid="3B2C5D7E-9F0A-4B2C-8D3E-4F5A6B7C8D9E"?>
+  <?define StartMenuGuid="5D4E7F90-1B2C-4D4E-8F50-6B7C8D9E0F1A"?>
+  <?define DesktopGuid="6E5F8091-2C3D-4E5F-9061-7C8D9E0F1A2B"?>
+  <?define PathIsSystem="yes"?>
+  <?define StateRoot="HKLM"?>
+<?endif?>
+
+<!-- The firewall namespace is declared in both builds even though only the
+     per-machine one uses it: a processing instruction cannot live inside a
+     start tag, so there is no way to make the declaration itself conditional,
+     and an unused namespace declaration costs nothing. build-msi.ps1 loads
+     the extension for both builds to match. -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
      xmlns:fw="http://wixtoolset.org/schemas/v4/wxs/firewall">
@@ -21,8 +74,8 @@
   <Package Name="castr"
            Manufacturer="castr"
            Version="$(Version)"
-           UpgradeCode="5237300B-D9A8-4952-98A2-E5CF9FA3428B"
-           Scope="perMachine"
+           UpgradeCode="$(UpgradeGuid)"
+           Scope="$(Scope)"
            Compressed="yes"
            InstallerVersion="500">
 
@@ -41,9 +94,23 @@
     <WixVariable Id="WixUILicenseRtf" Value="$(LicensePath)" />
     <ui:WixUI Id="WixUI_FeatureTree" InstallDirectory="INSTALLFOLDER" />
 
+<?ifdef PerUser ?>
+    <!-- Under the user's own profile, so nothing here needs elevation.
+         `Programs` is where per-user installs conventionally land, and is
+         where Windows' own "Installed apps" expects to find them. -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="UserProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="castr" />
+      </Directory>
+    </StandardDirectory>
+<?else?>
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="castr" />
     </StandardDirectory>
+<?endif?>
+    <!-- In a per-user package these two resolve to the user's own Start Menu
+         and Desktop rather than the all-users ones; the elements are the
+         same either way. -->
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="AppMenuFolder" Name="castr" />
     </StandardDirectory>
@@ -78,37 +145,50 @@
         <ComponentRef Id="PathComponent" />
       </Feature>
 
+<?ifndef PerUser ?>
       <Feature Id="FirewallRule"
                Title="Allow through Windows Firewall"
                Description="Pre-authorises castr so Windows does not raise a firewall prompt mid-cast, when a display connects back to it."
                Level="1">
         <ComponentRef Id="FirewallComponent" />
       </Feature>
+<?endif?>
     </Feature>
 
     <ComponentGroup Id="Everything" Directory="INSTALLFOLDER">
-      <Component Id="SenderExe" Guid="2A1B4C6D-8E9F-4A1B-9C2D-3E4F5A6B7C8D">
+      <Component Id="SenderExe" Guid="$(SenderExeGuid)">
         <File Id="castr_sender.exe"
               Source="$(SourceDir)\castr-sender.exe"
               KeyPath="yes" />
       </Component>
 
       <!-- The PATH entry goes and comes with the feature, so uninstalling
-           leaves the system PATH as it was found. -->
-      <Component Id="PathComponent" Guid="3B2C5D7E-9F0A-4B2C-8D3E-4F5A6B7C8D9E">
+           leaves the PATH as it was found. `System` follows the scope: a
+           per-user package cannot write the machine PATH, and should not
+           want to. -->
+      <Component Id="PathComponent" Guid="$(PathGuid)">
         <Environment Id="CastrPath"
                      Name="PATH"
                      Value="[INSTALLFOLDER]"
                      Part="last"
                      Action="set"
-                     System="yes"
+                     System="$(PathIsSystem)"
                      Permanent="no" />
-        <RegistryValue Root="HKLM" Key="Software\castr" Name="PathEntry"
+        <!-- The keypath follows the scope with the PATH entry it guards. A
+             per-machine component must not hang off HKCU, and a per-user
+             package cannot write HKLM at all. -->
+        <RegistryValue Root="$(StateRoot)" Key="Software\castr" Name="PathEntry"
                        Type="integer" Value="1" KeyPath="yes" />
       </Component>
 
+<?ifndef PerUser ?>
       <!-- Tied to its component, so it is withdrawn on uninstall rather than
-           left authorising an executable that is no longer there. -->
+           left authorising an executable that is no longer there.
+
+           Note what this rule names: the installed path. The portable exe run
+           from anywhere else is a different program to the firewall and gets
+           no benefit from it - which is why the sender's own `firewall`
+           command exists, and names the running exe instead. -->
       <Component Id="FirewallComponent" Guid="4C3D6E8F-0A1B-4C3D-9E4F-5A6B7C8D9E0F">
         <RegistryValue Root="HKLM" Key="Software\castr" Name="FirewallRule"
                        Type="integer" Value="1" KeyPath="yes" />
@@ -120,11 +200,12 @@
                               Profile="all"
                               IgnoreFailure="yes" />
       </Component>
+<?endif?>
     </ComponentGroup>
 
     <Component Id="StartMenuShortcutComponent"
                Directory="AppMenuFolder"
-               Guid="5D4E7F90-1B2C-4D4E-8F50-6B7C8D9E0F1A">
+               Guid="$(StartMenuGuid)">
       <Shortcut Id="StartMenuCastr"
                 Name="castr"
                 Description="Cast this screen to a receiver or a Miracast display"
@@ -138,7 +219,7 @@
 
     <Component Id="DesktopShortcutComponent"
                Directory="DesktopFolder"
-               Guid="6E5F8091-2C3D-4E5F-9061-7C8D9E0F1A2B">
+               Guid="$(DesktopGuid)">
       <Shortcut Id="DesktopCastr"
                 Name="castr"
                 Description="Cast this screen to a receiver or a Miracast display"
