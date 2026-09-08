@@ -1,0 +1,96 @@
+# Builds the Windows installer on a Windows runner and publishes it, so the
+# MSI can be downloaded rather than built by hand.
+#
+# Pushing a tag `v<version>` makes a release and attaches the MSI to it. The
+# same workflow can be run by hand, which builds the MSI and leaves it as a run
+# artifact - or, with `publish` ticked, tags the commit it ran on and makes the
+# release from there, for when pushing a tag directly is not to hand.
+#
+# The MSI is unsigned: signing needs a certificate, which is a purchase rather
+# than a code change. Windows will call the publisher unknown.
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Tag this commit v<workspace version> and publish the release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  msi:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: version
+        shell: pwsh
+        run: |
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+                    Select-Object -First 1).Matches[0].Groups[1].Value
+          $version = $cargo
+          if ($env:GITHUB_REF -like 'refs/tags/*') {
+              $tag = $env:GITHUB_REF -replace '^refs/tags/', ''
+              $version = $tag -replace '^v', ''
+              # A tag that disagrees with the workspace version would ship an
+              # MSI whose Apps and Features entry contradicts its own release.
+              if ($version -ne $cargo) {
+                  throw "tag $tag says $version, but Cargo.toml says $cargo"
+              }
+          } elseif ('${{ inputs.publish }}' -eq 'true') {
+              # Run by hand with publish ticked: the tag does not exist yet, so
+              # the release below creates it on the commit this run checked out.
+              $tag = "v$cargo"
+          } else {
+              $tag = ''
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-release-
+
+      # WiX 5 rather than the current 7, which requires accepting the Open
+      # Source Maintenance Fee licence. Pinned so a new WiX cannot change what
+      # the installer is on an unrelated day.
+      - name: Install WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          wix extension add --global WixToolset.UI.wixext/5.0.2
+          wix extension add --global WixToolset.Firewall.wixext/5.0.2
+
+      - name: Build the MSI
+        shell: pwsh
+        run: powershell -File scripts\windows\build-msi.ps1 -Version ${{ steps.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: castr-${{ steps.version.outputs.version }}-x64-msi
+          path: dist/castr-*-x64.msi
+          if-no-files-found: error
+
+      - name: Publish the release
+        if: steps.version.outputs.tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $msi = (Get-ChildItem dist -Filter 'castr-*-x64.msi' | Select-Object -First 1).FullName
+          gh release create ${{ steps.version.outputs.tag }} $msi --target $env:GITHUB_SHA --title "castr ${{ steps.version.outputs.version }}" --notes-file .github/release-notes.md
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }

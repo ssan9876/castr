@@ -36,6 +36,9 @@ for machines where a Start Menu entry, a working `castr-sender` on the PATH and
 a pre-authorised firewall rule are worth having — and because an MSI can be
 deployed by group policy to managed machines.
 
+Prebuilt installers are attached to each release:
+<https://github.com/ssan9876/castr/releases/latest>. To build one yourself:
+
 ```
 powershell -File scripts\windows\build-msi.ps1     # -> dist\castr-<version>-x64.msi
 ```
@@ -74,6 +77,14 @@ it left nothing behind.
 
 The application icon lives at `assets/castr.ico` and is committed;
 `scripts\windows\make-icon.ps1` regenerates it if the artwork changes.
+
+Releases are cut by pushing a tag that matches the workspace version — `v0.1.0`
+for `version = "0.1.0"`. `.github/workflows/release.yml` then builds the MSI on
+a Windows runner and attaches it to the release; the workflow refuses a tag
+that disagrees with `Cargo.toml`, so a release can never carry an installer
+that names a different version. The same workflow can be run by hand from the
+Actions tab: it builds the MSI and leaves it as a run artifact, or, with
+`publish` ticked, tags the commit it ran on and makes the release from there.
 
 ## Running
 
