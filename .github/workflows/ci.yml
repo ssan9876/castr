@@ -1,0 +1,33 @@
+# Builds and tests the sender on Windows, which is the only platform it
+# compiles on: the crate reaches for castr-capture-win, castr-codec-win and
+# castr-wifidirect-win, so `cargo test -p castr-sender` on Linux fails before
+# it reaches a single test.
+#
+# That is why this exists. Windows-only code with unit tests behind it is only
+# as good as the machine that last ran them, and until now that was somebody's
+# desk.
+name: ci
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ci-
+
+      - name: Test the sender
+        run: cargo test -p castr-sender

@@ -192,13 +192,24 @@ pub fn facts() -> Facts {
             .push(("Shared Wi-Fi and Bluetooth antenna".into(), e)),
     }
 
-    f.elevated = powershell(
+    f.elevated = elevated();
+
+    f
+}
+
+/// Whether this process is running with administrator rights.
+///
+/// Split out of `facts` because `firewall` needs the same answer without
+/// paying for the whole health check, which runs a dozen commands. A probe
+/// that cannot answer reads as "not elevated": the cost of being wrong that
+/// way is a printed command line, and the other way is a half-applied
+/// privileged change.
+pub fn elevated() -> bool {
+    powershell(
         "([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)",
     )
     .map(|s| s.trim().eq_ignore_ascii_case("true"))
-    .unwrap_or(false);
-
-    f
+    .unwrap_or(false)
 }
 
 fn powercfg_query(subgroup: &str) -> Option<PowerSetting> {

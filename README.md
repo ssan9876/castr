@@ -37,23 +37,66 @@ a pre-authorised firewall rule are worth having — and because an MSI can be
 deployed by group policy to managed machines.
 
 Prebuilt installers are attached to each release:
-<https://github.com/ssan9876/castr/releases/latest>. To build one yourself:
+<https://github.com/ssan9876/castr/releases/latest>. There are two, holding the
+same exe:
+
+| | Installs to | Elevation | Firewall rule |
+|---|---|---|---|
+| `castr-<version>-x64.msi` | `C:\Program Files\castr` | asks once | included |
+| `castr-<version>-x64-peruser.msi` | `%LOCALAPPDATA%\Programs\castr` | none at all | added separately |
+
+The per-machine one is for a machine you administer, and is the one group
+policy can deploy. The per-user one prompts for nothing at all — it writes only
+inside your own profile — and is the answer when you do not have administrator
+rights, or would rather not be asked for them to install a screen caster.
+
+To build them yourself:
 
 ```
-powershell -File scripts\windows\build-msi.ps1     # -> dist\castr-<version>-x64.msi
+powershell -File scripts\windows\build-msi.ps1              # -> dist\castr-<version>-x64.msi
+powershell -File scripts\windows\build-msi.ps1 -PerUser     # -> dist\castr-<version>-x64-peruser.msi
 ```
 
-Double-clicking the MSI runs a wizard: licence, install location, then four
+Both are built from the same `packaging\windows\castr.wxs`, which the WiX
+preprocessor takes two ways through. They are separate packages with separate
+UpgradeCodes and separate component GUIDs, not two builds of one package: the
+same component GUID pointing at two different directories is a component-rules
+violation, and Windows would reference-count the exe in Program Files and the
+one in LocalAppData as though they were the same file.
+
+Double-clicking either runs a wizard: licence, install location, then the
 things you can decline — Start Menu shortcut, Desktop shortcut, add to PATH,
-and a Windows Firewall rule. The last is worth keeping: castr listens on 7236
-for a Miracast display to connect back, and a firewall prompt arriving mid-cast
-is the worst possible moment for one.
+and, in the per-machine package, a Windows Firewall rule.
 
-Uninstalling is Windows' own Apps & Features entry. It removes the PATH entry
-and the firewall rule as well as the files — but **deliberately keeps
-`%APPDATA%\castr\`**, which holds the identity certificate and `paired.toml`.
-Deleting those would silently discard every pairing, including the Miracast
-ones, and reinstalling would mean pairing everything again.
+### The firewall rule
+
+Only the per-machine package carries one, and that is not an omission. A
+firewall rule lives in the machine-wide policy store; there is no such thing as
+a per-user rule, so no installer can add one without elevation. Once, from an
+administrator terminal:
+
+```
+castr-sender firewall --allow      # castr-sender firewall  says whether it is there
+```
+
+It is worth having. `miracast-cast` listens on 7236 because **real Miracast
+sinks are the TCP initiator** — a wireless display adapter dials you and listens
+on nothing itself — so without the rule Windows drops that connection and the
+cast times out. What still works without it: casting to a castr receiver, and
+to castr's own sink. Both are dialled out from here, and nothing else the
+sender does wants inbound traffic — RTP is send-only and the control socket is
+loopback.
+
+The command names whichever exe is running, which the installer's rule cannot:
+that one names the installed path, so the portable exe run from anywhere else
+was never covered by it. `castr-sender firewall --remove` takes it away again.
+
+Uninstalling is Windows' own Apps & Features entry. It removes the PATH entry,
+the shortcuts and (per-machine) the firewall rule as well as the files — but
+**deliberately keeps `%APPDATA%\castr\`**, which holds the identity certificate
+and `paired.toml`. Deleting those would silently discard every pairing,
+including the Miracast ones, and reinstalling would mean pairing everything
+again. A rule added by `firewall --allow` is yours to remove.
 
 Building the MSI needs the WiX toolset once per machine, as a per-user tool
 with no administrator rights:
@@ -67,20 +110,24 @@ wix extension add --global WixToolset.Firewall.wixext/5.0.2
 WiX 5 rather than the current 7, which requires accepting the Open Source
 Maintenance Fee licence; 5 is supported and carries no such condition.
 
-**The MSI is unsigned**, so Windows will call the publisher unknown and
-SmartScreen will warn about it. Signing needs a code-signing certificate, which
-is a purchase rather than a code change.
+**The MSIs are unsigned**, so Windows will call the publisher unknown and
+SmartScreen will warn about them. Signing needs a code-signing certificate,
+which is a purchase rather than a code change.
 
-`scripts\windows\verify-msi.ps1`, run from an elevated PowerShell, installs the
-package silently, checks everything it claims to do, uninstalls it, and checks
-it left nothing behind.
+`scripts\windows\verify-msi.ps1` installs the package silently, checks
+everything it claims to do, uninstalls it, and checks it left nothing behind.
+Run it from an elevated PowerShell for the per-machine package, and with
+`-PerUser` from an ordinary one for the other — running that one unelevated is
+most of the point, since what it is testing is that nothing asks. It also
+checks the per-user package's absences: no firewall rule, nothing in Program
+Files, the machine PATH untouched.
 
 The application icon lives at `assets/castr.ico` and is committed;
 `scripts\windows\make-icon.ps1` regenerates it if the artwork changes.
 
 Releases are cut by pushing a tag that matches the workspace version — `v0.1.0`
 for `version = "0.1.0"`. `.github/workflows/release.yml` then builds the MSI on
-a Windows runner and attaches it to the release; the workflow refuses a tag
+a Windows runner and attaches both packages to the release; it refuses a tag
 that disagrees with `Cargo.toml`, so a release can never carry an installer
 that names a different version. The same workflow can be run by hand from the
 Actions tab: it builds the MSI and leaves it as a run artifact, or, with
@@ -146,7 +193,12 @@ castr-sender miracast-cast "Living Room TV" [--mode quality|game] [--duration SE
 castr-sender miracast-cast 192.168.173.1:7236       # or by address
 castr-sender miracast-status                        # what it is sending
 castr-sender miracast-stop                          # end it
+castr-sender firewall                               # is the inbound rule there?
 ```
+
+If a cast to a real display times out having never connected, check `firewall`
+first: the display dials *us* on 7236, and without the rule Windows drops that
+connection silently. See [The firewall rule](#the-firewall-rule).
 
 `miracast-list` shows the Wi-Fi Direct devices in range and which of them are
 displays, with the RTSP port and bandwidth each advertises.

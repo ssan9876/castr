@@ -1,6 +1,7 @@
 mod cast;
 mod control;
 mod diagnose;
+mod firewall;
 mod gui;
 mod miracast_cast;
 
@@ -27,6 +28,17 @@ enum Cmd {
         /// Offer to apply the safe fixes, prompting for each
         #[arg(long)]
         fix: bool,
+    },
+    /// Show, add or remove the firewall rule that lets a Miracast display
+    /// connect back to this machine
+    Firewall {
+        /// Add the rule for this exe. Needs an administrator terminal; without
+        /// one the command to run is printed instead.
+        #[arg(long, conflicts_with = "remove")]
+        allow: bool,
+        /// Remove the rule for this exe again
+        #[arg(long)]
+        remove: bool,
     },
     /// List the Wi-Fi Direct devices in range, and which of them are displays
     MiracastList,
@@ -175,6 +187,15 @@ fn main() -> anyhow::Result<()> {
         }),
         Some(Cmd::Diagnose { fix }) => {
             let code = diagnose::run(fix)?;
+            std::process::exit(code);
+        }
+        Some(Cmd::Firewall { allow, remove }) => {
+            let action = match (allow, remove) {
+                (true, _) => firewall::Action::Allow,
+                (_, true) => firewall::Action::Remove,
+                _ => firewall::Action::Status,
+            };
+            let code = firewall::run(action)?;
             std::process::exit(code);
         }
         Some(Cmd::MiracastList) => {
