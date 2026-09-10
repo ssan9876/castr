@@ -194,6 +194,7 @@ castr-sender miracast-cast 192.168.173.1:7236       # or by address
 castr-sender miracast-status                        # what it is sending
 castr-sender miracast-stop                          # end it
 castr-sender firewall                               # is the inbound rule there?
+castr-sender logs                                   # where this run was logged
 ```
 
 If a cast to a real display times out having never connected, check `firewall`
@@ -258,6 +259,54 @@ chooses the monitor here too.
 The picture is negotiated with the display and sent as H.264 in MPEG-TS over
 RTP, with audio as LPCM. See the "Known gaps" below before relying on it: it has
 only ever been tested against castr's own sink.
+
+### Logs
+
+Every run writes a log, so a session on real hardware can be handed over whole
+rather than described from memory.
+
+```
+castr-sender logs           # where they are, newest first
+castr-sender logs --open    # open the folder
+```
+
+They live in `%APPDATA%\castr\logs\` on Windows and
+`~/.config/castr/logs/` on the Pi, one file per run, named for the moment it
+started: `castr-sender-20260910-140311-04216.log`. The window offers **Open log
+folder** at its foot, because the double-clicked exe has no console and its
+user may have no terminal.
+
+The console keeps exactly the output it always had. The file gets the same
+events plus everything castr's own crates log at `debug`, which is the part
+that was previously invisible — and the GUI path detaches its console
+entirely, so before this a crash there left nothing behind at all. Panics go to
+the log too. `RUST_LOG` still works and turns both up.
+
+A log opens with what was run, when, on what:
+
+```
+app        castr-sender 0.1.0
+started    2026-09-10 14:03:11Z
+command    castr-sender miracast-cast "Living Room TV"
+os         windows x86_64
+exe        C:\Program Files\castr\castr-sender.exe
+```
+
+A Miracast cast also records whether the firewall rule covered the exe before
+it tried to connect, since that is the first question any failure to connect
+raises. `diagnose`'s findings go into the log as well.
+
+**What a log contains, since handing one over should be an informed act:** the
+command line, this machine's OS, the exe's path, and then the run — display
+names, Wi-Fi Direct device names, and the addresses on the peer-to-peer link.
+It does not contain pairing PINs, the identity key, or anything from
+`paired.toml`; none of those are logged anywhere, at any level.
+
+The newest 30 runs are kept and older ones deleted, so a directory cannot grow
+without bound on an SD card. Short runs count towards that, so a log worth
+keeping is worth copying somewhere else. `castr-sender logs` deliberately
+writes no log of its own — otherwise the newest file would always be the one
+that just listed the directory.
 
 ### Wi-Fi health check
 

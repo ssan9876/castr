@@ -30,7 +30,12 @@ pub fn run(_apply_fixes: bool) -> anyhow::Result<i32> {
 pub fn run(apply_fixes: bool) -> anyhow::Result<i32> {
     let facts = collect::facts();
     let findings = rules::analyse(&facts);
-    print!("{}", render::report(&findings, &facts));
+    let report = render::report(&findings, &facts);
+    print!("{report}");
+    // Into the log as well, at debug so the console does not print it twice.
+    // A health check whose findings are not in the log is one that has to be
+    // run again, on the machine, by the person reporting the problem.
+    tracing::debug!("diagnose report:\n{report}");
     if apply_fixes {
         fix::prompt_and_apply(&findings, &facts)?;
     }

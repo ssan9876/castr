@@ -29,6 +29,12 @@ enum Cmd {
         #[arg(long)]
         fix: bool,
     },
+    /// Show where this run's log went, and the runs before it
+    Logs {
+        /// Open the folder rather than printing paths
+        #[arg(long)]
+        open: bool,
+    },
     /// Show, add or remove the firewall rule that lets a Miracast display
     /// connect back to this machine
     Firewall {
@@ -145,16 +151,88 @@ fn sender_name() -> String {
         .unwrap_or_else(|_| "castr sender".into())
 }
 
+/// The log's filename prefix, and what `logs` looks for.
+const APP: &str = "castr-sender";
+
+/// Opens a folder in the system file manager, for the person who has castr's
+/// window in front of them and no terminal at all. Best effort: a machine with
+/// no file manager is not a reason for anything here to fail.
+pub fn open_dir(dir: &std::path::Path) {
+    #[cfg(windows)]
+    let _ = std::process::Command::new("explorer").arg(dir).spawn();
+    #[cfg(not(windows))]
+    let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+}
+
+/// `castr-sender logs`: where the logs are, and which is which.
+///
+/// Newest first, because the run being asked about is nearly always the last
+/// one. Sizes are shown because the useful signal that a run did nothing at
+/// all is a log that is only its own header.
+fn show_logs(root: &std::path::Path, open: bool) -> anyhow::Result<()> {
+    let dir = castr_net::logging::dir(root);
+    println!("folder  {}", dir.display());
+    if open {
+        open_dir(&dir);
+        return Ok(());
+    }
+
+    let prefix = format!("{APP}-");
+    let mut logs: Vec<(String, u64)> = std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| {
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                e.metadata().map(|m| m.len()).unwrap_or(0),
+            )
+        })
+        .filter(|(n, _)| n.starts_with(&prefix) && n.ends_with(".log"))
+        .collect();
+    // The timestamp in the name is what orders these, not the filesystem's
+    // idea of modification time, which a copy or a sync can rewrite.
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+
+    if logs.is_empty() {
+        println!("\nno logs yet; they appear here the next time castr runs");
+        return Ok(());
+    }
+    println!();
+    for (name, size) in logs.iter().take(10) {
+        println!("  {name}  {:.0} KB", *size as f64 / 1024.0);
+    }
+    if logs.len() > 10 {
+        println!("  ... and {} older", logs.len() - 10);
+    }
+    println!(
+        "\nThe newest is the run before this command. To report a problem, send\n{}",
+        dir.join(&logs[0].0).display()
+    );
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
-        )
-        .init();
+    // Before anything else, so a failure while starting up is in the log
+    // rather than only on a console the GUI path is about to detach from.
+    let root = castr_net::config_dir();
+    // `logs` is the exception: its whole job is to point at the other runs'
+    // files, and a log of its own would become the newest one - so the file
+    // someone was asked to hand over would be the one that just listed the
+    // directory. Read from the arguments rather than the parsed command
+    // because the subscriber has to be up before anything can fail.
+    let log = if std::env::args().nth(1).as_deref() == Some("logs") {
+        castr_net::logging::console_only();
+        None
+    } else {
+        castr_net::logging::init(&root, APP, env!("CARGO_PKG_VERSION"), &[])
+    };
+    castr_net::logging::log_panics();
+
     let cli = Cli::parse();
-    let config_dir = castr_net::config_dir().join("sender");
+    let config_dir = root.join("sender");
     let rt = tokio::runtime::Runtime::new()?;
-    match cli.cmd {
+    let result = match cli.cmd {
         None => {
             // The GUI path is what a double-clicked exe hits. The binary is a
             // console subsystem exe (so `list`/`pair`/`cast` keep a working
@@ -164,7 +242,7 @@ fn main() -> anyhow::Result<()> {
             unsafe {
                 let _ = windows::Win32::System::Console::FreeConsole();
             }
-            gui::run_gui(config_dir, sender_name())
+            gui::run_gui(config_dir, sender_name(), log.clone())
         }
         Some(Cmd::List) => rt.block_on(async {
             for r in discover(Duration::from_secs(2)).await? {
@@ -189,6 +267,7 @@ fn main() -> anyhow::Result<()> {
             let code = diagnose::run(fix)?;
             std::process::exit(code);
         }
+        Some(Cmd::Logs { open }) => show_logs(&root, open),
         Some(Cmd::Firewall { allow, remove }) => {
             let action = match (allow, remove) {
                 (true, _) => firewall::Action::Allow,
@@ -383,5 +462,15 @@ fn main() -> anyhow::Result<()> {
             )
             .await
         }),
+    };
+    // The last line of the log says how the run ended. Without this, a command
+    // that failed left a log that simply stopped, which reads the same as one
+    // that was killed - and the error text went only to a console that may not
+    // exist. `{e:#}` for the whole anyhow chain: the context is usually the
+    // half that says what was being attempted.
+    match &result {
+        Ok(()) => tracing::debug!("finished"),
+        Err(e) => tracing::error!("failed: {e:#}"),
     }
+    result
 }

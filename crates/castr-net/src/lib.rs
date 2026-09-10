@@ -1,6 +1,7 @@
 //! See docs/superpowers/specs/2026-09-01-castr-core-design.md
 pub mod discovery;
 pub mod identity;
+pub mod logging;
 pub mod pairing;
 pub mod retransmit;
 pub mod tls;

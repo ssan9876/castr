@@ -53,6 +53,10 @@ struct App {
     /// `(index, label)` per monitor, empty where enumeration is unavailable.
     monitors: Vec<(u32, String)>,
     monitor: u32,
+    /// This run's log, when there is one. Held so the window can offer it: the
+    /// double-clicked exe has no console and its user has no terminal, so
+    /// without this the log exists and nobody can find it.
+    log: Option<PathBuf>,
     wifi: wifi::Panel,
 }
 
@@ -509,6 +513,29 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(message);
             }
+
+            // Bottom of the window, out of the way of the task but always
+            // there: when something goes wrong, the next question is always
+            // "can you send the log", and this is the answer for someone who
+            // has never opened a terminal.
+            if let Some(log) = &self.log {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("This run is being logged.");
+                    if ui.button("Open log folder").clicked() {
+                        if let Some(dir) = log.parent() {
+                            crate::open_dir(dir);
+                        }
+                    }
+                });
+                // The full path, selectable, for pasting into a message when
+                // opening a folder is not what is wanted.
+                ui.label(
+                    egui::RichText::new(log.display().to_string())
+                        .small()
+                        .weak(),
+                );
+            }
         });
     }
 
@@ -528,7 +555,11 @@ impl eframe::App for App {
     }
 }
 
-pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
+pub fn run_gui(
+    config_dir: PathBuf,
+    sender_name: String,
+    log: Option<PathBuf>,
+) -> anyhow::Result<()> {
     let rt = tokio::runtime::Runtime::new()?;
 
     #[cfg(windows)]
@@ -565,6 +596,7 @@ pub fn run_gui(config_dir: PathBuf, sender_name: String) -> anyhow::Result<()> {
         monitors,
         monitor,
         wifi: wifi::Panel::default(),
+        log,
     };
     app.scan();
     let options = eframe::NativeOptions {

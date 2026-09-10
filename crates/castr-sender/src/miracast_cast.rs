@@ -95,6 +95,11 @@ pub fn cast_to(
     cmd_tx: mpsc::Sender<Command>,
     cmds: mpsc::Receiver<Command>,
 ) -> anyhow::Result<()> {
+    // Before the connection is attempted, so the log says what the firewall
+    // looked like at the moment it mattered rather than whenever someone got
+    // round to checking afterwards.
+    crate::firewall::note_state();
+
     // `establish` has already logged which way round the connection went.
     let mut sock = establish(addr)?;
     sock.set_read_timeout(Some(TICK))?;
