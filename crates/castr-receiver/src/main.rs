@@ -61,11 +61,13 @@ fn default_bitrate() -> u32 {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("info".parse()?),
-        )
-        .init();
+    // A file as well as the console. journald already keeps the Pi's output
+    // when it runs as a service, but a receiver started by hand over SSH left
+    // nothing behind once the terminal closed - and that is exactly how it is
+    // run while something is being debugged.
+    let root = castr_net::config_dir();
+    castr_net::logging::init(&root, "castr-receiver", env!("CARGO_PKG_VERSION"), &[]);
+    castr_net::logging::log_panics();
     let cli = Cli::parse();
     pipeline::run(ReceiverConfig {
         name: cli.name,

@@ -246,6 +246,35 @@ pub fn run(action: Action) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// Records in the log whether the inbound rule covers the running exe.
+///
+/// Called once at the start of a Miracast cast, because "was the firewall rule
+/// there?" is the first question any failure to connect raises, and a log that
+/// cannot answer it sends everyone looking in the wrong place. A netsh that
+/// could not be run at all is itself worth writing down.
+#[cfg(windows)]
+pub fn note_state() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    match std::process::Command::new("netsh").args(show_args()).output() {
+        Ok(out) => {
+            if rule_covers(&String::from_utf8_lossy(&out.stdout), &exe) {
+                tracing::info!("firewall: the inbound rule covers this exe");
+            } else {
+                tracing::warn!(
+                    "firewall: NO inbound rule for this exe. A display that dials us on \
+                     {WFD_RTSP_PORT} will be blocked; `castr-sender firewall --allow` adds it"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("firewall: could not ask netsh whether the rule exists ({e})"),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn note_state() {}
+
 #[cfg(not(windows))]
 pub fn run(_action: Action) -> anyhow::Result<i32> {
     anyhow::bail!("firewall is Windows only")
