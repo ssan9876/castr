@@ -32,6 +32,20 @@ The installer is optional either way: `castr-sender.exe` is a single portable
 exe with no runtime DLLs, and runs from wherever you put it. `firewall --allow`
 covers whichever copy is running, so the portable exe can have the rule too.
 
+### Reporting a problem
+
+Every run writes a log. To report something that went wrong, send the log for
+that run:
+
+```
+castr-sender logs        # prints the folder and the newest file
+```
+
+The window has **Open log folder** at its foot for the same thing. A log holds
+the command line, this machine's OS, display and device names, and the
+addresses on the peer-to-peer link — and no pairing PINs, identity key, or
+anything from `paired.toml`.
+
 ### Signing
 
 **These MSIs are unsigned**, so Windows will call the publisher unknown and

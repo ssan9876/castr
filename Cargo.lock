@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "castr-capture-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "castr-media",
@@ -731,7 +731,7 @@ dependencies = [
 
 [[package]]
 name = "castr-codec-v4l2"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "castr-media",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "castr-codec-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "castr-media",
@@ -751,7 +751,7 @@ dependencies = [
 
 [[package]]
 name = "castr-media"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "castr-miracast"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "castr-media",
@@ -775,7 +775,7 @@ dependencies = [
 
 [[package]]
 name = "castr-net"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -802,7 +802,7 @@ dependencies = [
 
 [[package]]
 name = "castr-proto"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -812,7 +812,7 @@ dependencies = [
 
 [[package]]
 name = "castr-receiver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "castr-sender"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -859,7 +859,7 @@ dependencies = [
 
 [[package]]
 name = "castr-wifidirect-win"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "castr-miracast",
