@@ -29,5 +29,8 @@ jobs:
           key: ${{ runner.os }}-cargo-ci-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-ci-
 
+      # castr-net as well as the sender: it holds the logging that both
+      # binaries use, and its file handling is the part most likely to differ
+      # between a Linux desk and the Windows machine castr actually runs on.
       - name: Test the sender
-        run: cargo test -p castr-sender
+        run: cargo test -p castr-sender -p castr-net
