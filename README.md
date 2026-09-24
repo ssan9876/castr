@@ -251,14 +251,17 @@ sent. `repeated_frames` counts frames re-sent because the desktop did not
 change, which is worth watching: a still screen is normal, and without that
 count it looks identical to a capture that has stopped.
 
-Given an address instead, the radio is skipped entirely: on the ordinary LAN
-that is Miracast over Infrastructure, and over an existing Wi-Fi Direct group it
-is ordinary Miracast — the media path does not care which. `CASTR_OUTPUT`
+Given an address instead, the radio is skipped entirely. This is a useful
+direct-IP/debug path and also works after a Wi-Fi Direct group already exists,
+but it is not Microsoft Miracast over Infrastructure (MS-MICE). MS-MICE adds
+DNS-SD discovery and a TCP/7250 control handshake before the RTSP media
+session; castr does not implement that control plane yet. `CASTR_OUTPUT`
 chooses the monitor here too.
 
 The picture is negotiated with the display and sent as H.264 in MPEG-TS over
 RTP, with audio as LPCM. See the "Known gaps" below before relying on it: it has
-only ever been tested against castr's own sink.
+only ever been tested against castr's own sink. Hardware results and the exact
+test checklist live in [docs/miracast-compatibility.md](docs/miracast-compatibility.md).
 
 ### Logs
 
@@ -450,7 +453,7 @@ Three limits, stated plainly:
 
 - **720p30.** The Pi's radio is 2.4 GHz only, and 1080p over it drops frames
   rather than degrading gracefully. The sink offers 720p30 and nothing else.
-- **No HDCP.** Protected video � Netflix, Amazon, most streaming apps � shows
+- **No HDCP.** Protected video — Netflix, Amazon, most streaming apps — shows
   as a black rectangle. That needs licensed keys, which castr does not have.
   Everything else mirrors normally.
 - **One protocol at a time.** The Pi has one screen. Whichever protocol
@@ -468,8 +471,8 @@ turns it off, `--miracast on` forces it on, and `--miracast-channel 1|6|11`
 pins the Wi-Fi Direct channel instead of picking the least busy one.
 
 If Windows drops the cast repeatedly, run `castr-sender diagnose` on the PC: it
-checks the local causes � a shared Wi-Fi/Bluetooth antenna, adapter power
-saving, driver age � and offers to fix the safe ones.
+checks the local causes — a shared Wi-Fi/Bluetooth antenna, adapter power
+saving, driver age — and offers to fix the safe ones.
 
 ## Known gaps
 

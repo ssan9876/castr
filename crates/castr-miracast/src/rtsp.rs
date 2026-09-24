@@ -4,6 +4,9 @@
 
 use std::fmt::Write as _;
 
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub const MAX_BODY_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartLine {
     Request { method: String, uri: String },
@@ -22,6 +25,7 @@ pub enum ParseError {
     MalformedStartLine(String),
     MalformedHeader(String),
     BadContentLength(String),
+    MessageTooLarge(&'static str),
     NotUtf8,
 }
 
@@ -31,6 +35,7 @@ impl std::fmt::Display for ParseError {
             ParseError::MalformedStartLine(s) => write!(f, "malformed start line: {s:?}"),
             ParseError::MalformedHeader(s) => write!(f, "malformed header: {s:?}"),
             ParseError::BadContentLength(s) => write!(f, "bad Content-Length: {s:?}"),
+            ParseError::MessageTooLarge(part) => write!(f, "RTSP {part} exceeds the size limit"),
             ParseError::NotUtf8 => write!(f, "message is not UTF-8"),
         }
     }
@@ -81,8 +86,14 @@ impl Message {
 /// how many bytes it consumed, so the caller can drain exactly that much.
 pub fn parse(buf: &[u8]) -> Result<Option<(Message, usize)>, ParseError> {
     let Some(head_end) = find_double_crlf(buf) else {
+        if buf.len() > MAX_HEADER_BYTES {
+            return Err(ParseError::MessageTooLarge("header"));
+        }
         return Ok(None);
     };
+    if head_end > MAX_HEADER_BYTES {
+        return Err(ParseError::MessageTooLarge("header"));
+    }
     let head = std::str::from_utf8(&buf[..head_end]).map_err(|_| ParseError::NotUtf8)?;
     let mut lines = head.split("\r\n");
     let start_line = lines.next().unwrap_or_default();
@@ -107,11 +118,17 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Message, usize)>, ParseError> {
             .map_err(|_| ParseError::BadContentLength(v.clone()))?,
         None => 0,
     };
+    if body_len > MAX_BODY_BYTES {
+        return Err(ParseError::MessageTooLarge("body"));
+    }
     let body_start = head_end + 4;
-    if buf.len() < body_start + body_len {
+    let end = body_start
+        .checked_add(body_len)
+        .ok_or(ParseError::MessageTooLarge("body"))?;
+    if buf.len() < end {
         return Ok(None);
     }
-    let body = std::str::from_utf8(&buf[body_start..body_start + body_len])
+    let body = std::str::from_utf8(&buf[body_start..end])
         .map_err(|_| ParseError::NotUtf8)?
         .to_string();
     Ok(Some((
@@ -120,7 +137,7 @@ pub fn parse(buf: &[u8]) -> Result<Option<(Message, usize)>, ParseError> {
             headers,
             body,
         },
-        body_start + body_len,
+        end,
     )))
 }
 
@@ -890,7 +907,10 @@ mod negotiation_tests {
         let text = m.format();
         assert!(text.starts_with("SET_PARAMETER "), "{text}");
         assert!(text.contains("microsoft_max_bitrate: 2000\r\n"), "{text}");
-        assert!(text.contains("Session: "), "the source needs to know which session: {text}");
+        assert!(
+            text.contains("Session: "),
+            "the source needs to know which session: {text}"
+        );
     }
 
     #[test]
@@ -901,5 +921,23 @@ mod negotiation_tests {
         assert!(early.is_empty(), "too soon: {early:?}");
         let due = n.tick(t0 + Duration::from_secs(6));
         assert_eq!(due.len(), 1, "one keep-alive: {due:?}");
+    }
+
+    #[test]
+    fn oversized_headers_are_rejected_before_the_buffer_grows_forever() {
+        let buf = vec![b'x'; MAX_HEADER_BYTES + 1];
+        assert_eq!(parse(&buf), Err(ParseError::MessageTooLarge("header")));
+    }
+
+    #[test]
+    fn oversized_declared_bodies_are_rejected_without_waiting_for_them() {
+        let text = format!(
+            "SET_PARAMETER * RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert_eq!(
+            parse(text.as_bytes()),
+            Err(ParseError::MessageTooLarge("body"))
+        );
     }
 }

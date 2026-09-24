@@ -62,6 +62,23 @@ pub fn video_type(
     fps: u32,
     bitrate: Option<u32>,
 ) -> anyhow::Result<IMFMediaType> {
+    video_type_with_h264(subtype, w, h, fps, bitrate, None)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct H264Format {
+    pub profile: u32,
+    pub level_idc: u32,
+}
+
+pub fn video_type_with_h264(
+    subtype: &GUID,
+    w: u32,
+    h: u32,
+    fps: u32,
+    bitrate: Option<u32>,
+    h264: Option<H264Format>,
+) -> anyhow::Result<IMFMediaType> {
     // SAFETY: `t` is a freshly created media type COM object; all setters take valid
     // attribute GUIDs and by-value/by-ref arguments per the MF API contract.
     unsafe {
@@ -76,7 +93,12 @@ pub fn video_type(
             t.SetUINT32(&MF_MT_AVG_BITRATE, b)?;
         }
         if *subtype == MFVideoFormat_H264 {
-            t.SetUINT32(&MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main.0 as u32)?;
+            let h264 = h264.unwrap_or(H264Format {
+                profile: eAVEncH264VProfile_Main.0 as u32,
+                level_idc: 40,
+            });
+            t.SetUINT32(&MF_MT_MPEG2_PROFILE, h264.profile)?;
+            t.SetUINT32(&MF_MT_MPEG2_LEVEL, h264.level_idc)?;
         }
         Ok(t)
     }

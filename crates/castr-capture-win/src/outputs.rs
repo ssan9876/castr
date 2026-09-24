@@ -26,16 +26,15 @@ pub struct Output {
     /// The desktop's origin is on this monitor, which is what Windows means by
     /// the primary display.
     pub primary: bool,
-    /// Windows has this monitor turned. Worth surfacing: the capture path does
-    /// not consult rotation, so casting one arrives sideways.
+    /// Windows has this monitor turned. The capture path rotates it upright,
+    /// and the picker still surfaces the fact because dimensions are swapped.
     pub rotated: bool,
 }
 
 /// Every monitor attached to the adapter that owns the desktop.
 pub fn outputs() -> anyhow::Result<Vec<Output>> {
     // SAFETY: FFI into DXGI; the factory pointer is ours and checked.
-    let factory: IDXGIFactory1 =
-        unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
+    let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.context("CreateDXGIFactory1")?;
     let mut found = Vec::new();
     let mut adapter_index = 0u32;
     // SAFETY: enumeration ends with an error, which is how DXGI says "no more".
@@ -88,7 +87,7 @@ pub fn label(o: &Output) -> String {
         s.push_str("  (primary)");
     }
     if o.rotated {
-        s.push_str("  (rotated - the cast will appear sideways)");
+        s.push_str("  (rotated)");
     }
     s
 }
@@ -135,14 +134,12 @@ mod tests {
     }
 
     #[test]
-    fn a_rotated_monitor_warns_that_the_cast_will_be_sideways() {
-        // The capture path ignores rotation, so this is a standing limitation
-        // the picker can at least be honest about.
+    fn a_rotated_monitor_is_identified() {
         let o = Output {
             rotated: true,
             ..out(1, r"\\.\DISPLAY2", false)
         };
-        assert!(label(&o).contains("sideways"));
+        assert!(label(&o).contains("(rotated)"));
     }
 
     #[test]
@@ -152,13 +149,19 @@ mod tests {
 
     #[test]
     fn the_primary_is_the_default() {
-        let list = vec![out(0, r"\\.\DISPLAY1", false), out(1, r"\\.\DISPLAY2", true)];
+        let list = vec![
+            out(0, r"\\.\DISPLAY1", false),
+            out(1, r"\\.\DISPLAY2", true),
+        ];
         assert_eq!(default_index(&list), 1);
     }
 
     #[test]
     fn without_a_primary_the_first_is_the_default() {
-        let list = vec![out(2, r"\\.\DISPLAY1", false), out(3, r"\\.\DISPLAY2", false)];
+        let list = vec![
+            out(2, r"\\.\DISPLAY1", false),
+            out(3, r"\\.\DISPLAY2", false),
+        ];
         assert_eq!(default_index(&list), 2);
     }
 

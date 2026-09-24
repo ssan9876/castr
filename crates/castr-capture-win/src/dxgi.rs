@@ -15,6 +15,7 @@ pub struct DesktopCapture {
     staging: ID3D11Texture2D,
     width: u32,
     height: u32,
+    rotation: DXGI_MODE_ROTATION,
     cursor: CursorCache,
 }
 
@@ -78,12 +79,16 @@ impl DesktopCapture {
             staging: staging.context("no staging texture")?,
             width,
             height,
+            rotation: desc.Rotation,
             cursor: CursorCache::new(),
         })
     }
 
     pub fn size(&self) -> (u32, u32) {
-        (self.width, self.height)
+        match self.rotation {
+            DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => (self.height, self.width),
+            _ => (self.width, self.height),
+        }
     }
 
     pub fn next_frame(
@@ -125,9 +130,7 @@ impl DesktopCapture {
             match got {
                 Ok(()) => {
                     let kind = match DXGI_OUTDUPL_POINTER_SHAPE_TYPE(si.Type as i32) {
-                        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME => {
-                            Some(CursorKind::Monochrome)
-                        }
+                        DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME => Some(CursorKind::Monochrome),
                         DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR => Some(CursorKind::Color),
                         DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MASKED_COLOR => {
                             Some(CursorKind::MaskedColor)
@@ -225,13 +228,71 @@ impl DesktopCapture {
         // which keeps it consistent with the picture.
         self.cursor
             .draw(&mut frame.data, self.width, self.height, frame.stride);
+        if self.rotation != DXGI_MODE_ROTATION_IDENTITY
+            && self.rotation != DXGI_MODE_ROTATION_UNSPECIFIED
+        {
+            let (data, width, height) = rotate_bgra(
+                &frame.data,
+                frame.width,
+                frame.height,
+                frame.stride,
+                self.rotation,
+            );
+            frame.data = data;
+            frame.width = width;
+            frame.height = height;
+            frame.stride = width * 4;
+        }
         Ok(Some(frame))
     }
+}
+
+fn rotate_bgra(
+    src: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    rotation: DXGI_MODE_ROTATION,
+) -> (Vec<u8>, u32, u32) {
+    let (out_width, out_height) = match rotation {
+        DXGI_MODE_ROTATION_ROTATE90 | DXGI_MODE_ROTATION_ROTATE270 => (height, width),
+        _ => (width, height),
+    };
+    let mut out = vec![0u8; (out_width * out_height * 4) as usize];
+    for y in 0..height {
+        for x in 0..width {
+            let (ox, oy) = match rotation {
+                DXGI_MODE_ROTATION_ROTATE90 => (height - 1 - y, x),
+                DXGI_MODE_ROTATION_ROTATE180 => (width - 1 - x, height - 1 - y),
+                DXGI_MODE_ROTATION_ROTATE270 => (y, width - 1 - x),
+                _ => (x, y),
+            };
+            let from = (y * stride + x * 4) as usize;
+            let to = ((oy * out_width + ox) * 4) as usize;
+            out[to..to + 4].copy_from_slice(&src[from..from + 4]);
+        }
+    }
+    (out, out_width, out_height)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotation_turns_pixels_and_dimensions() {
+        // Two rows: A B / C D / E F. Only the first byte identifies a pixel.
+        let src: Vec<u8> = [1, 2, 3, 4, 5, 6]
+            .into_iter()
+            .flat_map(|v| [v, 0, 0, 255])
+            .collect();
+        let (out, w, h) = rotate_bgra(&src, 2, 3, 8, DXGI_MODE_ROTATION_ROTATE90);
+        assert_eq!((w, h), (3, 2));
+        assert_eq!(
+            out.chunks_exact(4).map(|p| p[0]).collect::<Vec<_>>(),
+            [5, 3, 1, 6, 4, 2]
+        );
+    }
 
     /// Needs an interactive desktop. Run: cargo test -p castr-capture-win -- --ignored
     #[test]

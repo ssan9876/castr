@@ -51,6 +51,28 @@ pub fn resize_bgra_nearest(src: &[u8], w: u32, h: u32, stride: u32, dw: u32, dh:
     out
 }
 
+/// Fit a BGRA frame without changing its aspect ratio. Unused space is
+/// opaque black, avoiding the stretched desktop many fixed-mode sinks show.
+pub fn fit_bgra_letterbox(src: &[u8], w: u32, h: u32, stride: u32, dw: u32, dh: u32) -> Vec<u8> {
+    let scale = (dw as f64 / w as f64).min(dh as f64 / h as f64);
+    let fw = ((w as f64 * scale).round() as u32).max(1).min(dw);
+    let fh = ((h as f64 * scale).round() as u32).max(1).min(dh);
+    let fitted = resize_bgra_nearest(src, w, h, stride, fw, fh);
+    let mut out = vec![0u8; (dw * dh * 4) as usize];
+    for alpha in (3..out.len()).step_by(4) {
+        out[alpha] = 0xff;
+    }
+    let x0 = (dw - fw) / 2;
+    let y0 = (dh - fh) / 2;
+    for y in 0..fh as usize {
+        let src_start = y * fw as usize * 4;
+        let dst_start = ((y0 as usize + y) * dw as usize + x0 as usize) * 4;
+        out[dst_start..dst_start + fw as usize * 4]
+            .copy_from_slice(&fitted[src_start..src_start + fw as usize * 4]);
+    }
+    out
+}
+
 pub fn choose_params(
     native: (u32, u32),
     fps: u32,

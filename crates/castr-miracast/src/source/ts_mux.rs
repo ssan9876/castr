@@ -21,6 +21,7 @@ const STREAM_ID_PRIVATE_1: u8 = 0xbd;
 /// that tunes in late, or drops the one copy, must still learn the program
 /// rather than give up on the stream.
 const TABLE_INTERVAL_PACKETS: u32 = 40;
+const AUDIO_FRAME_US: u64 = 10_000;
 
 /// A 33-bit presentation time in 90 kHz units, spread over five bytes with the
 /// marker bits the format requires.
@@ -40,19 +41,30 @@ fn pts_bytes(pts_90k: u64) -> [u8; 5] {
 /// start - while audio declares its true length, because the demuxer uses that
 /// to know where the payload stops and the packet's padding begins.
 fn pes(stream_id: u8, payload: &[u8], pts_us: u64, bounded: bool) -> Vec<u8> {
+    pes_with_stuffing(stream_id, payload, pts_us, bounded, 0)
+}
+
+fn pes_with_stuffing(
+    stream_id: u8,
+    payload: &[u8],
+    pts_us: u64,
+    bounded: bool,
+    stuffing: usize,
+) -> Vec<u8> {
     let header = pts_bytes(pts_us * 9 / 100);
     let declared = if bounded {
-        (payload.len() + header.len() + 3) as u16
+        (payload.len() + header.len() + stuffing + 3) as u16
     } else {
         0
     };
-    let mut v = Vec::with_capacity(9 + header.len() + payload.len());
+    let mut v = Vec::with_capacity(9 + header.len() + stuffing + payload.len());
     v.extend_from_slice(&[0x00, 0x00, 0x01, stream_id]);
     v.extend_from_slice(&declared.to_be_bytes());
     v.push(0x80); // '10' marker, not scrambled, no priority
     v.push(0x80); // PTS present, no DTS
-    v.push(header.len() as u8);
+    v.push((header.len() + stuffing) as u8);
     v.extend_from_slice(&header);
+    v.extend(std::iter::repeat_n(0xff, stuffing));
     v.extend_from_slice(payload);
     v
 }
@@ -96,7 +108,7 @@ fn pat_section() -> Vec<u8> {
     section(0x00, &body)
 }
 
-fn pmt_section() -> Vec<u8> {
+fn pmt_section(profile_bitmap: u8, level_bitmap: u8) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&PROGRAM_NUMBER.to_be_bytes());
     body.push(0xc1);
@@ -104,13 +116,41 @@ fn pmt_section() -> Vec<u8> {
     body.push(0x00);
     body.extend_from_slice(&(0xe000 | VIDEO_PID).to_be_bytes()); // the PCR rides on video
     body.extend_from_slice(&0xf000u16.to_be_bytes()); // no program info
-    for (stream_type, pid) in [
-        (STREAM_TYPE_H264, VIDEO_PID),
-        (STREAM_TYPE_LPCM, AUDIO_PID),
+    let (profile_idc, constraints) = if profile_bitmap == 0x02 {
+        (100, 0x0c)
+    } else {
+        (66, 0xc0)
+    };
+    let level_idc = match level_bitmap {
+        0x02 => 32,
+        0x04 => 40,
+        0x08 => 41,
+        0x10 => 42,
+        _ => 31,
+    };
+    let video_descriptors = [
+        0x28,
+        0x04,
+        profile_idc,
+        constraints,
+        level_idc,
+        0x3f,
+        0x2a,
+        0x02,
+        0x7e,
+        0x1f,
+    ];
+    for (stream_type, pid, descriptors) in [
+        // AVC timing/HRD is mandatory for WFD. The AVC descriptor describes
+        // the CBP stream selected during negotiation.
+        (STREAM_TYPE_H264, VIDEO_PID, &video_descriptors[..]),
+        // LPCM: 48 kHz and stereo, in the descriptor format used by WFD.
+        (STREAM_TYPE_LPCM, AUDIO_PID, &[0x83, 0x02, 0x46, 0x2f][..]),
     ] {
         body.push(stream_type);
         body.extend_from_slice(&(0xe000 | pid).to_be_bytes());
-        body.extend_from_slice(&0xf000u16.to_be_bytes()); // no descriptors
+        body.extend_from_slice(&(0xf000 | descriptors.len() as u16).to_be_bytes());
+        body.extend_from_slice(descriptors);
     }
     section(0x02, &body)
 }
@@ -141,15 +181,37 @@ fn pcr_bytes(pcr_90k: u64) -> [u8; 6] {
     ]
 }
 
-#[derive(Default)]
 pub struct Muxer {
     cc: HashMap<u16, u8>,
     since_tables: u32,
+    audio_pending: Vec<i16>,
+    next_audio_pts_us: Option<u64>,
+    h264_profile: u8,
+    h264_level: u8,
+}
+
+impl Default for Muxer {
+    fn default() -> Self {
+        Self {
+            cc: HashMap::new(),
+            since_tables: 0,
+            audio_pending: Vec::new(),
+            next_audio_pts_us: None,
+            h264_profile: 0x01,
+            h264_level: 0x01,
+        }
+    }
 }
 
 impl Muxer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_h264_format(&mut self, profile: u8, level: u8) {
+        self.h264_profile = profile;
+        self.h264_level = level;
+        self.since_tables = 0;
     }
 
     /// The next continuity counter for a PID. The demuxer reads a gap here as
@@ -168,7 +230,11 @@ impl Muxer {
         let pat_cc = self.next_cc(0);
         let pmt_cc = self.next_cc(PMT_PID);
         let mut out = section_packet(0, &pat_section(), pat_cc);
-        out.extend(section_packet(PMT_PID, &pmt_section(), pmt_cc));
+        out.extend(section_packet(
+            PMT_PID,
+            &pmt_section(self.h264_profile, self.h264_level),
+            pmt_cc,
+        ));
         out
     }
 
@@ -191,9 +257,8 @@ impl Muxer {
                 }
                 _ => None,
             };
-            let capacity = |af: &Option<Vec<u8>>| {
-                PACKET_LEN - 4 - af.as_ref().map_or(0, |v| 1 + v.len())
-            };
+            let capacity =
+                |af: &Option<Vec<u8>>| PACKET_LEN - 4 - af.as_ref().map_or(0, |v| 1 + v.len());
             if remaining < capacity(&af) {
                 // Pad to the full packet through the adaptation field. Its
                 // content is one flags byte then stuffing, except at exactly
@@ -238,10 +303,23 @@ impl Muxer {
 
     /// Interleaved stereo samples, framed as LPCM.
     pub fn push_audio(&mut self, samples: &[i16], pts_us: u64) -> Vec<u8> {
-        let mut out = self.tables_if_due();
-        let frame = crate::source::lpcm::frame(samples);
-        let pes = pes(STREAM_ID_PRIVATE_1, &frame, pts_us, true);
-        out.extend(self.packetize(AUDIO_PID, &pes, None));
+        use crate::source::lpcm::SAMPLES_PER_FRAME;
+
+        if self.audio_pending.is_empty() {
+            self.next_audio_pts_us = Some(pts_us);
+        }
+        self.audio_pending.extend_from_slice(samples);
+        let mut out = Vec::new();
+        while self.audio_pending.len() >= SAMPLES_PER_FRAME {
+            let samples: Vec<i16> = self.audio_pending.drain(..SAMPLES_PER_FRAME).collect();
+            let frame_pts = self.next_audio_pts_us.unwrap_or(pts_us);
+            self.next_audio_pts_us = Some(frame_pts.saturating_add(AUDIO_FRAME_US));
+            out.extend(self.tables_if_due());
+            let frame = crate::source::lpcm::frame(&samples);
+            // WFD LPCM without HDCP carries two stuffing bytes after the PTS.
+            let pes = pes_with_stuffing(STREAM_ID_PRIVATE_1, &frame, frame_pts, true, 2);
+            out.extend(self.packetize(AUDIO_PID, &pes, None));
+        }
         out
     }
 }
@@ -267,18 +345,17 @@ mod tests {
         let out = m.push_video(&[0, 0, 0, 1, 0x65, 0xaa], 0);
         assert!(!out.is_empty());
         assert_eq!(out.len() % PACKET_LEN, 0, "a partial packet is unsendable");
-        assert!(out.chunks(PACKET_LEN).all(|p| p[0] == 0x47), "lost sync byte");
+        assert!(
+            out.chunks(PACKET_LEN).all(|p| p[0] == 0x47),
+            "lost sync byte"
+        );
     }
 
     #[test]
     fn an_access_unit_survives_our_own_demuxer() {
         // The strongest cheap check available: the sink already reads a real
         // source's stream, so what it reads back is at least self-consistent.
-        let au: Vec<u8> = [0, 0, 0, 1, 0x65]
-            .iter()
-            .copied()
-            .chain(0..200u8)
-            .collect();
+        let au: Vec<u8> = [0, 0, 0, 1, 0x65].iter().copied().chain(0..200u8).collect();
         let mut m = Muxer::new();
         let mut buf = m.push_video(&au, 1_000);
         buf.extend(m.push_video(&au, 34_000));
@@ -306,7 +383,7 @@ mod tests {
     #[test]
     fn audio_survives_with_its_header_intact() {
         let mut m = Muxer::new();
-        let buf = m.push_audio(&[0x0102; 480], 1_000);
+        let buf = m.push_audio(&[0x0102; crate::source::lpcm::SAMPLES_PER_FRAME], 1_000);
         let units = round_trip(&buf);
         let audio = units
             .iter()
@@ -315,7 +392,7 @@ mod tests {
                 _ => None,
             })
             .expect("no audio unit came back");
-        assert_eq!(crate::source::lpcm::payload(&audio).len(), 960);
+        assert_eq!(crate::source::lpcm::payload(&audio).len(), 1920);
     }
 
     #[test]
@@ -349,14 +426,17 @@ mod tests {
             .chunks(PACKET_LEN)
             .filter(|p| (((p[1] & 0x1f) as u16) << 8 | p[2] as u16) == 0)
             .count();
-        assert!(pat >= 2, "the program association table was sent {pat} times");
+        assert!(
+            pat >= 2,
+            "the program association table was sent {pat} times"
+        );
     }
 
     #[test]
     fn the_demuxer_learns_both_streams_from_our_tables() {
         let mut m = Muxer::new();
         let mut buf = m.push_video(&[0, 0, 0, 1, 0x65, 1], 0);
-        buf.extend(m.push_audio(&[0; 48], 0));
+        buf.extend(m.push_audio(&[0; crate::source::lpcm::SAMPLES_PER_FRAME], 0));
         let mut d = Demux::new();
         for p in buf.chunks(PACKET_LEN) {
             d.push(p);

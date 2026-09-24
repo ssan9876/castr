@@ -45,6 +45,34 @@ fn set_codec_bool(api: &ICodecAPI, key: &windows::core::GUID, v: bool) -> anyhow
 
 impl MfEncoder {
     pub fn new(cfg: EncoderConfig) -> anyhow::Result<Self> {
+        Self::new_with_h264(cfg, None)
+    }
+
+    /// Construct an encoder whose SPS/profile attributes match the WFD M4
+    /// selection. Profile bit 0 is constrained baseline; bit 1 is constrained
+    /// high. The level bitmap uses WFD's 3.1 through 4.2 bits.
+    pub fn new_miracast(
+        cfg: EncoderConfig,
+        profile_bitmap: u8,
+        level_bitmap: u8,
+    ) -> anyhow::Result<Self> {
+        let profile = match profile_bitmap {
+            0x01 => eAVEncH264VProfile_ConstrainedBase.0 as u32,
+            0x02 => eAVEncH264VProfile_UCConstrainedHigh.0 as u32,
+            _ => bail!("unsupported Miracast H.264 profile bitmap {profile_bitmap:#04x}"),
+        };
+        let level_idc = match level_bitmap {
+            0x01 => 31,
+            0x02 => 32,
+            0x04 => 40,
+            0x08 => 41,
+            0x10 => 42,
+            _ => bail!("unsupported Miracast H.264 level bitmap {level_bitmap:#04x}"),
+        };
+        Self::new_with_h264(cfg, Some(H264Format { profile, level_idc }))
+    }
+
+    fn new_with_h264(cfg: EncoderConfig, h264: Option<H264Format>) -> anyhow::Result<Self> {
         mf_startup()?;
         let mut candidates: Vec<(IMFActivate, &'static str)> = find_transforms(
             MFT_CATEGORY_VIDEO_ENCODER,
@@ -68,7 +96,7 @@ impl MfEncoder {
         let mut last_err = anyhow!("no H.264 encoder MFT found");
         for (activate, name) in candidates {
             let friendly = transform_name(&activate);
-            match Self::open(&activate, &cfg, name) {
+            match Self::open(&activate, &cfg, name, h264) {
                 Ok(enc) => {
                     tracing::info!("using encoder {friendly} ({name})");
                     return Ok(enc);
@@ -86,6 +114,7 @@ impl MfEncoder {
         activate: &IMFActivate,
         cfg: &EncoderConfig,
         name: &'static str,
+        h264: Option<H264Format>,
     ) -> anyhow::Result<Self> {
         // SAFETY: `activate` is a valid `IMFActivate` from `find_transforms`;
         // `ActivateObject` returns a new `IMFTransform` reference we own.
@@ -112,14 +141,18 @@ impl MfEncoder {
         if let Some(api) = &codec_api {
             let _ = set_codec_bool(api, &CODECAPI_AVLowLatencyMode, true);
             let _ = set_codec_u32(api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+            if h264.is_some() {
+                let _ = set_codec_bool(api, &CODECAPI_AVEncH264CABACEnable, false);
+            }
             Self::apply_mode(api, cfg);
         }
-        let out_type = video_type(
+        let out_type = video_type_with_h264(
             &MFVideoFormat_H264,
             cfg.width,
             cfg.height,
             cfg.fps,
             Some(cfg.bitrate_bps),
+            h264,
         )?;
         // SAFETY: `mft` is a valid transform; `out_type` is a valid media type.
         unsafe { mft.SetOutputType(0, &out_type, 0) }.context("SetOutputType H264")?;

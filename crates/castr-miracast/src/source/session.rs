@@ -14,8 +14,9 @@
 //! - **M6/M7** it sends `SETUP` then `PLAY`; we answer both, and media starts.
 
 use crate::rtsp::{self, Action, Message, StartLine, VideoMode};
-use crate::source::caps::{self, SinkCaps};
+use crate::source::caps::{self, ModeSelection, SinkCaps, VideoTable};
 use castr_media::codec::Mode;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 /// Matches the sink's tolerance in `rtsp.rs`: two missed keep-alives, not one,
@@ -35,9 +36,8 @@ const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// ever: after it, M3 goes out regardless, which is exactly the old behaviour.
 const M2_GRACE: Duration = Duration::from_secs(2);
 
-const PUBLIC: &str =
-    "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER";
-const PRESENTATION_URL: &str = "rtsp://localhost/wfd1.0/streamid=0";
+const PUBLIC: &str = "org.wfa.wfd1.0, SETUP, TEARDOWN, PLAY, PAUSE, GET_PARAMETER, SET_PARAMETER";
+const BASE_URL: &str = "rtsp://localhost/wfd1.0";
 
 #[derive(Debug, Clone)]
 pub struct SourceConfig {
@@ -51,6 +51,7 @@ pub struct SourceConfig {
     /// What the display's information element said it can carry, if the radio
     /// read one. The capability body may name a ceiling too; the lower wins.
     pub ceiling_mbps: Option<u16>,
+    pub presentation_url: String,
 }
 
 impl Default for SourceConfig {
@@ -60,6 +61,7 @@ impl Default for SourceConfig {
             rtp_port: 5000,
             session_id: "1234567890".to_string(),
             ceiling_mbps: None,
+            presentation_url: "rtsp://localhost/wfd1.0/streamid=0".to_string(),
         }
     }
 }
@@ -78,6 +80,16 @@ pub enum SourceState {
 /// in. Every one of these names a stage.
 pub type Reason = &'static str;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    M1,
+    M3,
+    M4,
+    M5,
+    Keepalive,
+    Teardown,
+}
+
 pub struct SourceSession {
     cfg: SourceConfig,
     state: SourceState,
@@ -85,8 +97,10 @@ pub struct SourceSession {
     asked_caps: bool,
     /// When M1 was answered, so M2 can be waited for without waiting for ever.
     m1_answered: Option<Instant>,
-    chosen: Option<VideoMode>,
+    chosen: Option<ModeSelection>,
     sink: Option<SinkCaps>,
+    sink_rtp_port: Option<u16>,
+    pending: HashMap<u32, Pending>,
     last_heard: Option<Instant>,
     last_keepalive: Option<Instant>,
 }
@@ -101,6 +115,8 @@ impl SourceSession {
             m1_answered: None,
             chosen: None,
             sink: None,
+            sink_rtp_port: None,
+            pending: HashMap::new(),
             last_heard: None,
             last_keepalive: None,
         }
@@ -111,17 +127,40 @@ impl SourceSession {
     }
 
     pub fn chosen(&self) -> Option<VideoMode> {
-        self.chosen
+        self.chosen.map(|c| c.mode)
+    }
+
+    pub fn h264_profile(&self) -> Option<u8> {
+        self.chosen.map(|c| c.profile)
+    }
+
+    pub fn h264_level(&self) -> Option<u8> {
+        self.chosen.map(|c| c.level)
     }
 
     /// The port the display wants RTP sent to, once it has told us.
     pub fn sink_rtp_port(&self) -> Option<u16> {
-        self.sink.as_ref().map(|c| c.rtp_port)
+        self.sink_rtp_port
+            .or_else(|| self.sink.as_ref().map(|c| c.rtp_port))
     }
 
     /// The ceiling the display asked us to respect, if it named one.
     pub fn max_bitrate_kbps(&self) -> Option<u32> {
         self.sink.as_ref().and_then(|c| c.max_bitrate_kbps)
+    }
+
+    pub fn video_bitrate_kbps(&self) -> Option<u32> {
+        let preferred = u32::from(caps::needs_mbps(self.chosen?.mode)) * 1000;
+        let ceiling = [
+            self.cfg.ceiling_mbps.map(u32::from).map(|m| m * 1000),
+            self.max_bitrate_kbps(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        Some(ceiling.map_or(preferred, |total| {
+            preferred.min(total.saturating_sub(2200).max(1000))
+        }))
     }
 
     /// When the display was last heard from at all.
@@ -143,9 +182,9 @@ impl SourceSession {
     pub fn start(&mut self) -> Vec<Action> {
         let cseq = self.cseq();
         let mut m1 = rtsp::request("OPTIONS", "*", cseq, "");
-        m1.headers
-            .push(("Require".into(), "org.wfa.wfd1.0".into()));
+        m1.headers.push(("Require".into(), "org.wfa.wfd1.0".into()));
         self.state = SourceState::AwaitingCaps;
+        self.pending.insert(cseq, Pending::M1);
         vec![Action::Send(m1)]
     }
 
@@ -184,6 +223,9 @@ impl SourceSession {
             // M6. The sink refuses a SETUP response with no Session header, so
             // this is where the session id has to appear.
             "SETUP" => {
+                if let Some(port) = transport_client_port(m.header("transport").unwrap_or("")) {
+                    self.sink_rtp_port = Some(port);
+                }
                 let mut ok = rtsp::response(200, cseq, "");
                 ok.headers
                     .push(("Session".into(), self.cfg.session_id.clone()));
@@ -201,12 +243,12 @@ impl SourceSession {
             // M7: media starts.
             "PLAY" => {
                 self.state = SourceState::Playing;
-                vec![Action::Send(rtsp::response(200, cseq, "")), Action::Play]
+                vec![Action::Send(self.response_with_session(cseq)), Action::Play]
             }
             "TEARDOWN" => {
                 self.state = SourceState::Done;
                 vec![
-                    Action::Send(rtsp::response(200, cseq, "")),
+                    Action::Send(self.response_with_session(cseq)),
                     Action::Teardown("session: the display ended the session"),
                 ]
             }
@@ -215,7 +257,7 @@ impl SourceSession {
             // for a keyframe and sees black, or asks for less bitrate and is
             // sent the same rate until the link gives out.
             "SET_PARAMETER" => {
-                let mut actions = vec![Action::Send(rtsp::response(200, cseq, ""))];
+                let mut actions = vec![Action::Send(self.response_with_session(cseq))];
                 if m.body.contains("wfd_idr_request") {
                     actions.push(Action::Keyframe);
                 }
@@ -224,6 +266,9 @@ impl SourceSession {
                 }
                 actions
             }
+            "GET_PARAMETER" | "PAUSE" => {
+                vec![Action::Send(self.response_with_session(cseq))]
+            }
             // Never fatal: a display may ask us things we have never seen, and
             // refusing them would refuse the display.
             _ => vec![Action::Send(rtsp::response(200, cseq, ""))],
@@ -231,18 +276,37 @@ impl SourceSession {
     }
 
     fn on_response(&mut self, status: u16, m: &Message, now: Instant) -> Vec<Action> {
+        let Some(cseq) = m.cseq() else {
+            return Vec::new();
+        };
+        let Some(pending) = self.pending.remove(&cseq) else {
+            return Vec::new();
+        };
         if status != 200 {
-            return vec![Action::Teardown("negotiation: the display refused a request")];
+            return vec![Action::Teardown(
+                "negotiation: the display refused a request",
+            )];
         }
-        if !self.asked_caps {
+        if pending == Pending::M1 {
             // M1 answered. Do *not* ask for capabilities yet: the sink's own
             // OPTIONS - M2 - comes next, and an M3 sent before it is ignored
             // by a display that follows the sequence properly.
             self.m1_answered = Some(now);
             return Vec::new();
         }
-        if self.sink.is_none() && !m.body.trim().is_empty() {
+        if pending == Pending::M3 {
             return self.on_capabilities(m);
+        }
+        if pending == Pending::M4 {
+            let cseq = self.cseq();
+            self.pending.insert(cseq, Pending::M5);
+            self.state = SourceState::AwaitingSetup;
+            return vec![Action::Send(rtsp::request(
+                "SET_PARAMETER",
+                BASE_URL,
+                cseq,
+                "wfd_trigger_method: SETUP\r\n",
+            ))];
         }
         // A keep-alive answered, or an acknowledgement of something we set.
         Vec::new()
@@ -256,7 +320,8 @@ impl SourceSession {
                     wfd_audio_codecs\r\n\
                     wfd_content_protection\r\n\
                     wfd_client_rtp_ports\r\n";
-        Action::Send(rtsp::request("GET_PARAMETER", PRESENTATION_URL, cseq, body))
+        self.pending.insert(cseq, Pending::M3);
+        Action::Send(rtsp::request("GET_PARAMETER", BASE_URL, cseq, body))
     }
 
     fn on_capabilities(&mut self, m: &Message) -> Vec<Action> {
@@ -271,43 +336,58 @@ impl SourceSession {
         // The list of what to propose can only be built now: until M3 we did not
         // know what the display can carry, and offering it more than that is
         // asking for a stream it has already said it cannot take.
-        let ceiling = [self.cfg.ceiling_mbps, sink.max_bitrate_kbps.map(|k| (k / 1000) as u16)]
-            .into_iter()
-            .flatten()
-            .min();
-        let ours = caps::our_modes(self.cfg.mode, ceiling);
-        let chosen = match caps::choose(&sink, &ours) {
-            Ok(mode) => mode,
+        let ceiling = [
+            self.cfg.ceiling_mbps,
+            sink.max_bitrate_kbps.map(|k| (k / 1000) as u16),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
+        // Mode cost estimates are video-only. Reserve 1.536 Mbit/s LPCM plus
+        // RTP/TS/IP overhead before deciding which picture rate can fit.
+        let ours = caps::our_modes(self.cfg.mode, ceiling.map(|m| m.saturating_sub(3)));
+        let chosen = match caps::choose_selection(&sink, &ours) {
+            Ok(selection) => selection,
             Err(_) => return vec![Action::Teardown("negotiation: no video format in common")],
         };
-        let Some(bit) = caps::mode_bit(chosen) else {
-            return vec![Action::Teardown("negotiation: chose a mode with no table entry")];
+        if sink.lpcm_modes & 0x02 == 0 {
+            return vec![Action::Teardown(
+                "negotiation: no LPCM audio format in common",
+            )];
+        }
+        if sink.content_protection.is_some() {
+            return vec![Action::Teardown(
+                "negotiation: the display requires unsupported content protection",
+            )];
         };
         self.chosen = Some(chosen);
         self.sink = Some(sink);
         self.state = SourceState::Configuring;
 
-        // M4 then M5, back to back: name the one mode we chose, then ask the
-        // display to take over as client and send us SETUP. Exactly one bit is
-        // set in exactly one table, which is what a sink will accept.
+        // Send M4 now. M5 waits for M4's matching 200 response.
         let m4 = self.cseq();
-        let m5 = self.cseq();
+        self.pending.insert(m4, Pending::M4);
+        let (cea, vesa, hh) = match chosen.table {
+            VideoTable::Cea => (chosen.bit, 0, 0),
+            VideoTable::Vesa => (0, chosen.bit, 0),
+            VideoTable::Hh => (0, 0, chosen.bit),
+        };
         let set = format!(
-            "wfd_video_formats: 00 00 02 04 {bit:08X} 00000000 00000000 00 0000 0000 00 none none\r\n\
+            "wfd_video_formats: 00 00 {:02X} {:02X} {cea:08X} {vesa:08X} {hh:08X} 00 0000 0000 00 none none\r\n\
              wfd_audio_codecs: LPCM 00000002 00\r\n\
-             wfd_presentation_URL: {PRESENTATION_URL} none\r\n\
+             wfd_presentation_URL: {} none\r\n\
              wfd_client_rtp_ports: RTP/AVP/UDP;unicast {} 0 mode=play\r\n",
+            chosen.profile,
+            chosen.level,
+            self.cfg.presentation_url,
             self.cfg.rtp_port
         );
-        vec![
-            Action::Send(rtsp::request("SET_PARAMETER", PRESENTATION_URL, m4, &set)),
-            Action::Send(rtsp::request(
-                "SET_PARAMETER",
-                PRESENTATION_URL,
-                m5,
-                "wfd_trigger_method: SETUP\r\n",
-            )),
-        ]
+        vec![Action::Send(rtsp::request(
+            "SET_PARAMETER",
+            BASE_URL,
+            m4,
+            &set,
+        ))]
     }
 
     /// Time-driven work: a keep-alive out, and giving up on a silent display.
@@ -343,12 +423,12 @@ impl SourceSession {
         }
         self.last_keepalive = Some(now);
         let cseq = self.cseq();
-        vec![Action::Send(rtsp::request(
-            "GET_PARAMETER",
-            PRESENTATION_URL,
-            cseq,
-            "",
-        ))]
+        self.pending.insert(cseq, Pending::Keepalive);
+        let mut keepalive = rtsp::request("GET_PARAMETER", &self.cfg.presentation_url, cseq, "");
+        keepalive
+            .headers
+            .push(("Session".into(), self.cfg.session_id.clone()));
+        vec![Action::Send(keepalive)]
     }
 
     /// The message that ends a session politely. The caller sends this before
@@ -357,11 +437,31 @@ impl SourceSession {
     pub fn teardown(&mut self) -> Message {
         let cseq = self.cseq();
         self.state = SourceState::Done;
-        let mut m = rtsp::request("TEARDOWN", PRESENTATION_URL, cseq, "");
+        self.pending.insert(cseq, Pending::Teardown);
+        let mut m = rtsp::request("TEARDOWN", &self.cfg.presentation_url, cseq, "");
         m.headers
             .push(("Session".into(), self.cfg.session_id.clone()));
         m
     }
+
+    fn response_with_session(&self, cseq: u32) -> Message {
+        let mut response = rtsp::response(200, cseq, "");
+        response
+            .headers
+            .push(("Session".into(), self.cfg.session_id.clone()));
+        response
+    }
+}
+
+fn transport_client_port(value: &str) -> Option<u16> {
+    value.split(';').find_map(|part| {
+        part.trim()
+            .strip_prefix("client_port=")?
+            .split('-')
+            .next()?
+            .parse()
+            .ok()
+    })
 }
 
 #[cfg(test)]
@@ -497,7 +597,9 @@ mod tests {
         s.start();
         s.on_message(&rtsp::response(200, 1, ""));
         assert!(has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 1, ""))));
-        assert!(!has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 2, ""))));
+        assert!(!has_m3(
+            &s.on_message(&rtsp::request("OPTIONS", "*", 2, ""))
+        ));
         assert!(!has_m3(&s.tick(Instant::now() + M2_GRACE * 2)));
     }
 
@@ -507,7 +609,9 @@ mod tests {
         // waits until our own M1 has been answered.
         let mut s = SourceSession::new(cfg());
         s.start();
-        assert!(!has_m3(&s.on_message(&rtsp::request("OPTIONS", "*", 1, ""))));
+        assert!(!has_m3(
+            &s.on_message(&rtsp::request("OPTIONS", "*", 1, ""))
+        ));
     }
 
     #[test]
@@ -541,9 +645,7 @@ mod tests {
         ask.body = "microsoft_max_bitrate: 2000\r\n".into();
         let actions = s.on_message(&ask);
         assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Bitrate(2000))),
+            actions.iter().any(|a| matches!(a, Action::Bitrate(2000))),
             "the bitrate request must reach the encoder"
         );
         assert!(sent(&actions)
@@ -736,9 +838,17 @@ mod tests {
         }
         assert!(source_playing, "the source never reached Play");
         assert_eq!(source.state(), SourceState::Playing);
-        assert_eq!(sink.state(), NegState::Playing, "the sink never reached Playing");
+        assert_eq!(
+            sink.state(),
+            NegState::Playing,
+            "the sink never reached Playing"
+        );
         assert_eq!(source.chosen(), Some(P720P30));
-        assert_eq!(sink.chosen_video(), Some(P720P30), "the two chose differently");
+        assert_eq!(
+            sink.chosen_video(),
+            Some(P720P30),
+            "the two chose differently"
+        );
     }
 
     #[test]
@@ -746,8 +856,8 @@ mod tests {
         // A display offering 720p30, 720p60 and 1080p30 - CEA bits 5, 6 and 7.
         // Quality should take the biggest picture, Game the fastest one, and
         // the choice is made here rather than baked in at construction.
-        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none
-";
+        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none\r\n\
+                    wfd_audio_codecs: LPCM 00000002 00\r\n";
         for (mode, want) in [(Mode::Quality, P1080P30), (Mode::Game, P720P60)] {
             let mut s = SourceSession::new(SourceConfig {
                 mode,
@@ -764,10 +874,10 @@ mod tests {
     #[test]
     fn a_ceiling_keeps_us_from_proposing_what_a_display_cannot_carry() {
         // The same display, but it says it can take only 9 Mbit/s. 1080p30 is
-        // reckoned at 10, so Quality has to settle for the next thing that
-        // fits rather than proposing what the display cannot carry.
-        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none
-";
+        // reckoned at 10, and LPCM plus packet overhead also need room, so
+        // Quality has to settle for 720p30 rather than overfill the link.
+        let body = "wfd_video_formats: 40 00 02 04 000000E0 00000000 00000000 00 0000 0000 00 none none\r\n\
+                    wfd_audio_codecs: LPCM 00000002 00\r\n";
         let mut s = SourceSession::new(SourceConfig {
             mode: Mode::Quality,
             ceiling_mbps: Some(9),
@@ -777,7 +887,7 @@ mod tests {
         s.on_message(&rtsp::response(200, 1, ""));
         s.on_message(&rtsp::request("OPTIONS", "*", 1, "")); // M2 brings out M3
         s.on_message(&rtsp::response(200, 2, body));
-        assert_eq!(s.chosen(), Some(P720P60));
+        assert_eq!(s.chosen(), Some(P720P30));
     }
 
     #[test]
@@ -787,5 +897,34 @@ mod tests {
         assert!(matches!(&m.start, StartLine::Request { method, .. } if method == "TEARDOWN"));
         assert_eq!(m.header("session"), Some("1234567890"));
         assert_eq!(s.state(), SourceState::Done);
+    }
+
+    #[test]
+    fn m5_waits_for_the_matching_m4_response() {
+        let mut s = SourceSession::new(cfg());
+        s.start();
+        s.on_message(&rtsp::response(200, 1, ""));
+        s.on_message(&rtsp::request("OPTIONS", "*", 8, ""));
+        let body = "wfd_video_formats: 40 00 02 04 00000020 00000000 00000000 00 0000 0000 00 none none\r\n\
+                    wfd_audio_codecs: LPCM 00000002 00\r\n";
+        let m4 = sent(&s.on_message(&rtsp::response(200, 2, body)));
+        assert_eq!(m4.len(), 1, "M4 and M5 must not be pipelined");
+        assert!(!m4[0].body.contains("wfd_trigger_method"));
+        assert!(sent(&s.on_message(&rtsp::response(200, 99, ""))).is_empty());
+        let m5 = sent(&s.on_message(&rtsp::response(200, 3, "")));
+        assert_eq!(m5.len(), 1);
+        assert!(m5[0].body.contains("wfd_trigger_method: SETUP"));
+    }
+
+    #[test]
+    fn setup_transport_can_override_the_capability_port() {
+        let mut s = SourceSession::new(cfg());
+        let mut setup = rtsp::request("SETUP", "rtsp://x/wfd1.0/streamid=0", 7, "");
+        setup.headers.push((
+            "Transport".into(),
+            "RTP/AVP/UDP;unicast;client_port=19000-19001".into(),
+        ));
+        s.on_message(&setup);
+        assert_eq!(s.sink_rtp_port(), Some(19000));
     }
 }
